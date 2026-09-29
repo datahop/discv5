@@ -1,4 +1,6 @@
 //! A set of configuration parameters to tune the discovery protocol.
+#[cfg(feature = "topic-discovery")]
+use crate::topic::TopicConfig;
 use crate::{
     Enr, Executor, PermitBanList, ProtocolIdentity, RateLimiter, RateLimiterBuilder,
     kbucket::MAX_NODES_PER_BUCKET, socket::ListenConfig,
@@ -113,6 +115,10 @@ pub struct Config {
 
     /// The protocol identity to use in network messages.
     pub protocol_identity: ProtocolIdentity,
+
+    /// Parameters of the topic discovery extension.
+    #[cfg(feature = "topic-discovery")]
+    pub topic: TopicConfig,
 }
 
 #[derive(Debug)]
@@ -160,6 +166,8 @@ impl ConfigBuilder {
             executor: None,
             listen_config,
             protocol_identity: ProtocolIdentity::default(),
+            #[cfg(feature = "topic-discovery")]
+            topic: TopicConfig::default(),
         };
 
         ConfigBuilder { config }
@@ -343,6 +351,13 @@ impl ConfigBuilder {
     /// matching the configured protocol identity will be ignored.
     pub fn protocol_identity(&mut self, protocol_identity: ProtocolIdentity) -> &mut Self {
         self.config.protocol_identity = protocol_identity;
+        self
+    }
+
+    /// Parameters of the topic discovery extension.
+    #[cfg(feature = "topic-discovery")]
+    pub fn topic_config(&mut self, topic: TopicConfig) -> &mut Self {
+        self.config.topic = topic;
         self
     }
 

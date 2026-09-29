@@ -85,6 +85,26 @@ pub enum RequestBody {
         /// The request.
         request: Vec<u8>,
     },
+    /// A REGTOPIC request: register the sender's record for a topic.
+    #[cfg(feature = "topic-discovery")]
+    RegTopic {
+        /// The topic to register for.
+        topic: [u8; 32],
+        /// The ticket issued by the recipient on the previous attempt; empty on the first.
+        ticket: Vec<u8>,
+        /// The sender's current record.
+        enr: Enr<CombinedKey>,
+        /// Log2 distances from the topic where the sender's service table has space.
+        buckets: Vec<u64>,
+    },
+    /// A TOPICQUERY request: ask for advertisers registered for a topic.
+    #[cfg(feature = "topic-discovery")]
+    TopicQuery {
+        /// The topic to look up.
+        topic: [u8; 32],
+        /// Log2 distances from the topic where the sender's service table has space.
+        buckets: Vec<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +130,32 @@ pub enum ResponseBody {
         /// The response for the talk.
         response: Vec<u8>,
     },
+    /// The REGCONFIRMATION response to a REGTOPIC.
+    #[cfg(feature = "topic-discovery")]
+    RegConfirmation {
+        /// The total number of responses (this one plus auxiliary NODES) to the request.
+        total: u64,
+        /// The ticket for the next attempt; empty when the registration was admitted.
+        ticket: Vec<u8>,
+        /// Milliseconds to wait before the next attempt, or the advertisement lifetime
+        /// when admitted.
+        wait_time: u64,
+    },
+    /// A TOPICNODES response to a TOPICQUERY.
+    #[cfg(feature = "topic-discovery")]
+    TopicNodes {
+        /// The total number of responses (TOPICNODES plus auxiliary NODES) to the request.
+        total: u64,
+        /// Advertisers registered for the requested topic.
+        nodes: Vec<Enr<CombinedKey>>,
+    },
 }
+
+/// Decode-time bounds on the variable-length fields of the topic discovery messages.
+#[cfg(feature = "topic-discovery")]
+const MAX_TOPIC_DISTANCES: usize = 256;
+#[cfg(feature = "topic-discovery")]
+const MAX_TOPIC_NODES: usize = 16;
 
 impl Request {
     pub fn msg_type(&self) -> u8 {
@@ -118,6 +163,10 @@ impl Request {
             RequestBody::Ping { .. } => 1,
             RequestBody::FindNode { .. } => 3,
             RequestBody::Talk { .. } => 5,
+            #[cfg(feature = "topic-discovery")]
+            RequestBody::RegTopic { .. } => 7,
+            #[cfg(feature = "topic-discovery")]
+            RequestBody::TopicQuery { .. } => 9,
         }
     }
 
@@ -165,6 +214,30 @@ impl Request {
                 buf.extend_from_slice(&list);
                 buf
             }
+            // Field order follows the Go implementation (ticket before ENR).
+            #[cfg(feature = "topic-discovery")]
+            RequestBody::RegTopic {
+                topic,
+                ticket,
+                enr,
+                buckets,
+            } => {
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                topic.encode(&mut list);
+                ticket.as_slice().encode(&mut list);
+                enr.encode(&mut list);
+                buckets.encode(&mut list);
+                wrap_list(buf, &list)
+            }
+            #[cfg(feature = "topic-discovery")]
+            RequestBody::TopicQuery { topic, buckets } => {
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                topic.encode(&mut list);
+                buckets.encode(&mut list);
+                wrap_list(buf, &list)
+            }
         }
     }
 }
@@ -175,6 +248,10 @@ impl Response {
             ResponseBody::Pong { .. } => 2,
             ResponseBody::Nodes { .. } => 4,
             ResponseBody::Talk { .. } => 6,
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::RegConfirmation { .. } => 8,
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::TopicNodes { .. } => 10,
         }
     }
 
@@ -186,6 +263,10 @@ impl Response {
                 matches!(req, RequestBody::FindNode { .. })
             }
             ResponseBody::Talk { .. } => matches!(req, RequestBody::Talk { .. }),
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::RegConfirmation { .. } => matches!(req, RequestBody::RegTopic { .. }),
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::TopicNodes { .. } => matches!(req, RequestBody::TopicQuery { .. }),
         }
     }
 
@@ -217,31 +298,8 @@ impl Response {
                 let mut list = Vec::<u8>::new();
                 id.as_bytes().encode(&mut list);
                 total.encode(&mut list);
-                if !nodes.is_empty() {
-                    let mut out = BytesMut::new();
-                    for node in nodes.clone() {
-                        node.encode(&mut out);
-                    }
-                    let tmp_header = Header {
-                        list: true,
-                        payload_length: out.len(),
-                    };
-                    let mut tmp_out = BytesMut::new();
-                    tmp_header.encode(&mut tmp_out);
-                    tmp_out.extend_from_slice(&out);
-                    list.extend_from_slice(&tmp_out);
-                } else {
-                    let mut out = BytesMut::new();
-                    nodes.encode(&mut out);
-                    list.extend_from_slice(&out);
-                }
-                let header = Header {
-                    list: true,
-                    payload_length: list.len(),
-                };
-                header.encode(&mut buf);
-                buf.extend_from_slice(&list);
-                buf
+                encode_enr_list(&nodes, &mut list);
+                wrap_list(buf, &list)
             }
             ResponseBody::Talk { response } => {
                 let mut list = Vec::<u8>::new();
@@ -255,8 +313,105 @@ impl Response {
                 buf.extend_from_slice(&list);
                 buf
             }
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::RegConfirmation {
+                total,
+                ticket,
+                wait_time,
+            } => {
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                total.encode(&mut list);
+                ticket.as_slice().encode(&mut list);
+                wait_time.encode(&mut list);
+                wrap_list(buf, &list)
+            }
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::TopicNodes { total, nodes } => {
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                total.encode(&mut list);
+                encode_enr_list(&nodes, &mut list);
+                wrap_list(buf, &list)
+            }
         }
     }
+}
+
+impl ResponseBody {
+    /// The announced number of messages making up the whole response, for the response
+    /// types that can span several messages.
+    pub fn total(&self) -> Option<u64> {
+        match self {
+            ResponseBody::Nodes { total, .. } => Some(*total),
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::RegConfirmation { total, .. }
+            | ResponseBody::TopicNodes { total, .. } => Some(*total),
+            _ => None,
+        }
+    }
+}
+
+/// Appends the RLP list header for `list` to `buf`, followed by `list`.
+fn wrap_list(mut buf: Vec<u8>, list: &[u8]) -> Vec<u8> {
+    Header {
+        list: true,
+        payload_length: list.len(),
+    }
+    .encode(&mut buf);
+    buf.extend_from_slice(list);
+    buf
+}
+
+/// Encodes records as an RLP list of records.
+fn encode_enr_list(nodes: &[Enr<CombinedKey>], out: &mut Vec<u8>) {
+    let mut items = BytesMut::new();
+    for node in nodes {
+        node.encode(&mut items);
+    }
+    Header {
+        list: true,
+        payload_length: items.len(),
+    }
+    .encode(out);
+    out.extend_from_slice(&items);
+}
+
+/// Decodes one record, bounding the decoder to the record's own RLP item.
+fn decode_enr(payload: &mut &[u8]) -> Result<Enr<CombinedKey>, DecoderError> {
+    let header = Header::decode(&mut &payload[..])?;
+    if !header.list {
+        return Err(DecoderError::Custom("Invalid format of header"));
+    }
+    let len = header.length_with_payload();
+    if len > payload.len() {
+        return Err(DecoderError::Custom(
+            "Payload size is smaller than payload_length",
+        ));
+    }
+    let enr = Enr::<CombinedKey>::decode(&mut &payload[..len])?;
+    payload.advance(len);
+    Ok(enr)
+}
+
+/// Decodes an RLP list of records.
+fn decode_enr_list(payload: &mut &[u8]) -> Result<Vec<Enr<CombinedKey>>, DecoderError> {
+    let header = Header::decode(payload)?;
+    if !header.list {
+        return Err(DecoderError::Custom("Invalid format of header"));
+    }
+    if header.payload_length > payload.len() {
+        return Err(DecoderError::Custom(
+            "Payload size is smaller than payload_length",
+        ));
+    }
+    let (mut items, rest) = payload.split_at(header.payload_length);
+    let mut nodes = Vec::new();
+    while !items.is_empty() {
+        nodes.push(decode_enr(&mut items)?);
+    }
+    *payload = rest;
+    Ok(nodes)
 }
 
 impl std::fmt::Display for RequestId {
@@ -303,6 +458,27 @@ impl std::fmt::Display for ResponseBody {
             ResponseBody::Talk { response } => {
                 write!(f, "Response: Response {}", hex::encode(response))
             }
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::RegConfirmation {
+                total,
+                ticket,
+                wait_time,
+            } => write!(
+                f,
+                "REGCONFIRMATION: total: {total}, admitted: {}, wait_time: {wait_time} ms",
+                ticket.is_empty()
+            ),
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::TopicNodes { total, nodes } => {
+                write!(f, "TOPICNODES: total: {total}, Nodes: [")?;
+                for (i, node) in nodes.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{node}")?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -325,6 +501,24 @@ impl std::fmt::Display for RequestBody {
                 "TALK: protocol: {}, request: {}",
                 hex::encode(protocol),
                 hex::encode(request)
+            ),
+            #[cfg(feature = "topic-discovery")]
+            RequestBody::RegTopic {
+                topic,
+                ticket,
+                buckets,
+                ..
+            } => write!(
+                f,
+                "REGTOPIC: topic: {}, ticket: {} bytes, distances: {buckets:?}",
+                hex::encode(topic),
+                ticket.len()
+            ),
+            #[cfg(feature = "topic-discovery")]
+            RequestBody::TopicQuery { topic, buckets } => write!(
+                f,
+                "TOPICQUERY: topic: {}, distances: {buckets:?}",
+                hex::encode(topic)
             ),
         }
     }
@@ -440,35 +634,7 @@ impl Message {
             4 => {
                 // NodesResponse
                 let total = u64::decode(payload)?;
-                let nodes = {
-                    let header = Header::decode(payload)?;
-                    if !header.list {
-                        return Err(DecoderError::Custom("Invalid format of header"));
-                    }
-                    let mut enr_list_rlp = Vec::<Enr<CombinedKey>>::new();
-                    while !payload.is_empty() {
-                        let node_header = Header::decode(&mut &payload[..])?;
-                        if !node_header.list {
-                            return Err(DecoderError::Custom("Invalid format of header"));
-                        }
-                        if node_header.length_with_payload() > payload.len() {
-                            return Err(DecoderError::Custom(
-                                "Payload size is smaller than payload_length",
-                            ));
-                        }
-                        let enr_rlp = Enr::<CombinedKey>::decode(
-                            &mut &payload[..node_header.length_with_payload()],
-                        )?;
-                        payload.advance(enr_rlp.size());
-                        enr_list_rlp.append(&mut vec![enr_rlp]);
-                    }
-                    if enr_list_rlp.is_empty() {
-                        // no records
-                        vec![]
-                    } else {
-                        enr_list_rlp
-                    }
-                };
+                let nodes = decode_enr_list(payload)?;
                 if !payload.is_empty() {
                     return Err(DecoderError::Custom("Payload should be empty"));
                 }
@@ -500,6 +666,79 @@ impl Message {
                     body: ResponseBody::Talk {
                         response: response.to_vec(),
                     },
+                })
+            }
+            #[cfg(feature = "topic-discovery")]
+            7 => {
+                // REGTOPIC: [request-id, topic, ticket, ENR, [distance, ...]]
+                let topic = <[u8; 32]>::decode(payload)?;
+                let ticket = Bytes::decode(payload)?.to_vec();
+                let enr = decode_enr(payload)?;
+                let buckets = Vec::<u64>::decode(payload)?;
+                if buckets.len() > MAX_TOPIC_DISTANCES {
+                    return Err(DecoderError::Custom("Too many distances in REGTOPIC"));
+                }
+                if !payload.is_empty() {
+                    return Err(DecoderError::Custom("Payload should be empty"));
+                }
+                Message::Request(Request {
+                    id,
+                    body: RequestBody::RegTopic {
+                        topic,
+                        ticket,
+                        enr,
+                        buckets,
+                    },
+                })
+            }
+            #[cfg(feature = "topic-discovery")]
+            8 => {
+                // REGCONFIRMATION: [request-id, total, ticket, wait-time]
+                let total = u64::from(u8::decode(payload)?);
+                let ticket = Bytes::decode(payload)?.to_vec();
+                let wait_time = u64::decode(payload)?;
+                if !payload.is_empty() {
+                    return Err(DecoderError::Custom("Payload should be empty"));
+                }
+                Message::Response(Response {
+                    id,
+                    body: ResponseBody::RegConfirmation {
+                        total,
+                        ticket,
+                        wait_time,
+                    },
+                })
+            }
+            #[cfg(feature = "topic-discovery")]
+            9 => {
+                // TOPICQUERY: [request-id, topic, [distance, ...]]
+                let topic = <[u8; 32]>::decode(payload)?;
+                let buckets = Vec::<u64>::decode(payload)?;
+                if buckets.len() > MAX_TOPIC_DISTANCES {
+                    return Err(DecoderError::Custom("Too many distances in TOPICQUERY"));
+                }
+                if !payload.is_empty() {
+                    return Err(DecoderError::Custom("Payload should be empty"));
+                }
+                Message::Request(Request {
+                    id,
+                    body: RequestBody::TopicQuery { topic, buckets },
+                })
+            }
+            #[cfg(feature = "topic-discovery")]
+            10 => {
+                // TOPICNODES: [request-id, total, [ENR, ...]]
+                let total = u64::from(u8::decode(payload)?);
+                let nodes = decode_enr_list(payload)?;
+                if nodes.len() > MAX_TOPIC_NODES {
+                    return Err(DecoderError::Custom("Too many nodes in TOPICNODES"));
+                }
+                if !payload.is_empty() {
+                    return Err(DecoderError::Custom("Payload should be empty"));
+                }
+                Message::Response(Response {
+                    id,
+                    body: ResponseBody::TopicNodes { total, nodes },
                 })
             }
             _ => {
@@ -891,5 +1130,251 @@ mod tests {
 
         // This should fail to decode with the current (original) logic
         Message::decode(&data).expect("This should be decodable");
+    }
+}
+
+#[cfg(all(test, feature = "topic-discovery"))]
+mod topic_tests {
+    //! Byte vectors produced by the Go implementation: each message below was built with
+    //! the same field values in `v5wire`, encoded with `rlp.EncodeToBytes` and prefixed
+    //! with its message type byte. The record is signed with the secp256k1 key
+    //! eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f (ip 127.0.0.1,
+    //! udp 30303, seq 1); the signature is deterministic (RFC 6979), so the bytes are
+    //! reproducible from the Go code.
+    use super::*;
+
+    const ENR: &str = "f884b8404ee3d46c3bfc895484b582e2a5892c2eccfd61c6259bcb57e12bcfbd3544b46b6922188402582c89eae528dd0ea691ebfb2c13cc974b357ba721ea9b84a285a080826964827634826970847f00000189736563703235366b31a10313d14211e0287b2361a1615890a9b5212080546d0a257ae4cff96cf534992cb98375647082765f";
+
+    fn record() -> Enr<CombinedKey> {
+        Enr::decode(&mut &hex::decode(ENR).unwrap()[..]).unwrap()
+    }
+
+    fn topic() -> [u8; 32] {
+        let mut topic = [0u8; 32];
+        topic[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
+        topic
+    }
+
+    const TOPIC_HEX: &str = "a00102030405000000000000000000000000000000000000000000000000000000";
+
+    fn check(message: Message, expected_hex: &str) {
+        let expected = hex::decode(expected_hex).unwrap();
+        assert_eq!(hex::encode(message.clone().encode()), expected_hex);
+        assert_eq!(Message::decode(&expected).unwrap(), message);
+    }
+
+    #[test]
+    fn regtopic_vector() {
+        check(
+            Message::Request(Request {
+                id: RequestId(vec![1, 2, 3]),
+                body: RequestBody::RegTopic {
+                    topic: topic(),
+                    ticket: vec![9, 9],
+                    enr: record(),
+                    buckets: vec![250, 251],
+                },
+            }),
+            &format!("07f8b383010203{TOPIC_HEX}820909{ENR}c481fa81fb"),
+        );
+    }
+
+    #[test]
+    fn regtopic_vector_no_ticket() {
+        check(
+            Message::Request(Request {
+                id: RequestId(vec![1]),
+                body: RequestBody::RegTopic {
+                    topic: topic(),
+                    ticket: vec![],
+                    enr: record(),
+                    buckets: vec![],
+                },
+            }),
+            &format!("07f8aa01{TOPIC_HEX}80{ENR}c0"),
+        );
+    }
+
+    #[test]
+    fn regconfirmation_vectors() {
+        check(
+            Message::Response(Response {
+                id: RequestId(vec![4]),
+                body: ResponseBody::RegConfirmation {
+                    total: 2,
+                    ticket: vec![7, 7],
+                    wait_time: 1500,
+                },
+            }),
+            "08c804028207078205dc",
+        );
+        // Admitted: empty ticket, wait time carries the ad lifetime (15 min).
+        check(
+            Message::Response(Response {
+                id: RequestId(vec![4]),
+                body: ResponseBody::RegConfirmation {
+                    total: 1,
+                    ticket: vec![],
+                    wait_time: 900_000,
+                },
+            }),
+            "08c7040180830dbba0",
+        );
+    }
+
+    #[test]
+    fn topicquery_vectors() {
+        check(
+            Message::Request(Request {
+                id: RequestId(vec![5]),
+                body: RequestBody::TopicQuery {
+                    topic: topic(),
+                    buckets: vec![248],
+                },
+            }),
+            &format!("09e505{TOPIC_HEX}c281f8"),
+        );
+        check(
+            Message::Request(Request {
+                id: RequestId(vec![5]),
+                body: RequestBody::TopicQuery {
+                    topic: topic(),
+                    buckets: vec![],
+                },
+            }),
+            &format!("09e305{TOPIC_HEX}c0"),
+        );
+    }
+
+    #[test]
+    fn topicnodes_vectors() {
+        check(
+            Message::Response(Response {
+                id: RequestId(vec![6]),
+                body: ResponseBody::TopicNodes {
+                    total: 3,
+                    nodes: vec![record()],
+                },
+            }),
+            &format!("0af88a0603f886{ENR}"),
+        );
+        check(
+            Message::Response(Response {
+                id: RequestId(vec![6]),
+                body: ResponseBody::TopicNodes {
+                    total: 1,
+                    nodes: vec![],
+                },
+            }),
+            "0ac30601c0",
+        );
+    }
+
+    #[test]
+    fn nodes_vector_unchanged() {
+        // The shared record-list codec still produces the plain NODES encoding.
+        check(
+            Message::Response(Response {
+                id: RequestId(vec![6]),
+                body: ResponseBody::Nodes {
+                    total: 3,
+                    nodes: vec![record()],
+                },
+            }),
+            &format!("04f88a0603f886{ENR}"),
+        );
+    }
+
+    #[test]
+    fn response_totals() {
+        let confirmation = ResponseBody::RegConfirmation {
+            total: 2,
+            ticket: vec![],
+            wait_time: 0,
+        };
+        assert_eq!(confirmation.total(), Some(2));
+        assert!(
+            Response {
+                id: RequestId(vec![1]),
+                body: confirmation
+            }
+            .match_request(&RequestBody::RegTopic {
+                topic: topic(),
+                ticket: vec![],
+                enr: record(),
+                buckets: vec![]
+            })
+        );
+        let topic_nodes = ResponseBody::TopicNodes {
+            total: 4,
+            nodes: vec![],
+        };
+        assert_eq!(topic_nodes.total(), Some(4));
+        assert!(
+            Response {
+                id: RequestId(vec![1]),
+                body: topic_nodes
+            }
+            .match_request(&RequestBody::TopicQuery {
+                topic: topic(),
+                buckets: vec![]
+            })
+        );
+        assert_eq!(ResponseBody::Talk { response: vec![] }.total(), None);
+    }
+
+    #[test]
+    fn rejects_malformed() {
+        // Distances above the per-message cap.
+        let many = Message::Request(Request {
+            id: RequestId(vec![1]),
+            body: RequestBody::TopicQuery {
+                topic: topic(),
+                buckets: vec![1; MAX_TOPIC_DISTANCES + 1],
+            },
+        })
+        .encode();
+        assert!(Message::decode(&many).is_err());
+        let at_cap = Message::Request(Request {
+            id: RequestId(vec![1]),
+            body: RequestBody::RegTopic {
+                topic: topic(),
+                ticket: vec![],
+                enr: record(),
+                buckets: vec![1; MAX_TOPIC_DISTANCES],
+            },
+        })
+        .encode();
+        assert!(Message::decode(&at_cap).is_ok());
+
+        // More records than fit a TOPICNODES.
+        let many_nodes = Message::Response(Response {
+            id: RequestId(vec![1]),
+            body: ResponseBody::TopicNodes {
+                total: 1,
+                nodes: vec![record(); MAX_TOPIC_NODES + 1],
+            },
+        })
+        .encode();
+        assert!(Message::decode(&many_nodes).is_err());
+
+        // Total does not fit the Go uint8.
+        assert!(Message::decode(&hex::decode("08c904820100820707820101").unwrap()).is_err());
+
+        // Trailing and truncated bodies.
+        let good = hex::decode(format!("09e505{TOPIC_HEX}c281f8")).unwrap();
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(Message::decode(&trailing).is_err());
+        assert!(Message::decode(&good[..good.len() - 1]).is_err());
+
+        // The topic must be exactly 32 bytes.
+        assert!(Message::decode(&hex::decode("09c5059f0102c0").unwrap()).is_err());
+
+        // A record where the ticket is expected (the field order of the spec draft)
+        // does not decode.
+        let spec_order =
+            hex::decode(format!("07f8b083010203{TOPIC_HEX}{ENR}820909c481fa81fb")).unwrap();
+        assert!(Message::decode(&spec_order).is_err());
     }
 }

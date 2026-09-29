@@ -112,6 +112,20 @@ impl Discv5 {
             return Err("Provided keypair does not match the provided ENR");
         }
 
+        // Advertise the topic discovery capability, as peers only send REGTOPIC and
+        // TOPICQUERY to records carrying it.
+        #[cfg(feature = "topic-discovery")]
+        let local_enr = {
+            use crate::topic::{TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION};
+            let mut local_enr = local_enr;
+            if !crate::topic::supports_topic_discovery(&local_enr) {
+                local_enr
+                    .insert(TOPIC_DISCOVERY_ENR_KEY, &TOPIC_DISCOVERY_VERSION, &enr_key)
+                    .map_err(|_| "Failed to add the topic-discovery entry to the ENR")?;
+            }
+            local_enr
+        };
+
         // If an executor is not provided, assume a current tokio runtime is running. If not panic.
         if config.executor.is_none() {
             config.executor = Some(Box::<crate::executor::TokioExecutor>::default());

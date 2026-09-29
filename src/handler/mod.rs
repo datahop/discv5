@@ -1184,9 +1184,9 @@ impl Handler {
             .remove_request(&node_address, &response.id)
         {
             // The response matches a request
-            // Check to see if this is a Nodes response, in which case we may require to wait for
-            // extra responses
-            if let ResponseBody::Nodes { total, .. } = response.body
+            // Check to see if this is a multi-message response (NODES and the topic
+            // discovery responses), in which case we may require to wait for extra responses
+            if let Some(total) = response.body.total()
                 && total > 1
             {
                 // This is a multi-response Nodes response

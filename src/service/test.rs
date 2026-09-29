@@ -107,6 +107,10 @@ async fn build_service_with(
         discv5_recv,
         event_stream: None,
         exit,
+        #[cfg(feature = "topic-discovery")]
+        topic_table: crate::topic::TopicTable::new(config.topic.clone()),
+        #[cfg(feature = "topic-discovery")]
+        ticket_sealer: crate::topic::TicketSealer::new(std::time::Instant::now()),
         config,
         ip_mode,
         connectivity_state,
@@ -192,6 +196,10 @@ fn build_non_handler_service(
         discv5_recv,
         event_stream: None,
         exit,
+        #[cfg(feature = "topic-discovery")]
+        topic_table: crate::topic::TopicTable::new(config.topic.clone()),
+        #[cfg(feature = "topic-discovery")]
+        ticket_sealer: crate::topic::TicketSealer::new(std::time::Instant::now()),
         config,
         ip_mode: IpMode::DualStack,
         connectivity_state,
@@ -650,4 +658,209 @@ async fn test_connectivity_metrics_updated_on_incoming_connections_ipv6() {
 
     // Clean up to avoid affecting other tests.
     METRICS.ipv6_contactable.store(false, Ordering::Relaxed);
+}
+
+#[cfg(feature = "topic-discovery")]
+mod topic {
+    use super::*;
+    use crate::{
+        rpc::{Request, RequestBody},
+        topic::{TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION, supports_topic_discovery},
+    };
+    use enr::NodeId;
+
+    fn capable_enr(port: u16) -> (Enr, CombinedKey) {
+        let key = CombinedKey::generate_secp256k1();
+        let mut enr = Enr::builder()
+            .ip4(Ipv4Addr::LOCALHOST)
+            .udp4(port)
+            .build(&key)
+            .unwrap();
+        enr.insert(TOPIC_DISCOVERY_ENR_KEY, &TOPIC_DISCOVERY_VERSION, &key)
+            .unwrap();
+        (enr, key)
+    }
+
+    async fn service_with_table(port: u16, table: &[Enr]) -> Service {
+        let (enr, enr_key) = capable_enr(port);
+        let service = build_service(
+            Arc::new(RwLock::new(enr)),
+            Arc::new(RwLock::new(enr_key)),
+            false,
+        )
+        .await;
+        for enr in table {
+            let key = kbucket::Key::from(enr.node_id());
+            let _ = service.kbuckets.write().insert_or_update(
+                &key,
+                enr.clone(),
+                NodeStatus {
+                    state: ConnectionState::Connected,
+                    direction: ConnectionDirection::Incoming,
+                },
+            );
+        }
+        service
+    }
+
+    #[tokio::test]
+    async fn aux_nodes_one_per_distance_capable_only() {
+        init();
+        let topic = [7u8; 32];
+        let target = kbucket::Key::new_raw(NodeId::new(&topic), topic);
+
+        // Half of the table advertises the capability.
+        let mut table = Vec::new();
+        for i in 0..60u16 {
+            let key = CombinedKey::generate_secp256k1();
+            let mut enr = Enr::builder()
+                .ip4(Ipv4Addr::LOCALHOST)
+                .udp4(20000 + i)
+                .build(&key)
+                .unwrap();
+            if i % 2 == 0 {
+                enr.insert(TOPIC_DISCOVERY_ENR_KEY, &TOPIC_DISCOVERY_VERSION, &key)
+                    .unwrap();
+            }
+            table.push(enr);
+        }
+        let service = service_with_table(10030, &table).await;
+        let held: Vec<Enr> = service
+            .kbuckets
+            .read()
+            .iter_ref()
+            .map(|e| e.node.value.clone())
+            .collect();
+        assert!(held.len() > 16, "table too small: {}", held.len());
+
+        // Every distance, farthest first: the reply is capped at the first eight and
+        // carries one capable node per requested distance, in request order.
+        let requested: Vec<u64> = (1..=256).rev().collect();
+        let aux = service.collect_topic_aux_nodes(&topic, &requested, Ipv4Addr::LOCALHOST.into());
+        assert!(!aux.is_empty());
+        assert!(aux.len() <= service.config.topic.aux_nodes_limit);
+        let mut distances: Vec<u64> = aux
+            .iter()
+            .map(|enr| {
+                target
+                    .log2_distance(&kbucket::Key::from(enr.node_id()))
+                    .unwrap()
+            })
+            .collect();
+        for enr in &aux {
+            assert!(supports_topic_discovery(enr));
+            assert!(held.iter().any(|h| h.node_id() == enr.node_id()));
+        }
+        assert!(distances.iter().all(|d| *d > 248));
+        assert!(
+            distances.windows(2).all(|w| w[0] > w[1]),
+            "not in request order: {distances:?}"
+        );
+        distances.dedup();
+        assert_eq!(distances.len(), aux.len());
+        let capable_at: std::collections::HashSet<u64> = held
+            .iter()
+            .filter(|e| supports_topic_discovery(e))
+            .filter_map(|e| target.log2_distance(&kbucket::Key::from(e.node_id())))
+            .filter(|d| *d > 248)
+            .collect();
+        assert_eq!(distances.len(), capable_at.len());
+
+        // Unusable distances and an empty request yield nothing.
+        assert!(
+            service
+                .collect_topic_aux_nodes(&topic, &[0, 257], Ipv4Addr::LOCALHOST.into())
+                .is_empty()
+        );
+        assert!(
+            service
+                .collect_topic_aux_nodes(&topic, &[], Ipv4Addr::LOCALHOST.into())
+                .is_empty()
+        );
+        // A remote WAN address may not be told about loopback records.
+        assert!(
+            service
+                .collect_topic_aux_nodes(&topic, &requested, Ipv4Addr::new(8, 8, 8, 8).into())
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn regtopic_admits_and_topicquery_serves() {
+        init();
+        let topic = [9u8; 32];
+        let mut service = service_with_table(10031, &[]).await;
+
+        let (adv, _) = capable_enr(10032);
+        let contact: NodeContact = adv.clone().into();
+        let node_address = contact.node_address();
+        let regtopic = |enr: Enr| Request {
+            id: RequestId(vec![1]),
+            body: RequestBody::RegTopic {
+                topic,
+                ticket: vec![],
+                enr,
+                buckets: vec![256, 255],
+            },
+        };
+
+        // A record that does not belong to the sender is dropped.
+        let (other, _) = capable_enr(10033);
+        service.handle_rpc_request(node_address.clone(), regtopic(other.clone()));
+        assert!(!service.topic_table.is_registered(&other.node_id(), &topic));
+        assert_eq!(service.topic_table.occupancy().0, 0);
+
+        // A record whose address differs from the packet source is dropped.
+        let key = CombinedKey::generate_secp256k1();
+        let elsewhere = Enr::builder()
+            .ip4(Ipv4Addr::new(1, 2, 3, 4))
+            .udp4(10034)
+            .build(&key)
+            .unwrap();
+        let bad_contact = NodeContact::new(
+            elsewhere.public_key(),
+            (Ipv4Addr::new(1, 2, 3, 5), 10034).into(),
+            Some(elsewhere.clone()),
+        );
+        service.handle_rpc_request(bad_contact.node_address(), regtopic(elsewhere.clone()));
+        assert!(
+            !service
+                .topic_table
+                .is_registered(&elsewhere.node_id(), &topic)
+        );
+
+        // An empty cache admits at once.
+        service.handle_rpc_request(node_address.clone(), regtopic(adv.clone()));
+        assert!(service.topic_table.is_registered(&adv.node_id(), &topic));
+        assert_eq!(service.topic_table.occupancy().0, 1);
+
+        // A garbage ticket gets no reply and changes nothing.
+        service.handle_rpc_request(
+            node_address.clone(),
+            Request {
+                id: RequestId(vec![2]),
+                body: RequestBody::RegTopic {
+                    topic: [1u8; 32],
+                    ticket: vec![0xaa; 90],
+                    enr: adv.clone(),
+                    buckets: vec![],
+                },
+            },
+        );
+        assert_eq!(service.topic_table.occupancy().0, 1);
+
+        service.handle_rpc_request(
+            node_address.clone(),
+            Request {
+                id: RequestId(vec![3]),
+                body: RequestBody::TopicQuery {
+                    topic,
+                    buckets: vec![256],
+                },
+            },
+        );
+        let found = service.topic_table.random_nodes(&topic, 16, |_| true);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].node_id(), adv.node_id());
+    }
 }

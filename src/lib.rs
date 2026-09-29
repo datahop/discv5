@@ -111,6 +111,8 @@ mod query_pool;
 pub(crate) mod rpc;
 pub mod service;
 pub mod socket;
+#[cfg(feature = "topic-discovery")]
+pub mod topic;
 
 #[macro_use]
 extern crate lazy_static;

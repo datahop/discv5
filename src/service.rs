@@ -57,6 +57,8 @@ mod connectivity_state;
 mod ip_vote;
 mod query_info;
 mod test;
+#[cfg(feature = "topic-discovery")]
+mod topic;
 
 /// The number of distances (buckets) we simultaneously request from each peer.
 /// NOTE: This must not be larger than 127.
@@ -210,6 +212,12 @@ pub(crate) struct Service {
     /// contactable or not. This decides if we should update our ENR or set it to None, if we are
     /// not contactable.
     connectivity_state: ConnectivityState,
+    /// The ad cache of the topic discovery registrar.
+    #[cfg(feature = "topic-discovery")]
+    topic_table: crate::topic::TopicTable,
+    /// Seals the tickets handed out by the registrar.
+    #[cfg(feature = "topic-discovery")]
+    ticket_sealer: crate::topic::TicketSealer,
 }
 
 /// Active RPC request awaiting a response from the handler.
@@ -316,6 +324,10 @@ impl Service {
                     discv5_recv,
                     event_stream: None,
                     exit,
+                    #[cfg(feature = "topic-discovery")]
+                    topic_table: crate::topic::TopicTable::new(config.topic.clone()),
+                    #[cfg(feature = "topic-discovery")]
+                    ticket_sealer: crate::topic::TicketSealer::new(Instant::now()),
                     config: config.clone(),
                     ip_mode,
                     connectivity_state,
@@ -331,6 +343,7 @@ impl Service {
     /// The main execution loop of the discv5 serviced.
     async fn start(&mut self) {
         loop {
+            let topic_expiry = self.topic_expiry();
             tokio::select! {
                 _ = &mut self.exit => {
                     if let Some(exit) = self.handler_exit.take() {
@@ -427,6 +440,10 @@ impl Service {
                 }
                 event = Service::bucket_maintenance_poll(&self.kbuckets) => {
                     self.send_event(event);
+                }
+                _ = Service::topic_expiry_poll(topic_expiry) => {
+                    #[cfg(feature = "topic-discovery")]
+                    self.topic_table.expire(Instant::now());
                 }
                 query_event = Service::query_event_poll(&mut self.queries) => {
                     match query_event {
@@ -679,6 +696,19 @@ impl Service {
 
                 self.send_event(Event::TalkRequest(req));
             }
+            #[cfg(feature = "topic-discovery")]
+            RequestBody::RegTopic {
+                topic,
+                ticket,
+                enr,
+                buckets,
+            } => {
+                self.handle_regtopic(node_address, id, topic, ticket, enr, buckets);
+            }
+            #[cfg(feature = "topic-discovery")]
+            RequestBody::TopicQuery { topic, buckets } => {
+                self.handle_topic_query(node_address, id, topic, buckets);
+            }
         }
     }
 
@@ -875,6 +905,12 @@ impl Service {
                     }
                     _ => error!("Invalid callback for response"),
                 }
+            }
+            // The requester side of topic discovery is not implemented yet: no REGTOPIC or
+            // TOPICQUERY is ever sent, so these can only be unsolicited.
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::RegConfirmation { .. } | ResponseBody::TopicNodes { .. } => {
+                debug!(%node_address, "Ignoring topic discovery response");
             }
         }
     }
@@ -1640,6 +1676,28 @@ impl Service {
             Poll::Pending
         })
         .await
+    }
+
+    /// When the next topic advertisement expires, if the registrar holds any.
+    fn topic_expiry(&self) -> Option<Instant> {
+        #[cfg(feature = "topic-discovery")]
+        {
+            self.topic_table.next_expiry()
+        }
+        #[cfg(not(feature = "topic-discovery"))]
+        {
+            None
+        }
+    }
+
+    /// A future that resolves once the next topic advertisement has expired, or never when
+    /// none is held. It is rebuilt on every iteration of the main loop, so a new earlier
+    /// expiry is picked up.
+    async fn topic_expiry_poll(next_expiry: Option<Instant>) {
+        match next_expiry {
+            Some(at) => tokio::time::sleep_until(at.into()).await,
+            None => future::pending().await,
+        }
     }
 
     /// A future the maintains active queries. This returns completed and timed out queries, as
