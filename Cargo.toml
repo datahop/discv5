@@ -58,5 +58,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 libp2p = ["dep:libp2p-identity", "dep:multiaddr"]
 serde = ["enr/serde"]
-# Topic discovery (TopDisc) extension: registrar side.
+# Topic discovery (TopDisc) extension: registrar, advertiser and searcher.
 topic-discovery = ["dep:hmac", "dep:sha2", "tokio/time"]

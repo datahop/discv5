@@ -34,6 +34,8 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
+#[cfg(feature = "topic-discovery")]
+use crate::topic::{RegConfirmation, TopicId, TopicQueryResult, TopicTable};
 #[cfg(feature = "libp2p")]
 use multiaddr::Multiaddr;
 
@@ -81,6 +83,12 @@ pub enum Event {
     TalkRequest(TalkRequest),
     /// A received unrecognized frame.
     UnrecognizedFrame(UnrecognizedFrame),
+    /// A registrar stores the advertisement of the local node for a topic.
+    #[cfg(feature = "topic-discovery")]
+    TopicRegistered { topic: TopicId, registrar: NodeId },
+    /// A topic search found advertisers that it had not returned before.
+    #[cfg(feature = "topic-discovery")]
+    TopicNodesFound { topic: TopicId, nodes: Vec<Enr> },
 }
 
 /// The main Discv5 Service struct. This provides the user-level API for performing queries and
@@ -99,6 +107,9 @@ pub struct Discv5 {
     enr_key: Arc<RwLock<CombinedKey>>,
     // Type of socket we are using
     ip_mode: IpMode,
+    /// The ad cache of the topic discovery registrar.
+    #[cfg(feature = "topic-discovery")]
+    topic_table: Arc<RwLock<TopicTable>>,
 }
 
 impl Discv5 {
@@ -161,6 +172,8 @@ impl Discv5 {
         let ip_mode = IpMode::new_from_listen_config(&config.listen_config);
 
         Ok(Discv5 {
+            #[cfg(feature = "topic-discovery")]
+            topic_table: Arc::new(RwLock::new(TopicTable::new(config.topic.clone()))),
             config,
             service_channel: None,
             service_exit: None,
@@ -184,6 +197,8 @@ impl Discv5 {
             self.enr_key.clone(),
             self.kbuckets.clone(),
             self.config.clone(),
+            #[cfg(feature = "topic-discovery")]
+            self.topic_table.clone(),
         )
         .await?;
         self.service_exit = Some(service_exit);
@@ -717,6 +732,117 @@ impl Discv5 {
                 .await
                 .map_err(|e| QueryError::ChannelFailed(e.to_string()))
         }
+    }
+
+    /// Keeps an advertisement of the local node for `topic` alive: runs the registration
+    /// walk against the registrars around the topic hash until it is stopped. The
+    /// registrars are the nodes whose record carries the `ng` entry.
+    #[cfg(feature = "topic-discovery")]
+    pub fn register_topic(&self, topic: TopicId) -> Result<(), Error> {
+        self.send_topic_command(ServiceRequest::RegisterTopic(topic))
+    }
+
+    /// Stops the registration walk for `topic`. The advertisements placed so far stay
+    /// on the registrars until they expire.
+    #[cfg(feature = "topic-discovery")]
+    pub fn stop_topic_registration(&self, topic: TopicId) -> Result<(), Error> {
+        self.send_topic_command(ServiceRequest::StopTopic(topic))
+    }
+
+    /// Looks up advertisers of `topic`. Resolves with `count` distinct records, or with
+    /// the records found when the query timeout of the configuration has passed.
+    #[cfg(feature = "topic-discovery")]
+    pub fn topic_search(
+        &self,
+        topic: TopicId,
+        count: usize,
+    ) -> impl Future<Output = Result<Vec<Enr>, QueryError>> + 'static + use<> {
+        let channel = self.clone_channel();
+
+        async move {
+            let channel = channel.map_err(|_| QueryError::ServiceNotStarted)?;
+            let (callback_send, callback_recv) = oneshot::channel();
+
+            let event = ServiceRequest::TopicSearch(topic, count, callback_send);
+            channel
+                .send(event)
+                .await
+                .map_err(|_| QueryError::ChannelFailed("Service channel closed".into()))?;
+
+            callback_recv
+                .await
+                .map_err(|e| QueryError::ChannelFailed(e.to_string()))
+        }
+    }
+
+    /// Sends a REGTOPIC request for `topic` to the designated peer. `ticket` is the
+    /// ticket of the previous answer of the peer, empty on the first attempt, and
+    /// `distances` are the distances from the topic to get auxiliary nodes for.
+    #[cfg(feature = "topic-discovery")]
+    pub fn send_regtopic(
+        &self,
+        contact: NodeContact,
+        topic: TopicId,
+        ticket: Vec<u8>,
+        distances: Vec<u64>,
+    ) -> impl Future<Output = Result<RegConfirmation, RequestError>> + 'static + use<> {
+        let (callback_send, callback_recv) = oneshot::channel();
+        let channel = self.clone_channel();
+
+        async move {
+            let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
+
+            let event = ServiceRequest::RegTopic(contact, topic, ticket, distances, callback_send);
+            channel
+                .send(event)
+                .await
+                .map_err(|_| RequestError::ChannelFailed("Service channel closed".into()))?;
+            callback_recv
+                .await
+                .map_err(|e| RequestError::ChannelFailed(e.to_string()))?
+        }
+    }
+
+    /// Sends a TOPICQUERY request for `topic` to the designated peer. `distances` are
+    /// the distances from the topic to get auxiliary nodes for.
+    #[cfg(feature = "topic-discovery")]
+    pub fn send_topic_query(
+        &self,
+        contact: NodeContact,
+        topic: TopicId,
+        distances: Vec<u64>,
+    ) -> impl Future<Output = Result<TopicQueryResult, RequestError>> + 'static + use<> {
+        let (callback_send, callback_recv) = oneshot::channel();
+        let channel = self.clone_channel();
+
+        async move {
+            let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
+
+            let event = ServiceRequest::TopicQuery(contact, topic, distances, callback_send);
+            channel
+                .send(event)
+                .await
+                .map_err(|_| RequestError::ChannelFailed("Service channel closed".into()))?;
+            callback_recv
+                .await
+                .map_err(|e| RequestError::ChannelFailed(e.to_string()))?
+        }
+    }
+
+    /// The advertisers that the local node, as a registrar, holds for `topic`.
+    #[cfg(feature = "topic-discovery")]
+    pub fn local_topic_nodes(&self, topic: TopicId) -> Vec<Enr> {
+        self.topic_table.read().nodes(&topic, Instant::now())
+    }
+
+    #[cfg(feature = "topic-discovery")]
+    fn send_topic_command(&self, request: ServiceRequest) -> Result<(), Error> {
+        self.clone_channel()?
+            .try_send(request)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => Error::Custom("Service channel full"),
+                mpsc::error::TrySendError::Closed(_) => Error::ServiceChannelClosed,
+            })
     }
 
     /// Creates an event stream channel which can be polled to receive Discv5 events.

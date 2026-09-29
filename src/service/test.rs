@@ -108,9 +108,13 @@ async fn build_service_with(
         event_stream: None,
         exit,
         #[cfg(feature = "topic-discovery")]
-        topic_table: crate::topic::TopicTable::new(config.topic.clone()),
+        topic_table: Arc::new(RwLock::new(crate::topic::TopicTable::new(
+            config.topic.clone(),
+        ))),
         #[cfg(feature = "topic-discovery")]
         ticket_sealer: crate::topic::TicketSealer::new(std::time::Instant::now()),
+        #[cfg(feature = "topic-discovery")]
+        topics: Default::default(),
         config,
         ip_mode,
         connectivity_state,
@@ -141,7 +145,7 @@ async fn build_service_ipv6(
     build_service_with(local_enr, enr_key, filters, listen_config, IpMode::Ip6).await
 }
 
-fn build_non_handler_service(
+pub(super) fn build_non_handler_service(
     local_enr: Arc<RwLock<Enr>>,
     enr_key: Arc<RwLock<CombinedKey>>,
     filters: bool,
@@ -197,9 +201,13 @@ fn build_non_handler_service(
         event_stream: None,
         exit,
         #[cfg(feature = "topic-discovery")]
-        topic_table: crate::topic::TopicTable::new(config.topic.clone()),
+        topic_table: Arc::new(RwLock::new(crate::topic::TopicTable::new(
+            config.topic.clone(),
+        ))),
         #[cfg(feature = "topic-discovery")]
         ticket_sealer: crate::topic::TicketSealer::new(std::time::Instant::now()),
+        #[cfg(feature = "topic-discovery")]
+        topics: Default::default(),
         config,
         ip_mode: IpMode::DualStack,
         connectivity_state,
@@ -807,8 +815,13 @@ mod topic {
         // A record that does not belong to the sender is dropped.
         let (other, _) = capable_enr(10033);
         service.handle_rpc_request(node_address.clone(), regtopic(other.clone()));
-        assert!(!service.topic_table.is_registered(&other.node_id(), &topic));
-        assert_eq!(service.topic_table.occupancy().0, 0);
+        assert!(
+            !service
+                .topic_table
+                .read()
+                .is_registered(&other.node_id(), &topic)
+        );
+        assert_eq!(service.topic_table.read().occupancy().0, 0);
 
         // A record whose address differs from the packet source is dropped.
         let key = CombinedKey::generate_secp256k1();
@@ -826,13 +839,19 @@ mod topic {
         assert!(
             !service
                 .topic_table
+                .read()
                 .is_registered(&elsewhere.node_id(), &topic)
         );
 
         // An empty cache admits at once.
         service.handle_rpc_request(node_address.clone(), regtopic(adv.clone()));
-        assert!(service.topic_table.is_registered(&adv.node_id(), &topic));
-        assert_eq!(service.topic_table.occupancy().0, 1);
+        assert!(
+            service
+                .topic_table
+                .read()
+                .is_registered(&adv.node_id(), &topic)
+        );
+        assert_eq!(service.topic_table.read().occupancy().0, 1);
 
         // A garbage ticket gets no reply and changes nothing.
         service.handle_rpc_request(
@@ -847,7 +866,7 @@ mod topic {
                 },
             },
         );
-        assert_eq!(service.topic_table.occupancy().0, 1);
+        assert_eq!(service.topic_table.read().occupancy().0, 1);
 
         service.handle_rpc_request(
             node_address.clone(),
@@ -859,7 +878,10 @@ mod topic {
                 },
             },
         );
-        let found = service.topic_table.random_nodes(&topic, 16, |_| true);
+        let found = service
+            .topic_table
+            .read()
+            .random_nodes(&topic, 16, |_| true);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].node_id(), adv.node_id());
     }

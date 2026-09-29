@@ -1,9 +1,13 @@
 //! Address classification mirroring go-ethereum's `p2p/netutil`, used by the registrar
 //! to decide which records may be relayed to a requester and whether a REGTOPIC record
-//! is consistent with the packet source.
+//! is consistent with the packet source, and by the registration and search tables to
+//! limit the nodes per subnet.
 
 use crate::Enr;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 // Special-use IPv4 ranges (RFC 5735, IANA special registry): never valid targets.
 const SPECIAL_V4: &[(Ipv4Addr, u8)] = &[
@@ -145,6 +149,82 @@ pub(crate) fn preferred_ip(enr: &Enr) -> Option<IpAddr> {
     }
 }
 
+/// The UDP port that goes with `preferred_ip`: an IPv6 endpoint falls back to the
+/// IPv4 port entry when the record has no IPv6 one.
+pub(crate) fn preferred_udp_port(enr: &Enr) -> Option<u16> {
+    match preferred_ip(enr)? {
+        IpAddr::V4(_) => enr.udp4(),
+        IpAddr::V6(_) => enr.udp6().or(enr.udp4()),
+    }
+}
+
+/// The first `bits` bits of an address, tagged with its family.
+fn prefix(ip: IpAddr, bits: u8) -> (bool, u128) {
+    match unmap(ip) {
+        IpAddr::V4(v4) => {
+            let bits = u32::from(bits.min(32));
+            let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+            (false, u128::from(u32::from(v4) & mask))
+        }
+        IpAddr::V6(v6) => {
+            let bits = u32::from(bits.min(128));
+            let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+            (true, u128::from(v6) & mask)
+        }
+    }
+}
+
+/// Reports whether two addresses of the same family share a prefix of `bits` bits.
+pub(crate) fn same_net(bits: u8, a: IpAddr, b: IpAddr) -> bool {
+    prefix(a, bits) == prefix(b, bits)
+}
+
+/// Tracks addresses, allowing at most `limit` of them in the same `subnet`-bit prefix.
+#[derive(Debug, Clone)]
+pub(crate) struct DistinctNetSet {
+    subnet: u8,
+    pub(crate) limit: usize,
+    members: HashMap<(bool, u128), usize>,
+}
+
+impl DistinctNetSet {
+    pub(crate) fn new(subnet: u8, limit: usize) -> Self {
+        DistinctNetSet {
+            subnet,
+            limit,
+            members: HashMap::new(),
+        }
+    }
+
+    /// Adds an address. Returns false, and adds nothing, when its subnet is full.
+    pub(crate) fn add(&mut self, ip: IpAddr) -> bool {
+        let count = self.members.entry(prefix(ip, self.subnet)).or_insert(0);
+        if *count < self.limit {
+            *count += 1;
+            return true;
+        }
+        if *count == 0 {
+            self.members.remove(&prefix(ip, self.subnet));
+        }
+        false
+    }
+
+    pub(crate) fn remove(&mut self, ip: IpAddr) {
+        let key = prefix(ip, self.subnet);
+        if let Some(count) = self.members.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.members.remove(&key);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.members.values().sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +294,31 @@ mod tests {
         assert_eq!(preferred_ip(&both), Some(ip("1.2.3.4")));
         assert_eq!(preferred_ip(&enr), Some(ip("1.2.3.4")));
         assert_eq!(preferred_ip(&Enr::builder().build(&key).unwrap()), None);
+        assert_eq!(preferred_udp_port(&enr), Some(30303));
+        assert_eq!(preferred_udp_port(&both), Some(30303));
+    }
+
+    #[test]
+    fn distinct_net_set() {
+        let mut set = DistinctNetSet::new(24, 2);
+        assert!(set.add(ip("1.2.3.4")));
+        assert!(set.add(ip("1.2.3.5")));
+        assert!(!set.add(ip("1.2.3.6")));
+        assert!(set.add(ip("1.2.4.6")));
+        // A mapped address counts in the IPv4 subnet.
+        assert!(!set.add(ip("::ffff:1.2.3.7")));
+        assert!(set.add(ip("2001:4860::1")));
+        assert!(set.add(ip("2001:48ff::1")));
+        assert!(!set.add(ip("2001:4800::1")));
+        assert_eq!(set.len(), 5);
+
+        set.remove(ip("1.2.3.9"));
+        assert!(set.add(ip("1.2.3.6")));
+        set.remove(ip("9.9.9.9"));
+        assert_eq!(set.len(), 5);
+
+        assert!(same_net(24, ip("1.2.3.4"), ip("1.2.3.200")));
+        assert!(!same_net(24, ip("1.2.3.4"), ip("1.2.4.4")));
+        assert!(!same_net(24, ip("1.2.3.4"), ip("102:300::")));
     }
 }

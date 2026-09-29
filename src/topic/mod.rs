@@ -1,26 +1,99 @@
-//! Topic discovery (TopDisc) extension of discv5: the registrar side.
+//! Topic discovery (TopDisc) extension of discv5.
 //!
 //! A registrar keeps an ad cache of advertisements (`TopicTable`), admits advertisers
 //! through a waiting-time function that penalises full caches, crowded topics and
 //! clustered IP prefixes, and hands out HMAC-sealed tickets (`TicketSealer`) so an
-//! advertiser can prove how long it has waited. The wire messages live in `rpc`, the
-//! request handlers in `service::topic`.
+//! advertiser can prove how long it has waited. An advertiser walks the registrars
+//! around the topic hash with a `Registration` table, a searcher queries them with a
+//! `Search` table. The wire messages live in `rpc`, the request handlers and the
+//! registration and search loops in `service::topic`.
 
 use crate::Enr;
+use enr::NodeId;
+use std::{net::IpAddr, time::Duration};
 
 mod bound;
 mod config;
 mod iptree;
 pub(crate) mod netutil;
+mod registration;
+mod search;
+mod searchfilter;
 mod table;
 mod ticket;
 
 pub use config::TopicConfig;
+pub use registration::{RegAttempt, RegAttemptState, Registration};
+pub use search::Search;
+pub use searchfilter::SearchFilter;
 pub use table::{TOPIC_TABLE_WAIT_TIME_FLOOR, TopicTable};
 pub use ticket::{TICKET_SIZE, Ticket, TicketError, TicketSealer};
 
 /// A topic (service) identifier: a 32-byte hash.
 pub type TopicId = [u8; 32];
+
+/// The answer of a registrar to one REGTOPIC request.
+#[derive(Debug, Clone)]
+pub struct RegConfirmation {
+    /// The registrar stores the advertisement.
+    pub admitted: bool,
+    /// The ticket to send with the next attempt. Empty when admitted.
+    pub ticket: Vec<u8>,
+    /// How long to wait before the next attempt, or the advertisement lifetime when
+    /// admitted.
+    pub wait_time: Duration,
+    /// Registrars near the topic that the registrar knows.
+    pub aux: Vec<Enr>,
+}
+
+/// The answer of a registrar to one TOPICQUERY request.
+#[derive(Debug, Clone)]
+pub struct TopicQueryResult {
+    /// Nodes registered for the topic.
+    pub advertisers: Vec<Enr>,
+    /// Registrars near the topic that the registrar knows.
+    pub aux: Vec<Enr>,
+}
+
+/// What the registration and search tables need to know about a node.
+pub trait TopicNode: Clone {
+    fn node_id(&self) -> NodeId;
+    /// The sequence number of the node record.
+    fn seq(&self) -> u64;
+    /// The address the node is dialled at, if its record has one.
+    fn ip(&self) -> Option<IpAddr>;
+}
+
+impl TopicNode for Enr {
+    fn node_id(&self) -> NodeId {
+        Enr::node_id(self)
+    }
+
+    fn seq(&self) -> u64 {
+        Enr::seq(self)
+    }
+
+    fn ip(&self) -> Option<IpAddr> {
+        netutil::preferred_ip(self)
+    }
+}
+
+/// The logarithmic distance between a topic and a node id: 0 when equal, else 1..=256.
+pub(crate) fn log_dist(topic: &TopicId, id: &NodeId) -> usize {
+    for (i, (a, b)) in topic.iter().zip(id.raw().iter()).enumerate() {
+        let x = a ^ b;
+        if x != 0 {
+            return 256 - i * 8 - x.leading_zeros() as usize;
+        }
+    }
+    0
+}
+
+/// The index of the bucket that holds `id` in a table of `depth` buckets ordered far
+/// to close. Nodes closer than the last bucket go into the last bucket.
+pub(crate) fn bucket_index(topic: &TopicId, id: &NodeId, depth: usize) -> usize {
+    (256 - log_dist(topic, id)).min(depth - 1)
+}
 
 /// ENR key signalling the topic discovery capability.
 pub const TOPIC_DISCOVERY_ENR_KEY: &str = "ng";
@@ -36,6 +109,108 @@ pub fn supports_topic_discovery(enr: &Enr) -> bool {
         enr.get_decodable::<u64>(TOPIC_DISCOVERY_ENR_KEY),
         Some(Ok(TOPIC_DISCOVERY_VERSION))
     )
+}
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// A node with a chosen id, which a signed record cannot have.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct TestNode {
+        pub(crate) id: NodeId,
+        pub(crate) seq: u64,
+        pub(crate) ip: Option<IpAddr>,
+    }
+
+    impl TopicNode for TestNode {
+        fn node_id(&self) -> NodeId {
+            self.id
+        }
+
+        fn seq(&self) -> u64 {
+            self.seq
+        }
+
+        fn ip(&self) -> Option<IpAddr> {
+            self.ip
+        }
+    }
+
+    pub(crate) const TOPIC1: TopicId = {
+        let mut t = [0u8; 32];
+        t[0] = 1;
+        t[1] = 2;
+        t
+    };
+
+    /// A random id at logarithmic distance `dist` from `base`.
+    pub(crate) fn random_id(base: &[u8; 32], dist: usize) -> NodeId {
+        if dist == 0 {
+            return NodeId::new(base);
+        }
+        let mut id = *base;
+        let pos = 32 - (dist - 1) / 8 - 1;
+        let bit = 1u8 << ((dist - 1) % 8);
+        let tail: [u8; 32] = rand::random();
+        id[pos] = (base[pos] ^ bit) & !(bit - 1) | tail[pos] & (bit - 1);
+        id[pos + 1..].copy_from_slice(&tail[pos + 1..]);
+        NodeId::new(&id)
+    }
+
+    pub(crate) fn int_ip(i: usize) -> IpAddr {
+        Ipv4Addr::new(i as u8, 0, 2, i as u8).into()
+    }
+
+    pub(crate) fn node_at_distance(base: &[u8; 32], dist: usize, ip: IpAddr) -> TestNode {
+        TestNode {
+            id: random_id(base, dist),
+            seq: 1,
+            ip: Some(ip),
+        }
+    }
+
+    /// `n` nodes at distance `dist` from `base`, with addresses from `int_ip(start)` on.
+    pub(crate) fn nodes_at_distance_from(
+        base: &[u8; 32],
+        dist: usize,
+        n: usize,
+        start: usize,
+    ) -> Vec<TestNode> {
+        (0..n)
+            .map(|i| node_at_distance(base, dist, int_ip(start + i)))
+            .collect()
+    }
+
+    pub(crate) fn nodes_at_distance(base: &[u8; 32], dist: usize, n: usize) -> Vec<TestNode> {
+        nodes_at_distance_from(base, dist, n, 1)
+    }
+
+    /// The table sizes the Go tests were written for.
+    pub(crate) fn test_config() -> TopicConfig {
+        TopicConfig {
+            ad_cache_size: 20,
+            reg_table_depth: 18,
+            search_table_depth: 18,
+            reg_bucket_size: 10,
+            reg_bucket_standby_limit: 20,
+            search_bucket_size: 8,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn random_id_distance() {
+        for dist in 0..=256 {
+            let id = random_id(&TOPIC1, dist);
+            assert_eq!(log_dist(&TOPIC1, &id), dist);
+        }
+        assert_eq!(bucket_index(&TOPIC1, &random_id(&TOPIC1, 256), 18), 0);
+        assert_eq!(bucket_index(&TOPIC1, &random_id(&TOPIC1, 240), 18), 16);
+        assert_eq!(bucket_index(&TOPIC1, &random_id(&TOPIC1, 5), 18), 17);
+        assert_eq!(bucket_index(&TOPIC1, &random_id(&TOPIC1, 0), 18), 17);
+    }
 }
 
 #[cfg(test)]

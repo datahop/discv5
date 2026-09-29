@@ -77,6 +77,8 @@ pub use entry::*;
 pub use crate::handler::ConnectionDirection;
 use arrayvec::{self, ArrayVec};
 use bucket::KBucket;
+#[cfg(feature = "topic-discovery")]
+pub use bucket::TableChange;
 pub use bucket::{
     ConnectionState, FailureReason, InsertResult as BucketInsertResult, MAX_NODES_PER_BUCKET,
     UpdateResult,
@@ -464,6 +466,16 @@ where
             // Cannot insert our local entry.
             InsertResult::Failed(FailureReason::InvalidSelfUpdate)
         }
+    }
+
+    /// Returns the nodes that entered or left the table since the last call, in order
+    /// per bucket.
+    #[cfg(feature = "topic-discovery")]
+    pub fn take_changes(&mut self) -> Vec<TableChange<TNodeId>> {
+        self.buckets
+            .iter_mut()
+            .flat_map(|bucket| bucket.take_changes())
+            .collect()
     }
 
     /// Removes a node from the routing table. Returns `true` of the node existed.
@@ -1066,5 +1078,101 @@ mod tests {
 
         assert_eq!(Some(expected_applied), table.take_applied_pending());
         assert_eq!(None, table.take_applied_pending());
+    }
+
+    // The table reports the nodes that enter and leave it, and not the ones that only
+    // change their place in a bucket.
+    #[cfg(feature = "topic-discovery")]
+    #[test]
+    fn table_changes() {
+        let local_key = Key::from(NodeId::random());
+        let mut table = KBucketsTable::<_, u8>::new(
+            local_key,
+            Duration::from_millis(1),
+            MAX_NODES_PER_BUCKET,
+            None,
+            None,
+        );
+        assert!(table.take_changes().is_empty());
+
+        let key = Key::from(NodeId::random());
+        let result = table.insert_or_update(&key, 1, disconnected_state());
+        assert!(matches!(result, InsertResult::Inserted));
+        assert_eq!(table.take_changes(), [TableChange::Inserted(key.clone())]);
+        assert!(table.take_changes().is_empty());
+
+        // A new status and a new value are no changes of the membership.
+        let _ = table.insert_or_update(&key, 2, connected_state());
+        let _ = table.update_node_status(&key, ConnectionState::Disconnected, None);
+        let _ = table.update_node(&key, 3, Some(ConnectionState::Connected));
+        assert!(table.take_changes().is_empty());
+
+        assert!(table.remove(&key));
+        assert!(!table.remove(&key));
+        assert_eq!(table.take_changes(), [TableChange::Removed(key.clone())]);
+
+        // Removal through an entry.
+        let _ = table.insert_or_update(&key, 1, connected_state());
+        match table.entry(&key) {
+            Entry::Present(entry, _) => entry.remove(),
+            _ => panic!("entry missing"),
+        }
+        assert_eq!(
+            table.take_changes(),
+            [
+                TableChange::Inserted(key.clone()),
+                TableChange::Removed(key)
+            ]
+        );
+
+        // A pending node takes the place of a disconnected one.
+        let (inserted, evicted) = loop {
+            let key = Key::from(NodeId::random());
+            match table.insert_or_update(&key, 1, disconnected_state()) {
+                InsertResult::Failed(FailureReason::BucketFull) => {}
+                _ => continue,
+            }
+            match table.insert_or_update(&key, 1, connected_state()) {
+                InsertResult::Pending { disconnected } => break (key, disconnected),
+                _ => panic!("not pending"),
+            }
+        };
+        table.take_changes();
+        let index = BucketIndex::new(&inserted.distance(&table.local_key)).unwrap();
+        let ready = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        table.buckets[index.get()]
+            .pending_mut()
+            .unwrap()
+            .set_ready_at(ready);
+        assert!(matches!(table.entry(&inserted), Entry::Present(..)));
+        assert_eq!(
+            table.take_changes(),
+            [
+                TableChange::Removed(evicted),
+                TableChange::Inserted(inserted)
+            ]
+        );
+    }
+
+    // The changes that nothing collects are bounded per bucket.
+    #[cfg(feature = "topic-discovery")]
+    #[test]
+    fn table_changes_bounded() {
+        let local_key = Key::from(NodeId::random());
+        let mut table = KBucketsTable::<_, u8>::new(
+            local_key,
+            Duration::from_secs(5),
+            MAX_NODES_PER_BUCKET,
+            None,
+            None,
+        );
+        let key = Key::from(NodeId::random());
+        for _ in 0..100 {
+            let _ = table.insert_or_update(&key, 1, connected_state());
+            assert!(table.remove(&key));
+        }
+        let changes = table.take_changes();
+        assert_eq!(changes.len(), 64);
+        assert_eq!(changes.last(), Some(&TableChange::Removed(key)));
     }
 }

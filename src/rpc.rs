@@ -157,6 +157,17 @@ const MAX_TOPIC_DISTANCES: usize = 256;
 #[cfg(feature = "topic-discovery")]
 const MAX_TOPIC_NODES: usize = 16;
 
+#[cfg(feature = "topic-discovery")]
+impl RequestBody {
+    /// REGTOPIC and TOPICQUERY: the requests answered by several kinds of messages.
+    pub fn is_topic_request(&self) -> bool {
+        matches!(
+            self,
+            RequestBody::RegTopic { .. } | RequestBody::TopicQuery { .. }
+        )
+    }
+}
+
 impl Request {
     pub fn msg_type(&self) -> u8 {
         match self.body {
@@ -259,8 +270,19 @@ impl Response {
     pub fn match_request(&self, req: &RequestBody) -> bool {
         match self.body {
             ResponseBody::Pong { .. } => matches!(req, RequestBody::Ping { .. }),
+            #[cfg(not(feature = "topic-discovery"))]
             ResponseBody::Nodes { .. } => {
                 matches!(req, RequestBody::FindNode { .. })
+            }
+            // Topic requests are also answered with NODES, for the auxiliary nodes.
+            #[cfg(feature = "topic-discovery")]
+            ResponseBody::Nodes { .. } => {
+                matches!(
+                    req,
+                    RequestBody::FindNode { .. }
+                        | RequestBody::RegTopic { .. }
+                        | RequestBody::TopicQuery { .. }
+                )
             }
             ResponseBody::Talk { .. } => matches!(req, RequestBody::Talk { .. }),
             #[cfg(feature = "topic-discovery")]

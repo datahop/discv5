@@ -53,6 +53,9 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
+#[cfg(feature = "topic-discovery")]
+use crate::topic::{RegConfirmation, TopicId, TopicQueryResult, TopicTable};
+
 mod connectivity_state;
 mod ip_vote;
 mod query_info;
@@ -170,6 +173,32 @@ pub(crate) enum ServiceRequest {
     /// Sets up an event stream where the discv5 server will return various events such as
     /// discovered nodes as it traverses the DHT.
     RequestEventStream(oneshot::Sender<mpsc::Receiver<Event>>),
+    /// Send a REGTOPIC request to the designated peer and wait for the response.
+    #[cfg(feature = "topic-discovery")]
+    RegTopic(
+        NodeContact,
+        TopicId,
+        Vec<u8>,
+        Vec<u64>,
+        oneshot::Sender<Result<RegConfirmation, RequestError>>,
+    ),
+    /// Send a TOPICQUERY request to the designated peer and wait for the response.
+    #[cfg(feature = "topic-discovery")]
+    TopicQuery(
+        NodeContact,
+        TopicId,
+        Vec<u64>,
+        oneshot::Sender<Result<TopicQueryResult, RequestError>>,
+    ),
+    /// Start to advertise the local node for a topic.
+    #[cfg(feature = "topic-discovery")]
+    RegisterTopic(TopicId),
+    /// Stop to advertise the local node for a topic.
+    #[cfg(feature = "topic-discovery")]
+    StopTopic(TopicId),
+    /// Search for the given number of advertisers of a topic.
+    #[cfg(feature = "topic-discovery")]
+    TopicSearch(TopicId, usize, oneshot::Sender<Vec<Enr>>),
 }
 
 use crate::discv5::PERMIT_BAN_LIST;
@@ -214,10 +243,13 @@ pub(crate) struct Service {
     connectivity_state: ConnectivityState,
     /// The ad cache of the topic discovery registrar.
     #[cfg(feature = "topic-discovery")]
-    topic_table: crate::topic::TopicTable,
+    topic_table: Arc<RwLock<TopicTable>>,
     /// Seals the tickets handed out by the registrar.
     #[cfg(feature = "topic-discovery")]
     ticket_sealer: crate::topic::TicketSealer,
+    /// The topic registrations and searches of the local node.
+    #[cfg(feature = "topic-discovery")]
+    topics: topic::TopicSystem,
 }
 
 /// Active RPC request awaiting a response from the handler.
@@ -250,6 +282,18 @@ pub(crate) enum CallbackResponse {
     Talk(oneshot::Sender<Result<Vec<u8>, RequestError>>),
     /// A response from a Pong request
     Pong(oneshot::Sender<Result<Pong, RequestError>>),
+    /// A response to a REGTOPIC request of the user.
+    #[cfg(feature = "topic-discovery")]
+    RegConfirmation(oneshot::Sender<Result<RegConfirmation, RequestError>>),
+    /// A response to a TOPICQUERY request of the user.
+    #[cfg(feature = "topic-discovery")]
+    TopicNodes(oneshot::Sender<Result<TopicQueryResult, RequestError>>),
+    /// The REGTOPIC request belongs to the registration, by id, of a topic.
+    #[cfg(feature = "topic-discovery")]
+    TopicRegistration(TopicId, u64),
+    /// The TOPICQUERY request belongs to a search, by id.
+    #[cfg(feature = "topic-discovery")]
+    TopicSearch(u64),
 }
 
 /// For multiple responses to a FindNodes request, this keeps track of the request count
@@ -281,6 +325,7 @@ impl Service {
         enr_key: Arc<RwLock<CombinedKey>>,
         kbuckets: Arc<RwLock<KBucketsTable<NodeId, Enr>>>,
         config: Config,
+        #[cfg(feature = "topic-discovery")] topic_table: Arc<RwLock<TopicTable>>,
     ) -> Result<(oneshot::Sender<()>, mpsc::Sender<ServiceRequest>), std::io::Error> {
         // process behaviour-level configuration parameters
         let ip_votes = if config.enr_update {
@@ -325,9 +370,11 @@ impl Service {
                     event_stream: None,
                     exit,
                     #[cfg(feature = "topic-discovery")]
-                    topic_table: crate::topic::TopicTable::new(config.topic.clone()),
+                    topic_table,
                     #[cfg(feature = "topic-discovery")]
                     ticket_sealer: crate::topic::TicketSealer::new(Instant::now()),
+                    #[cfg(feature = "topic-discovery")]
+                    topics: Default::default(),
                     config: config.clone(),
                     ip_mode,
                     connectivity_state,
@@ -343,7 +390,9 @@ impl Service {
     /// The main execution loop of the discv5 serviced.
     async fn start(&mut self) {
         loop {
-            let topic_expiry = self.topic_expiry();
+            #[cfg(feature = "topic-discovery")]
+            self.topic_table_changes();
+            let topic_wakeup = self.topic_wakeup();
             tokio::select! {
                 _ = &mut self.exit => {
                     if let Some(exit) = self.handler_exit.take() {
@@ -382,6 +431,22 @@ impl Service {
                             if callback.send(event_stream_recv).is_err() {
                                 error!("Failed to return the event stream channel");
                             }
+                        }
+                        #[cfg(feature = "topic-discovery")]
+                        ServiceRequest::RegTopic(contact, topic, ticket, buckets, callback) => {
+                            self.request_regtopic(contact, topic, ticket, buckets, callback);
+                        }
+                        #[cfg(feature = "topic-discovery")]
+                        ServiceRequest::TopicQuery(contact, topic, buckets, callback) => {
+                            self.request_topic_query(contact, topic, buckets, callback);
+                        }
+                        #[cfg(feature = "topic-discovery")]
+                        ServiceRequest::RegisterTopic(topic) => self.register_topic(topic),
+                        #[cfg(feature = "topic-discovery")]
+                        ServiceRequest::StopTopic(topic) => self.stop_topic_registration(topic),
+                        #[cfg(feature = "topic-discovery")]
+                        ServiceRequest::TopicSearch(topic, count, callback) => {
+                            self.start_topic_search(topic, count, callback);
                         }
                     }
                 }
@@ -441,9 +506,9 @@ impl Service {
                 event = Service::bucket_maintenance_poll(&self.kbuckets) => {
                     self.send_event(event);
                 }
-                _ = Service::topic_expiry_poll(topic_expiry) => {
+                _ = Service::topic_wakeup_poll(topic_wakeup) => {
                     #[cfg(feature = "topic-discovery")]
-                    self.topic_table.expire(Instant::now());
+                    self.topic_tick();
                 }
                 query_event = Service::query_event_poll(&mut self.queries) => {
                     match query_event {
@@ -746,10 +811,20 @@ impl Service {
                 %node_address,
                 "Node gave an incorrect response type. Ignoring response"
             );
+            // The handler has dropped the request, so no timeout follows.
+            #[cfg(feature = "topic-discovery")]
+            if active_request.request_body.is_topic_request() {
+                self.topic_request_failed(id, active_request, RequestError::InvalidRemotePacket);
+            }
             return;
         }
 
         let node_id = node_address.node_id;
+
+        #[cfg(feature = "topic-discovery")]
+        if active_request.request_body.is_topic_request() {
+            return self.handle_topic_response(node_address, id, active_request, response.body);
+        }
 
         match response.body {
             ResponseBody::Nodes { total, mut nodes } => {
@@ -906,8 +981,7 @@ impl Service {
                     _ => error!("Invalid callback for response"),
                 }
             }
-            // The requester side of topic discovery is not implemented yet: no REGTOPIC or
-            // TOPICQUERY is ever sent, so these can only be unsolicited.
+            // These only match topic requests, which are handled above.
             #[cfg(feature = "topic-discovery")]
             ResponseBody::RegConfirmation { .. } | ResponseBody::TopicNodes { .. } => {
                 debug!(%node_address, "Ignoring topic discovery response");
@@ -1542,6 +1616,11 @@ impl Service {
     fn rpc_failure(&mut self, id: RequestId, error: RequestError) {
         trace!(reason = ?error, %id, "RPC Error removing request.");
         if let Some(active_request) = self.active_requests.remove(&id) {
+            #[cfg(feature = "topic-discovery")]
+            if active_request.request_body.is_topic_request() {
+                return self.topic_request_failed(id, active_request, error);
+            }
+
             // If this is initiated by the user, return an error on the callback. All callbacks
             // support a request error.
             match active_request.callback {
@@ -1565,6 +1644,9 @@ impl Service {
                         .unwrap_or_else(|_| debug!("Couldn't send Pong error response to user"));
                     return;
                 }
+                // Callbacks of topic requests, which are handled above.
+                #[cfg(feature = "topic-discovery")]
+                Some(_) => return,
                 None => {
                     // no callback to send too
                 }
@@ -1678,11 +1760,12 @@ impl Service {
         .await
     }
 
-    /// When the next topic advertisement expires, if the registrar holds any.
-    fn topic_expiry(&self) -> Option<Instant> {
+    /// When topic discovery has work to do next: an advertisement expires, a
+    /// registration attempt is due or a search goes on.
+    fn topic_wakeup(&self) -> Option<Instant> {
         #[cfg(feature = "topic-discovery")]
         {
-            self.topic_table.next_expiry()
+            self.topic_next_wakeup()
         }
         #[cfg(not(feature = "topic-discovery"))]
         {
@@ -1690,13 +1773,13 @@ impl Service {
         }
     }
 
-    /// A future that resolves once the next topic advertisement has expired, or never when
-    /// none is held. It is rebuilt on every iteration of the main loop, so a new earlier
-    /// expiry is picked up.
-    async fn topic_expiry_poll(next_expiry: Option<Instant>) {
-        match next_expiry {
+    /// A future that resolves at the given time, or never without one. It is rebuilt on
+    /// every iteration of the main loop, so a new earlier time is picked up.
+    async fn topic_wakeup_poll(wakeup: Option<Instant>) {
+        match wakeup {
+            #[cfg(feature = "topic-discovery")]
             Some(at) => tokio::time::sleep_until(at.into()).await,
-            None => future::pending().await,
+            _ => future::pending().await,
         }
     }
 

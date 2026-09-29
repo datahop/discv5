@@ -117,6 +117,19 @@ pub struct Node<TNodeId, TVal: Eq> {
     pub status: NodeStatus,
 }
 
+/// A node that entered or left a bucket. Topic discovery follows the routing table
+/// with these.
+#[cfg(feature = "topic-discovery")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableChange<TNodeId> {
+    Inserted(Key<TNodeId>),
+    Removed(Key<TNodeId>),
+}
+
+/// Changes kept per bucket while nothing collects them.
+#[cfg(feature = "topic-discovery")]
+const MAX_TABLE_CHANGES: usize = 64;
+
 /// The position of a node in a `KBucket`, i.e. a non-negative integer
 /// in the range `[0, MAX_NODES_PER_BUCKET)`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,6 +173,10 @@ pub struct KBucket<TNodeId, TVal: Eq> {
     /// The maximum number of incoming connections allowed per bucket. Setting this to
     /// MAX_NODES_PER_BUCKET means there is no restriction on incoming nodes.
     max_incoming: usize,
+
+    /// Insertions and removals since the last call to `take_changes`.
+    #[cfg(feature = "topic-discovery")]
+    changes: VecDeque<TableChange<TNodeId>>,
 }
 
 /// The result of inserting an entry into a bucket.
@@ -258,7 +275,33 @@ where
             pending_timeout,
             filter,
             max_incoming,
+            #[cfg(feature = "topic-discovery")]
+            changes: VecDeque::new(),
         }
+    }
+
+    #[cfg(feature = "topic-discovery")]
+    fn note_change(&mut self, change: TableChange<TNodeId>) {
+        if self.changes.len() >= MAX_TABLE_CHANGES {
+            self.changes.pop_front();
+        }
+        self.changes.push_back(change);
+    }
+
+    fn note_inserted(&mut self, _key: &Key<TNodeId>) {
+        #[cfg(feature = "topic-discovery")]
+        self.note_change(TableChange::Inserted(_key.clone()));
+    }
+
+    fn note_removed(&mut self, _key: &Key<TNodeId>) {
+        #[cfg(feature = "topic-discovery")]
+        self.note_change(TableChange::Removed(_key.clone()));
+    }
+
+    /// Returns the insertions and removals since the last call, oldest first.
+    #[cfg(feature = "topic-discovery")]
+    pub fn take_changes(&mut self) -> VecDeque<TableChange<TNodeId>> {
+        std::mem::take(&mut self.changes)
     }
 
     /// Returns a reference to the pending node of the bucket, if there is any.
@@ -325,7 +368,10 @@ where
                     // A connected pending node goes at the end of the list for
                     // the connected peers, removing the least-recently connected.
                     if pending.status().is_connected() {
-                        let evicted = Some(self.nodes.remove(0));
+                        let evicted = self.nodes.remove(0);
+                        self.note_removed(&evicted.key);
+                        self.note_inserted(&inserted);
+                        let evicted = Some(evicted);
                         self.first_connected_pos = self
                             .first_connected_pos
                             .map_or_else(|| Some(self.nodes.len()), |p| p.checked_sub(1));
@@ -336,14 +382,20 @@ where
                     // for the disconnected peers.
                     else if let Some(p) = self.first_connected_pos {
                         if let Some(insert_pos) = p.checked_sub(1) {
-                            let evicted = Some(self.nodes.remove(0));
+                            let evicted = self.nodes.remove(0);
+                            self.note_removed(&evicted.key);
+                            self.note_inserted(&inserted);
+                            let evicted = Some(evicted);
                             self.nodes.insert(insert_pos, pending.node);
                             return Some(AppliedPending { inserted, evicted });
                         }
                     } else {
                         // All nodes are disconnected. Insert the new node as the most
                         // recently disconnected, removing the least-recently disconnected.
-                        let evicted = Some(self.nodes.remove(0));
+                        let evicted = self.nodes.remove(0);
+                        self.note_removed(&evicted.key);
+                        self.note_inserted(&inserted);
+                        let evicted = Some(evicted);
                         self.nodes.push(pending.node);
                         return Some(AppliedPending { inserted, evicted });
                     }
@@ -431,7 +483,7 @@ where
                 self.pending = None
             }
             // Reinsert the node with the desired status.
-            match self.insert(node) {
+            match self.insert_node(node) {
                 InsertResult::Inserted => {
                     if not_modified {
                         UpdateResult::NotModified
@@ -444,12 +496,14 @@ where
                     }
                 }
                 InsertResult::TooManyIncoming => {
+                    self.note_removed(key);
                     UpdateResult::Failed(FailureReason::TooManyIncoming)
                 }
                 // Node could not be inserted. None of these should be possible.
                 InsertResult::FailedFilter => {
                     // If the filter is non-deterministic, potentially a re-insertion of the same
                     // node can fail the filter.
+                    self.note_removed(key);
                     UpdateResult::Failed(FailureReason::BucketFilter)
                 }
                 InsertResult::NodeExists => {
@@ -497,6 +551,7 @@ where
                 {
                     // Node is removed, update the `first_connected_pos` accordingly.
                     self.update_first_connected_pos_for_removal(pos);
+                    self.note_removed(key);
 
                     return UpdateResult::Failed(FailureReason::BucketFilter);
                 }
@@ -538,6 +593,18 @@ where
     /// returned. Similarly, if the inserted node would violate the `max_incoming` value, the
     /// result will return [`InsertResult::TooManyIncoming`].
     pub fn insert(&mut self, node: Node<TNodeId, TVal>) -> InsertResult<TNodeId> {
+        #[cfg(feature = "topic-discovery")]
+        let key = node.key.clone();
+        let result = self.insert_node(node);
+        #[cfg(feature = "topic-discovery")]
+        if matches!(result, InsertResult::Inserted) {
+            self.note_inserted(&key);
+        }
+        result
+    }
+
+    /// `insert` without the change record: used to move a node within the bucket.
+    fn insert_node(&mut self, node: Node<TNodeId, TVal>) -> InsertResult<TNodeId> {
         // Prevent inserting duplicate nodes.
         if self.position(&node.key).is_some() {
             return InsertResult::NodeExists;
@@ -612,6 +679,7 @@ where
         if let Some(Position(position)) = self.position(key) {
             self.nodes.remove(position);
             self.update_first_connected_pos_for_removal(position);
+            self.note_removed(key);
             self.apply_pending();
             true
         } else {

@@ -820,3 +820,296 @@ async fn test_bucket_limits() {
     // Number of entries should be equal to `bucket_limit`.
     assert_eq!(discv5.kbuckets.read().iter_ref().count(), bucket_limit);
 }
+
+/// Topic discovery between nodes of this crate, over UDP sockets on the loopback
+/// interface.
+#[cfg(feature = "topic-discovery")]
+mod topic {
+    use super::*;
+    use crate::topic::{TopicConfig, TopicId, supports_topic_discovery};
+    use std::time::Duration;
+
+    const TOPIC: TopicId = [7u8; 32];
+
+    /// Starts `n` nodes that all have each other in the routing table.
+    async fn build_topic_nodes(n: usize, base_port: u16, topic: TopicConfig) -> Vec<Discv5> {
+        let mut nodes = Vec::new();
+        for port in base_port..base_port + n as u16 {
+            let enr_key = CombinedKey::generate_secp256k1();
+            let listen_config = ListenConfig::Ipv4 {
+                ip: Ipv4Addr::LOCALHOST,
+                port,
+            };
+            let config = ConfigBuilder::new(listen_config)
+                .topic_config(topic.clone())
+                .query_timeout(Duration::from_secs(30))
+                .build();
+            let enr = Enr::builder()
+                .ip4(Ipv4Addr::LOCALHOST)
+                .udp4(port)
+                .build(&enr_key)
+                .unwrap();
+            let mut discv5 = Discv5::new(enr, enr_key, config).unwrap();
+            discv5.start().await.unwrap();
+            assert!(supports_topic_discovery(&discv5.local_enr()));
+            nodes.push(discv5);
+        }
+        for node in &nodes {
+            for other in &nodes {
+                if node.local_enr().node_id() != other.local_enr().node_id() {
+                    node.add_enr(other.local_enr()).unwrap();
+                }
+            }
+        }
+        nodes
+    }
+
+    /// Waits until `registrars` of the nodes hold an ad of `advertiser`.
+    async fn wait_registered(nodes: &[Discv5], advertiser: NodeId, registrars: usize) {
+        let holds = |node: &Discv5| {
+            node.local_topic_nodes(TOPIC)
+                .iter()
+                .any(|enr| enr.node_id() == advertiser)
+        };
+        for _ in 0..200 {
+            if nodes.iter().filter(|node| holds(node)).count() >= registrars {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{advertiser} is not registered on {registrars} nodes");
+    }
+
+    fn sorted_ids(nodes: &[crate::Enr]) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = nodes.iter().map(|enr| enr.node_id()).collect();
+        ids.sort_by_key(|id| id.raw());
+        ids
+    }
+
+    // Two nodes register, the second one through a ticket and its waiting time, and a
+    // third node finds both.
+    #[tokio::test]
+    async fn register_and_search() {
+        init();
+        let config = TopicConfig {
+            // The second ad of the topic has to wait 0.05 of this.
+            ad_lifetime: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let nodes = build_topic_nodes(5, 12000, config).await;
+        let ids: Vec<NodeId> = nodes.iter().map(|n| n.local_enr().node_id()).collect();
+        assert!(nodes[2].local_topic_nodes(TOPIC).is_empty());
+
+        let mut events = nodes[1].event_stream().await.unwrap();
+
+        nodes[0].register_topic(TOPIC).unwrap();
+        // Registering again changes nothing.
+        nodes[0].register_topic(TOPIC).unwrap();
+        wait_registered(&nodes, ids[0], 4).await;
+        assert!(nodes[0].local_topic_nodes(TOPIC).is_empty());
+
+        let started = std::time::Instant::now();
+        nodes[1].register_topic(TOPIC).unwrap();
+        wait_registered(&nodes[2..], ids[1], 3).await;
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the second ad was admitted without waiting"
+        );
+        // Node 0 holds no other ad of the topic and admits at once, the others do after
+        // the waiting time.
+        let mut registrars = Vec::new();
+        while registrars.len() < 4 {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("no registration event")
+                .unwrap();
+            if let Event::TopicRegistered { topic, registrar } = event {
+                assert_eq!(topic, TOPIC);
+                registrars.push(registrar);
+            }
+        }
+        registrars.sort_by_key(|id| id.raw());
+        registrars.dedup();
+        assert_eq!(registrars.len(), 4);
+        assert!(!registrars.contains(&ids[1]));
+
+        let mut found_events = nodes[2].event_stream().await.unwrap();
+        let found = nodes[2].topic_search(TOPIC, 2).await.unwrap();
+        assert_eq!(
+            sorted_ids(&found),
+            sorted_ids(&[nodes[0].local_enr(), nodes[1].local_enr()])
+        );
+        assert!(found.iter().all(supports_topic_discovery));
+
+        let mut reported = Vec::new();
+        while reported.len() < 2 {
+            let event = tokio::time::timeout(Duration::from_secs(5), found_events.recv())
+                .await
+                .expect("no search event")
+                .unwrap();
+            if let Event::TopicNodesFound { topic, nodes } = event {
+                assert_eq!(topic, TOPIC);
+                reported.extend(nodes);
+            }
+        }
+        assert_eq!(sorted_ids(&reported), sorted_ids(&found));
+
+        nodes[0].stop_topic_registration(TOPIC).unwrap();
+        nodes[0].stop_topic_registration(TOPIC).unwrap();
+    }
+
+    // The same with the adaptive search distance.
+    #[tokio::test]
+    async fn register_and_search_adaptive() {
+        init();
+        let config = TopicConfig {
+            ad_lifetime: Duration::from_secs(10),
+            search_yield_floor: 4,
+            // All registrars of a bucket are active, wherever the node ids fall.
+            reg_bucket_size: 16,
+            ..Default::default()
+        };
+        let nodes = build_topic_nodes(8, 12020, config).await;
+        let ids: Vec<NodeId> = nodes.iter().map(|n| n.local_enr().node_id()).collect();
+
+        for node in &nodes[..3] {
+            node.register_topic(TOPIC).unwrap();
+        }
+        for id in &ids[..3] {
+            wait_registered(&nodes[3..], *id, 5).await;
+        }
+
+        let found = nodes[7].topic_search(TOPIC, 3).await.unwrap();
+        let advertisers: Vec<crate::Enr> = nodes[..3].iter().map(|n| n.local_enr()).collect();
+        assert_eq!(sorted_ids(&found), sorted_ids(&advertisers));
+    }
+
+    // A search ends at the query timeout with what it found.
+    #[tokio::test]
+    async fn search_ends_at_timeout() {
+        init();
+        let mut nodes = Vec::new();
+        for port in 12040..12043u16 {
+            let enr_key = CombinedKey::generate_secp256k1();
+            let listen_config = ListenConfig::Ipv4 {
+                ip: Ipv4Addr::LOCALHOST,
+                port,
+            };
+            let config = ConfigBuilder::new(listen_config)
+                .query_timeout(Duration::from_secs(3))
+                .build();
+            let enr = Enr::builder()
+                .ip4(Ipv4Addr::LOCALHOST)
+                .udp4(port)
+                .build(&enr_key)
+                .unwrap();
+            let mut discv5 = Discv5::new(enr, enr_key, config).unwrap();
+            discv5.start().await.unwrap();
+            nodes.push(discv5);
+        }
+        nodes[0].add_enr(nodes[1].local_enr()).unwrap();
+        nodes[0].add_enr(nodes[2].local_enr()).unwrap();
+        nodes[1].add_enr(nodes[2].local_enr()).unwrap();
+
+        nodes[1].register_topic(TOPIC).unwrap();
+        wait_registered(&nodes[2..], nodes[1].local_enr().node_id(), 1).await;
+
+        let started = std::time::Instant::now();
+        let found = nodes[0].topic_search(TOPIC, 2).await.unwrap();
+        assert_eq!(sorted_ids(&found), vec![nodes[1].local_enr().node_id()]);
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(6));
+
+        assert!(nodes[0].topic_search(TOPIC, 0).await.unwrap().is_empty());
+    }
+
+    // A registrar drops the ads of a node that leaves its routing table.
+    #[tokio::test]
+    async fn table_removal_evicts_ad() {
+        init();
+        let nodes = build_topic_nodes(3, 12080, TopicConfig::default()).await;
+        let advertiser = nodes[0].local_enr().node_id();
+        let registrar: NodeContact = nodes[1].local_enr().into();
+        let confirmation = nodes[0]
+            .send_regtopic(registrar, TOPIC, vec![], vec![])
+            .await
+            .unwrap();
+        assert!(confirmation.admitted);
+        assert_eq!(nodes[1].local_topic_nodes(TOPIC).len(), 1);
+
+        assert!(nodes[1].remove_node(&advertiser));
+        // The service sees the removal when it next runs.
+        nodes[2].send_ping(nodes[1].local_enr()).await.unwrap();
+        for _ in 0..100 {
+            if nodes[1].local_topic_nodes(TOPIC).is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the ad is still in the cache");
+    }
+
+    // The requests to a designated peer.
+    #[tokio::test]
+    async fn designated_requests() {
+        init();
+        let nodes = build_topic_nodes(4, 12060, TopicConfig::default()).await;
+        let registrar: NodeContact = nodes[1].local_enr().into();
+
+        let confirmation = nodes[0]
+            .send_regtopic(
+                registrar.clone(),
+                TOPIC,
+                vec![],
+                (249..=256).rev().collect(),
+            )
+            .await
+            .unwrap();
+        assert!(confirmation.admitted);
+        assert!(confirmation.ticket.is_empty());
+        assert_eq!(confirmation.wait_time, TopicConfig::default().ad_lifetime);
+        // The auxiliary nodes come from the routing table of the registrar, at most one
+        // per distance.
+        let registrar_id = nodes[1].local_enr().node_id();
+        assert!(!confirmation.aux.is_empty() && confirmation.aux.len() <= 3);
+        assert!(confirmation.aux.iter().all(|e| e.node_id() != registrar_id));
+        assert!(confirmation.aux.iter().all(supports_topic_discovery));
+        assert_eq!(
+            sorted_ids(&nodes[1].local_topic_nodes(TOPIC)),
+            vec![nodes[0].local_enr().node_id()]
+        );
+
+        // A second topic ad of another node has to wait.
+        let confirmation = nodes[2]
+            .send_regtopic(registrar.clone(), TOPIC, vec![], vec![])
+            .await
+            .unwrap();
+        assert!(!confirmation.admitted);
+        assert_eq!(confirmation.ticket.len(), crate::topic::TICKET_SIZE);
+        assert!(confirmation.wait_time > Duration::from_secs(40));
+        assert!(confirmation.aux.is_empty());
+
+        let result = nodes[3]
+            .send_topic_query(registrar, TOPIC, (249..=256).rev().collect())
+            .await
+            .unwrap();
+        assert_eq!(
+            sorted_ids(&result.advertisers),
+            vec![nodes[0].local_enr().node_id()]
+        );
+        assert!(!result.aux.is_empty() && result.aux.len() <= 3);
+        assert!(result.aux.iter().all(supports_topic_discovery));
+
+        // A node that does not answer.
+        let key = CombinedKey::generate_secp256k1();
+        let silent = Enr::builder()
+            .ip4(Ipv4Addr::LOCALHOST)
+            .udp4(12099)
+            .build(&key)
+            .unwrap();
+        let result = nodes[0]
+            .send_topic_query(silent.into(), TOPIC, vec![256])
+            .await;
+        assert_eq!(result.unwrap_err(), RequestError::Timeout);
+    }
+}
