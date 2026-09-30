@@ -20,6 +20,47 @@ pub(crate) struct InternalMetrics {
     pub ipv4_contactable: AtomicBool,
     /// Whether we consider ourselves contactable or not on ipv6.
     pub ipv6_contactable: AtomicBool,
+    /// Topic discovery message counters.
+    #[cfg(feature = "topic-discovery")]
+    pub topic: TopicCounters,
+}
+
+/// Counts of topic discovery messages, cumulative since start.
+#[cfg(feature = "topic-discovery")]
+#[derive(Default)]
+pub(crate) struct TopicCounters {
+    pub regtopic_sent: AtomicUsize,
+    pub regtopic_recv: AtomicUsize,
+    pub topicquery_sent: AtomicUsize,
+    pub topicquery_recv: AtomicUsize,
+    pub regconfirmation_recv: AtomicUsize,
+    pub topicnodes_recv: AtomicUsize,
+}
+
+#[cfg(feature = "topic-discovery")]
+impl TopicCounters {
+    pub(crate) fn snapshot(&self) -> TopicMetrics {
+        TopicMetrics {
+            regtopic_sent: self.regtopic_sent.load(Ordering::Relaxed),
+            regtopic_recv: self.regtopic_recv.load(Ordering::Relaxed),
+            topicquery_sent: self.topicquery_sent.load(Ordering::Relaxed),
+            topicquery_recv: self.topicquery_recv.load(Ordering::Relaxed),
+            regconfirmation_recv: self.regconfirmation_recv.load(Ordering::Relaxed),
+            topicnodes_recv: self.topicnodes_recv.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Counts of topic discovery messages, cumulative since start.
+#[cfg(feature = "topic-discovery")]
+#[derive(Clone, Debug, Default)]
+pub struct TopicMetrics {
+    pub regtopic_sent: usize,
+    pub regtopic_recv: usize,
+    pub topicquery_sent: usize,
+    pub topicquery_recv: usize,
+    pub regconfirmation_recv: usize,
+    pub topicnodes_recv: usize,
 }
 
 impl Default for InternalMetrics {
@@ -32,6 +73,8 @@ impl Default for InternalMetrics {
             bytes_recv: AtomicUsize::new(0),
             ipv4_contactable: AtomicBool::new(false),
             ipv6_contactable: AtomicBool::new(false),
+            #[cfg(feature = "topic-discovery")]
+            topic: TopicCounters::default(),
         }
     }
 }
@@ -65,6 +108,9 @@ pub struct Metrics {
     pub ipv4_contactable: bool,
     /// Whether we consider ourselves contactable or not.
     pub ipv6_contactable: bool,
+    /// Topic discovery message counters.
+    #[cfg(feature = "topic-discovery")]
+    pub topic: TopicMetrics,
 }
 
 impl From<&METRICS> for Metrics {
@@ -79,6 +125,8 @@ impl From<&METRICS> for Metrics {
             bytes_recv: internal_metrics.bytes_recv.load(Ordering::Relaxed),
             ipv4_contactable: internal_metrics.ipv4_contactable.load(Ordering::Relaxed),
             ipv6_contactable: internal_metrics.ipv6_contactable.load(Ordering::Relaxed),
+            #[cfg(feature = "topic-discovery")]
+            topic: internal_metrics.topic.snapshot(),
         }
     }
 }

@@ -887,13 +887,14 @@ mod topic {
     }
 
     // Two nodes register, the second one through a ticket and its waiting time, and a
-    // third node finds both.
+    // third node finds both with the default search.
     #[tokio::test]
     async fn register_and_search() {
         init();
         let config = TopicConfig {
             // The second ad of the topic has to wait 0.05 of this.
             ad_lifetime: Duration::from_secs(30),
+            search_yield_floor: 0,
             ..Default::default()
         };
         let nodes = build_topic_nodes(5, 12000, config).await;

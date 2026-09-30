@@ -144,16 +144,21 @@ impl<N: TopicNode> Search<N> {
     }
 
     /// The distances at which the table has space available. An adaptive search lists
-    /// the distances around its active bucket first.
+    /// the distances within `search_aux_radius` of its active bucket, and only those
+    /// unless the radius is `None`.
     pub fn buckets_with_free_space(&self) -> Vec<u64> {
         let free = |i: usize| self.buckets[i].count() < self.config.search_bucket_size;
         let mut dists = Vec::with_capacity(self.buckets.len());
         if self.adaptive() {
             let last = self.buckets.len() - 1;
-            for i in self.active.saturating_sub(1)..=(self.active + 1).min(last) {
+            let r = self.config.search_aux_radius.unwrap_or(0).max(1);
+            for i in self.active.saturating_sub(r)..=(self.active + r).min(last) {
                 if free(i) {
                     dists.push(self.buckets[i].dist);
                 }
+            }
+            if self.config.search_aux_radius.is_some() {
+                return dists;
             }
         }
         for i in 0..self.buckets.len() {
@@ -665,15 +670,40 @@ mod tests {
         s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 249, 1, 2), now);
         s.set_active_bucket(5);
 
-        let dists = s.buckets_with_free_space();
-        assert_eq!(dists.len(), DEPTH);
-        assert_eq!(dists[..4], [252, 251, 250, 256]);
+        // Aux nodes are requested around the active bucket only.
+        assert_eq!(s.buckets_with_free_space(), [252, 251, 250]);
 
         let n = s.query_target().unwrap();
         assert_eq!(s.bucket_index(&n.id), 7);
         s.add_query_results(&n, [], now);
         let n = s.query_target().unwrap();
         assert_eq!(s.bucket_index(&n.id), 2);
+    }
+
+    // An adaptive search asks to refill only the buckets within `search_aux_radius` of
+    // its active bucket; `None` lists every bucket with free space, the neighbourhood
+    // first.
+    #[test]
+    fn adaptive_free_space_radius() {
+        let mut s = search(adaptive_config());
+        s.set_active_bucket(3);
+        assert_eq!(s.buckets_with_free_space(), [254, 253, 252]);
+
+        let mut s = search(TopicConfig {
+            search_aux_radius: Some(2),
+            ..adaptive_config()
+        });
+        s.set_active_bucket(3);
+        assert_eq!(s.buckets_with_free_space(), [255, 254, 253, 252, 251]);
+
+        let mut s = search(TopicConfig {
+            search_aux_radius: None,
+            ..adaptive_config()
+        });
+        s.set_active_bucket(3);
+        let dists = s.buckets_with_free_space();
+        assert_eq!(dists.len(), DEPTH);
+        assert_eq!(dists[..4], [254, 253, 252, 256]);
     }
 
     // An adaptive pass ends once the active bucket is exhausted, and not while results

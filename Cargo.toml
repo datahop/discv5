@@ -55,6 +55,10 @@ rand_xorshift = "0.5"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[[example]]
+name = "topdisc_node"
+required-features = ["topic-discovery"]
+
 [features]
 libp2p = ["dep:libp2p-identity", "dep:multiaddr"]
 serde = ["enr/serde"]

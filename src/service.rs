@@ -54,7 +54,12 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "topic-discovery")]
-use crate::topic::{RegConfirmation, TopicId, TopicQueryResult, TopicTable};
+use crate::{
+    metrics::METRICS,
+    topic::{RegConfirmation, TopicId, TopicQueryResult, TopicTable},
+};
+#[cfg(feature = "topic-discovery")]
+use std::sync::atomic::Ordering;
 
 mod connectivity_state;
 mod ip_vote;
@@ -768,10 +773,15 @@ impl Service {
                 enr,
                 buckets,
             } => {
+                METRICS.topic.regtopic_recv.fetch_add(1, Ordering::Relaxed);
                 self.handle_regtopic(node_address, id, topic, ticket, enr, buckets);
             }
             #[cfg(feature = "topic-discovery")]
             RequestBody::TopicQuery { topic, buckets } => {
+                METRICS
+                    .topic
+                    .topicquery_recv
+                    .fetch_add(1, Ordering::Relaxed);
                 self.handle_topic_query(node_address, id, topic, buckets);
             }
         }
@@ -1332,6 +1342,19 @@ impl Service {
         let contact = active_request.contact.clone();
 
         debug!(%request, node = %contact,"Sending RPC to node");
+        #[cfg(feature = "topic-discovery")]
+        match request.body {
+            RequestBody::RegTopic { .. } => {
+                METRICS.topic.regtopic_sent.fetch_add(1, Ordering::Relaxed);
+            }
+            RequestBody::TopicQuery { .. } => {
+                METRICS
+                    .topic
+                    .topicquery_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         if self
             .handler_send
             .send(HandlerIn::Request(contact, Box::new(request)))

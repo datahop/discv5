@@ -113,8 +113,7 @@ impl<N: TopicNode> Registration<N> {
         let depth = config.reg_table_depth.clamp(1, 256);
         let buckets = (0..depth)
             .map(|i| RegBucket {
-                // As in the Go table: the label runs opposite to the bucket order.
-                dist: (256 - (depth - 1) + i) as u64,
+                dist: (256 - i) as u64,
                 att: HashMap::new(),
                 count: [0; 3],
                 ips: DistinctNetSet::new(REG_BUCKET_SUBNET, REG_BUCKET_IP_LIMIT),
@@ -483,7 +482,7 @@ mod tests {
         assert_eq!(r.node_count(), 0);
     }
 
-    // The distance labels run opposite to the bucket order, as in the Go table.
+    // A bucket carries the distance of the nodes it holds.
     #[test]
     fn free_space_labels() {
         let now = Instant::now();
@@ -491,18 +490,23 @@ mod tests {
         config.reg_bucket_standby_limit = 2;
         config.reg_bucket_size = 1;
         let mut r = registration(config);
+        let depth = r.buckets.len();
+        for d in [256, 255, 256 - (depth - 1)] {
+            let n = node_at_distance(&TOPIC1, d, int_ip(d));
+            assert_eq!(r.buckets[r.bucket_index(&n.id)].dist, d as u64);
+        }
         let dists = r.buckets_with_free_space();
-        assert_eq!(dists, (239..=256).collect::<Vec<u64>>());
+        assert_eq!(dists, (239..=256).rev().collect::<Vec<u64>>());
 
-        // Bucket 0 holds the nodes at distance 256 and carries the label 239. One node
-        // becomes active, two fill the standby list.
+        // Fill the farthest bucket: one node becomes active, two fill the standby list.
+        // Its distance leaves the list, the others stay.
         for n in nodes_at_distance(&TOPIC1, 256, 3) {
             r.add_nodes(None, [n], now);
         }
         assert_eq!(bucket_count(&r, 0), 3);
         assert_eq!(
             r.buckets_with_free_space(),
-            (240..=256).collect::<Vec<u64>>()
+            (239..=255).rev().collect::<Vec<u64>>()
         );
     }
 

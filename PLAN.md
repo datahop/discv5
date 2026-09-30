@@ -111,6 +111,13 @@ The Go field `OpID` is `rlp:"-"`: it is not on the wire.
 - Search table per pass: `search_table_depth` buckets, far to close, `search_bucket_size`
   nodes per bucket (unasked and asked together), one non-LAN address per /24, one node per
   bucket from one response.
+- Defaults (Go commit `0b46128ea`): `search_yield_floor` 8 (adaptive on; 0 turns it
+  off), `search_aux_radius` `Some(1)` (a query lists only the free buckets within the
+  radius of the active bucket; `None` lists the neighbourhood first, then every free
+  bucket), `search_pass_backoff` `Some(60 s)` (the gap between passes starts at 2 s and
+  doubles after every pass that returned nothing new, `min(cap, 2 s << idle_passes)`,
+  reset by a pass with results; `None` keeps 2 s). Go encodes "unset" as 0 and "off"
+  as a negative value; Rust uses the default and `0` / `None`.
 - Default search (`search_yield_floor = 0`): the target is a random unasked node of a
   random bucket of the pool. The pool holds the buckets with unasked nodes, far to close,
   up to and including the first one that has not answered a request. The pass ends when no
@@ -255,11 +262,10 @@ Phase 3:
    commit `1e72b0066`). The depths are configuration in Rust, constants in Go. The ported
    unit tests use the sizes of the worktree. `Search::observe` uses
    `TopicConfig::topic_nodes_limit` where Go uses the constant `TopicNodesLimit`.
-9. Labels of the registration buckets (`registration.go:137`). Go gives bucket `i` the
-   label `256 - (depth - 1) + i`, while `bucketIndex` puts the nodes at distance 256 into
-   bucket 0. `BucketsWithFreeSpace` thus lists the distances in ascending order and drops
-   the mirror distance of a full bucket. Ported as is (test `free_space_labels`). Likely a
-   bug, see the report of phase 3.
+9. Labels of the registration buckets (`registration.go:137`). Bucket `i` holds the
+   nodes at distance `256 - i` and carries that label (Go commit `391c4ea3c`, which
+   replaced the mirrored labels of the phase 3 worktree). `buckets_with_free_space`
+   lists the distances far to close (test `free_space_labels`).
 10. Attempt handles. Go passes `*RegAttempt`; Rust passes the node id. A response for an
     attempt that is not in flight (removed in the meantime) changes nothing. Go panics in
     `removeAttempt` or puts a removed attempt back on the heap in this case

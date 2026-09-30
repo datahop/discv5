@@ -7,6 +7,7 @@ use crate::{
     Enr, Event, RequestError,
     handler::HandlerIn,
     kbucket::{self, TableChange},
+    metrics::METRICS,
     node_info::{NodeAddress, NodeContact},
     rpc::{RequestBody, RequestId, Response, ResponseBody},
     topic::{
@@ -22,6 +23,7 @@ use rand::{RngExt, seq::SliceRandom};
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
@@ -110,6 +112,12 @@ struct TopicSearch {
     active_bucket: usize,
     pass: Option<Search>,
     seeded_at: Option<Instant>,
+    /// The minimum length of the current pass.
+    gap: Duration,
+    /// Passes in a row that returned nothing new.
+    idle_passes: usize,
+    /// Results of the current pass.
+    pass_results: usize,
     /// The registrar of the request in flight. One request is sent at a time, and a
     /// pass does not end while it is out.
     in_flight: Option<Enr>,
@@ -119,9 +127,23 @@ impl TopicSearch {
     fn wakeup(&self) -> Option<Instant> {
         let seed = match self.pass {
             Some(_) => None,
-            None => self.seeded_at.map(|t| t + LOOP_MIN_TIME),
+            None => self.seeded_at.map(|t| t + self.gap),
         };
         Some(seed.map_or(self.deadline, |t| t.min(self.deadline)))
+    }
+
+    /// The minimum length of the next pass: `LOOP_MIN_TIME`, doubling after every pass
+    /// that returned nothing new, up to `backoff`.
+    fn pass_gap(&mut self, nresults: usize, backoff: Option<Duration>) -> Duration {
+        let Some(backoff) = backoff.filter(|_| nresults == 0) else {
+            self.idle_passes = 0;
+            return LOOP_MIN_TIME;
+        };
+        self.idle_passes += 1;
+        if self.idle_passes >= 30 {
+            return backoff;
+        }
+        backoff.min(LOOP_MIN_TIME * (1 << self.idle_passes))
     }
 
     /// Feeds the answer of a registrar into the pass.
@@ -449,7 +471,13 @@ impl Service {
         match body {
             ResponseBody::RegConfirmation {
                 ticket, wait_time, ..
-            } => response.confirmation = Some((ticket, wait_time)),
+            } => {
+                METRICS
+                    .topic
+                    .regconfirmation_recv
+                    .fetch_add(1, Ordering::Relaxed);
+                response.confirmation = Some((ticket, wait_time));
+            }
             ResponseBody::Nodes { nodes, .. } => {
                 for enr in nodes {
                     if response.aux.len() >= limit {
@@ -461,6 +489,10 @@ impl Service {
                 }
             }
             ResponseBody::TopicNodes { nodes, .. } => {
+                METRICS
+                    .topic
+                    .topicnodes_recv
+                    .fetch_add(1, Ordering::Relaxed);
                 for enr in nodes {
                     if response.advertisers.len() >= limit {
                         break;
@@ -752,9 +784,11 @@ impl Service {
             (None, Some((ticket, wait_time))) => {
                 let wait_time = Duration::from_millis(wait_time);
                 if ticket.is_empty() {
+                    debug!(%from, topic = %hex::encode(topic), lifetime_ms = wait_time.as_millis(), "Topic registration admitted");
                     reg.table.handle_registered(&from, wait_time, now);
                     registered = true;
                 } else {
+                    debug!(%from, topic = %hex::encode(topic), wait_ms = wait_time.as_millis(), "Topic registration ticket");
                     reg.table
                         .handle_ticket_response(&from, ticket, wait_time, now);
                 }
@@ -797,6 +831,9 @@ impl Service {
                 active_bucket: 0,
                 pass: None,
                 seeded_at: None,
+                gap: LOOP_MIN_TIME,
+                idle_passes: 0,
+                pass_results: 0,
                 in_flight: None,
             },
         );
@@ -820,10 +857,11 @@ impl Service {
             let pass = match &mut search.pass {
                 Some(pass) => pass,
                 None => {
-                    if search.seeded_at.is_some_and(|t| now < t + LOOP_MIN_TIME) {
+                    if search.seeded_at.is_some_and(|t| now < t + search.gap) {
                         break false;
                     }
                     search.seeded_at = Some(now);
+                    search.pass_results = 0;
                     let nodes = self.topic_capable_nodes();
                     if nodes.is_empty() {
                         break false;
@@ -848,6 +886,7 @@ impl Service {
                 }
                 search.result_filter.add(&node, now);
                 search.found.push(node.clone());
+                search.pass_results += 1;
                 new_results.push(node);
             }
             if search.found.len() >= search.count {
@@ -862,6 +901,8 @@ impl Service {
                 );
                 search.active_bucket = pass.active_bucket();
                 search.asked_filter = search.pass.take().map(Search::into_asked_filter);
+                search.gap =
+                    search.pass_gap(search.pass_results, self.config.topic.search_pass_backoff);
                 continue;
             }
 
@@ -985,6 +1026,14 @@ mod tests {
             },
         );
         assert!(matches!(result, kbucket::InsertResult::Inserted));
+    }
+
+    /// The configuration of the default search.
+    fn default_search() -> TopicConfig {
+        TopicConfig {
+            search_yield_floor: 0,
+            ..Default::default()
+        }
     }
 
     /// A service without a handler, with the given nodes in the routing table.
@@ -1273,7 +1322,7 @@ mod tests {
         assert!(ticket.is_empty());
         assert_eq!(enr, service.local_enr.read().clone());
         // The labels of the registration buckets, as the Go table lists them.
-        assert_eq!(buckets, (247..=256).collect::<Vec<u64>>());
+        assert_eq!(buckets, (247..=256).rev().collect::<Vec<u64>>());
         // One request at a time.
         assert!(next_request(&mut handler).is_none());
         assert!(service.topic_next_wakeup().is_none());
@@ -1455,7 +1504,7 @@ mod tests {
         let registrars: Vec<Enr> = (0..6).map(|i| registrar(12101 + i)).collect();
         let advertisers: Vec<Enr> = (0..3).map(|i| registrar(12201 + i)).collect();
         let not_capable = record(Ipv4Addr::LOCALHOST, 12210, false);
-        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
+        let (mut service, mut handler) = service(default_search(), &registrars);
         let (events_tx, mut events) = mpsc::channel(10);
         service.event_stream = Some(events_tx);
 
@@ -1513,7 +1562,7 @@ mod tests {
     async fn search_aux_nodes_and_failures() {
         let registrars: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
         let aux = registrar(12110);
-        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
+        let (mut service, mut handler) = service(default_search(), &registrars);
         let (tx, mut rx) = oneshot::channel();
         service.start_topic_search(TOPIC, 1, tx);
 
@@ -1561,6 +1610,7 @@ mod tests {
         let advertiser = registrar(12201);
         let config = TopicConfig {
             search_yield_floor: 4,
+            search_pass_backoff: None,
             ..Default::default()
         };
         let (mut service, mut handler) = service(config, &registrars);
@@ -1626,7 +1676,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_search_ends() {
         let registrars: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
-        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
+        let (mut service, mut handler) = service(default_search(), &registrars);
         let (tx, rx) = oneshot::channel();
         service.start_topic_search(TOPIC, 1, tx);
         let (contact, request) = next_request(&mut handler).unwrap();
@@ -1634,5 +1684,69 @@ mod tests {
         respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
         assert!(service.topics.searches.is_empty());
         assert!(next_request(&mut handler).is_none());
+    }
+
+    // The gap between passes: the minimum after a pass with results, doubling from it
+    // after every empty pass up to the back-off cap.
+    #[test]
+    fn search_pass_gap() {
+        let registrars: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
+        let (mut service, mut handler) = service(default_search(), &registrars);
+        let (tx, _rx) = oneshot::channel();
+        service.start_topic_search(TOPIC, 1, tx);
+        let id = *service.topics.searches.keys().next().unwrap();
+        let _ = next_request(&mut handler);
+        let search = service.topics.searches.get_mut(&id).unwrap();
+
+        let backoff = Some(Duration::from_secs(9));
+        for want in [4, 8, 9, 9] {
+            assert_eq!(search.pass_gap(0, backoff), Duration::from_secs(want));
+        }
+        assert_eq!(search.pass_gap(3, backoff), LOOP_MIN_TIME);
+        assert_eq!(search.pass_gap(0, backoff), Duration::from_secs(4));
+        search.idle_passes = 0;
+        for _ in 0..3 {
+            assert_eq!(search.pass_gap(0, None), LOOP_MIN_TIME);
+        }
+    }
+
+    // An empty pass delays the next one by the back-off gap; a pass with results does
+    // not.
+    #[tokio::test]
+    async fn search_pass_backoff() {
+        let registrars: Vec<Enr> = (0..1).map(|i| registrar(12101 + i)).collect();
+        let advertiser = registrar(12201);
+        let config = TopicConfig {
+            search_pass_backoff: Some(Duration::from_secs(30)),
+            ..default_search()
+        };
+        let (mut service, mut handler) = service(config, &registrars);
+        let (tx, _rx) = oneshot::channel();
+        let start = Instant::now();
+        service.start_topic_search(TOPIC, 2, tx);
+        let id = *service.topics.searches.keys().next().unwrap();
+
+        // An empty pass: the next one waits 4 s.
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
+        let wakeup = service.topic_next_wakeup().unwrap();
+        assert!(wakeup >= start + 2 * LOOP_MIN_TIME);
+        service.search_step(id, start + LOOP_MIN_TIME + Duration::from_millis(1));
+        assert!(next_request(&mut handler).is_none());
+
+        // Another empty pass: 8 s. Then a pass with a result: back to 2 s.
+        service.search_step(id, wakeup);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
+        assert_eq!(service.topics.searches[&id].gap, 4 * LOOP_MIN_TIME);
+        service.search_step(id, wakeup + 4 * LOOP_MIN_TIME);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(
+            &mut service,
+            &contact,
+            &request.id,
+            topic_nodes(vec![advertiser]),
+        );
+        assert_eq!(service.topics.searches[&id].gap, LOOP_MIN_TIME);
     }
 }

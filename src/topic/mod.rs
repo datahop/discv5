@@ -196,6 +196,7 @@ pub(crate) mod test_util {
             reg_bucket_size: 10,
             reg_bucket_standby_limit: 20,
             search_bucket_size: 8,
+            search_yield_floor: 0,
             ..Default::default()
         }
     }
