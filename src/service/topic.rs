@@ -9,9 +9,10 @@ use crate::{
     kbucket::{self, TableChange},
     metrics::METRICS,
     node_info::{NodeAddress, NodeContact},
-    rpc::{RequestBody, RequestId, Response, ResponseBody},
+    rpc::{RegTopicEnr, RequestBody, RequestId, Response, ResponseBody},
     topic::{
-        RegConfirmation, Registration, Search, SearchFilter, Ticket, TopicId, TopicQueryResult,
+        RegConfirmation, Registration, Search, SearchFilter, Ticket, TicketTiming, TopicId,
+        TopicQueryResult,
         netutil::{
             check_regtopic_record_ip, check_relay_addr, preferred_ip, preferred_udp_port, unmap,
         },
@@ -171,63 +172,95 @@ fn capable(nodes: Vec<Enr>) -> impl Iterator<Item = Enr> {
 }
 
 impl Service {
-    /// Serves REGTOPIC: admits the advertiser or issues a ticket, and attaches auxiliary
-    /// routing nodes near the topic. Invalid tickets and records get no reply.
+    /// Serves REGTOPIC in the order of the spec's admission control. Every request is
+    /// answered: a rejection with neither ticket nor wait time, an early ticket with
+    /// the same ticket and the rest of its wait, otherwise admission or a new ticket.
+    /// `now` is the one clock reading for the whole request.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_regtopic(
         &mut self,
         node_address: NodeAddress,
         id: RequestId,
         topic: TopicId,
         ticket: Vec<u8>,
-        enr: Enr,
+        enr: RegTopicEnr,
         buckets: Vec<u64>,
+        now: Instant,
     ) {
-        let Some(sealer) = &mut self.ticket_sealer else {
+        let (Some(table), Some(sealer)) = (self.topic_table.clone(), &mut self.ticket_sealer)
+        else {
             return;
         };
-        let now = Instant::now();
-        let ticket = match sealer.unpack(&topic, &ticket, now) {
-            Ok(ticket) => ticket,
+        let enr = match check_regtopic_enr(&node_address, enr.enr.map(|enr| *enr)) {
+            Ok(enr) => enr,
             Err(error) => {
-                debug!(%node_address, %error, "Invalid ticket in REGTOPIC");
+                debug!(%node_address, error, "Rejecting REGTOPIC");
+                METRICS
+                    .topic
+                    .regtopic_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                self.send_regconfirmation(node_address, id, 1, Vec::new(), 0);
                 return;
             }
         };
-        if !enr.verify() {
-            debug!(%node_address, "Node record in REGTOPIC has an invalid signature");
-            return;
-        }
-        if enr.node_id() != node_address.node_id {
-            debug!(%node_address, "Node record in REGTOPIC does not match sender");
-            return;
-        }
-        if let Err(error) = check_regtopic_record_ip(&enr, node_address.socket_addr.ip()) {
-            debug!(%node_address, error, "Bad address in REGTOPIC record");
-            return;
-        }
 
-        // Only a returning advertiser has accumulated waiting time.
-        let waited = ticket.as_ref().map_or(Duration::ZERO, |t| {
-            now.saturating_duration_since(t.first_issued)
-        });
+        let (mut waited, mut first_issued) = (Duration::ZERO, now);
+        if !ticket.is_empty() {
+            match sealer.unpack(&topic, &ticket, now) {
+                Err(error) => {
+                    debug!(%node_address, %error, "Invalid ticket in REGTOPIC");
+                    METRICS.topic.ticket_invalid.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(t) if t.node_id != node_address.node_id => {
+                    debug!(%node_address, owner = %t.node_id, "Ticket in REGTOPIC was issued to another node");
+                    METRICS.topic.ticket_foreign.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(t) => match t.timing_at(now) {
+                    TicketTiming::Early => {
+                        METRICS.topic.ticket_early.fetch_add(1, Ordering::Relaxed);
+                        let wait_time = wait_time_ms(t.window_start() - now);
+                        self.send_regconfirmation(node_address, id, 1, ticket, wait_time);
+                        return;
+                    }
+                    TicketTiming::Expired => {
+                        debug!(%node_address, "Expired ticket in REGTOPIC");
+                        METRICS.topic.ticket_expired.fetch_add(1, Ordering::Relaxed);
+                    }
+                    timing => {
+                        if self.used_tickets.use_ticket(&ticket, now) {
+                            debug!(%node_address, "Replayed ticket in REGTOPIC");
+                            METRICS
+                                .topic
+                                .ticket_replayed
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            if timing == TicketTiming::Late {
+                                METRICS.topic.ticket_late.fetch_add(1, Ordering::Relaxed);
+                            }
+                            (waited, first_issued) = regtopic_credit(&t, timing, now);
+                        }
+                    }
+                },
+            }
+        }
 
         let aux = self.collect_topic_aux_nodes(&topic, &buckets, node_address.socket_addr.ip());
         let nodes_responses = pack_node_records(aux);
         let total = 1 + nodes_responses.len() as u64;
 
-        let (Some(table), Some(sealer)) = (&self.topic_table, &mut self.ticket_sealer) else {
-            return;
-        };
+        // An advertisement already in the cache is admitted again unchanged.
         let new_wait = table.write().register(&enr, topic, waited, now);
         let (ticket, wait_time) = if new_wait > Duration::ZERO {
-            let first_issued = ticket.map_or(now, |t| t.first_issued);
             let mut ticket = Ticket {
                 key_id: 0,
                 topic,
+                node_id: node_address.node_id,
                 wait_time_issued: new_wait,
                 last_used: now,
                 first_issued,
             };
+            let sealer = self.ticket_sealer.as_mut().expect("checked above");
+            METRICS.topic.ticket_issued.fetch_add(1, Ordering::Relaxed);
             (sealer.pack(&mut ticket, now), wait_time_ms(new_wait))
         } else {
             (Vec::new(), wait_time_ms(table.read().ad_lifetime()))
@@ -241,17 +274,7 @@ impl Service {
             "Sending REGCONFIRMATION",
         );
 
-        self.send_topic_response(
-            node_address.clone(),
-            Response {
-                id: id.clone(),
-                body: ResponseBody::RegConfirmation {
-                    total,
-                    ticket,
-                    wait_time,
-                },
-            },
-        );
+        self.send_regconfirmation(node_address.clone(), id.clone(), total, ticket, wait_time);
         for nodes in nodes_responses {
             self.send_topic_response(
                 node_address.clone(),
@@ -261,6 +284,27 @@ impl Service {
                 },
             );
         }
+    }
+
+    fn send_regconfirmation(
+        &self,
+        node_address: NodeAddress,
+        id: RequestId,
+        total: u64,
+        ticket: Vec<u8>,
+        wait_time: u64,
+    ) {
+        self.send_topic_response(
+            node_address,
+            Response {
+                id,
+                body: ResponseBody::RegConfirmation {
+                    total,
+                    ticket,
+                    wait_time,
+                },
+            },
+        );
     }
 
     /// Serves TOPICQUERY: auxiliary routing nodes in NODES messages, then registered
@@ -397,7 +441,7 @@ impl Service {
         let request_body = RequestBody::RegTopic {
             topic,
             ticket,
-            enr: self.local_enr.read().clone(),
+            enr: self.local_enr.read().clone().into(),
             buckets,
         };
         self.send_rpc_request(ActiveRequest {
@@ -747,7 +791,7 @@ impl Service {
                 let request_body = RequestBody::RegTopic {
                     topic,
                     ticket: job.ticket,
-                    enr: self.local_enr.read().clone(),
+                    enr: self.local_enr.read().clone().into(),
                     buckets: job.buckets,
                 };
                 let callback = CallbackResponse::TopicRegistration(topic, reg.id);
@@ -980,6 +1024,37 @@ fn verify_response_node(sender: IpAddr, enr: &Enr, seen: &mut HashSet<NodeId>) -
     seen.insert(enr.node_id())
 }
 
+/// The record of a REGTOPIC if the registrar may store it: valid, the sender's, and
+/// with addresses that match the packet source.
+fn check_regtopic_enr(sender: &NodeAddress, enr: Option<Enr>) -> Result<Enr, &'static str> {
+    let enr = enr.ok_or("invalid node record")?;
+    if enr.node_id() != sender.node_id {
+        return Err("node record does not match sender");
+    }
+    check_regtopic_record_ip(&enr, sender.socket_addr.ip())?;
+    Ok(enr)
+}
+
+/// The waiting time credited to a ticket presented at `now`, and the first-issued time
+/// of a ticket issued in reply. A late ticket is credited the wait it was scheduled to
+/// have, with the first-issued time moved so the time past its window is not credited
+/// on the next retry either.
+fn regtopic_credit(ticket: &Ticket, timing: TicketTiming, now: Instant) -> (Duration, Instant) {
+    match timing {
+        TicketTiming::OnTime => (
+            now.saturating_duration_since(ticket.first_issued),
+            ticket.first_issued,
+        ),
+        TicketTiming::Late => {
+            let waited = ticket
+                .window_start()
+                .saturating_duration_since(ticket.first_issued);
+            (waited, now - waited)
+        }
+        TicketTiming::Early | TicketTiming::Expired => (Duration::ZERO, now),
+    }
+}
+
 /// Wait time in whole milliseconds, rounded up.
 fn wait_time_ms(d: Duration) -> u64 {
     (d.as_secs_f64() * 1000.0).ceil() as u64
@@ -1111,7 +1186,7 @@ mod tests {
             RequestBody::RegTopic {
                 topic: TOPIC,
                 ticket: vec![9],
-                enr: service.local_enr.read().clone(),
+                enr: service.local_enr.read().clone().into(),
                 buckets: vec![256, 255],
             }
         );
@@ -1332,7 +1407,7 @@ mod tests {
         };
         assert_eq!(topic, TOPIC);
         assert!(ticket.is_empty());
-        assert_eq!(enr, service.local_enr.read().clone());
+        assert_eq!(enr.enr.as_deref(), Some(&*service.local_enr.read()));
         // The labels of the registration buckets, as the Go table lists them.
         assert_eq!(buckets, (239..=256).rev().collect::<Vec<u64>>());
         // One request at a time.
@@ -1776,5 +1851,544 @@ mod tests {
             topic_nodes(vec![advertiser]),
         );
         assert_eq!(service.topics.searches[&id].gap, LOOP_MIN_TIME);
+    }
+
+    /// An advertiser at a LAN address with the matching packet source.
+    struct Advertiser {
+        enr: Enr,
+        address: NodeAddress,
+        key: CombinedKey,
+    }
+
+    fn advertiser(ip: Ipv4Addr) -> Advertiser {
+        let key = CombinedKey::generate_secp256k1();
+        let enr = Enr::builder().ip4(ip).udp4(30303).build(&key).unwrap();
+        let address = NodeAddress::new((ip, 30303).into(), enr.node_id());
+        Advertiser { enr, address, key }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Reply {
+        total: u64,
+        ticket: Vec<u8>,
+        wait_time: u64,
+        nodes: usize,
+    }
+
+    /// A registrar holding one ad for `TOPIC`, so that a new attempt has to wait about
+    /// 45 s, with one node in its routing table for the auxiliary replies.
+    struct Registrar {
+        service: Service,
+        handler: UnboundedReceiver<HandlerIn>,
+        /// The time of the next request: late enough for tickets issued in the past.
+        now: Instant,
+    }
+
+    impl Registrar {
+        fn new() -> Self {
+            Self::with_config(TopicConfig::default())
+        }
+
+        fn with_config(config: TopicConfig) -> Self {
+            let aux = loop {
+                let enr = record(Ipv4Addr::new(10, 0, 5, 1), 30303, true);
+                if crate::topic::log_dist(&TOPIC, &enr.node_id()) == 256 {
+                    break enr;
+                }
+            };
+            let (service, handler) = service(config, &[aux]);
+            let now = Instant::now() + Duration::from_secs(3600);
+            let seed = record(Ipv4Addr::new(10, 0, 9, 1), 30303, true);
+            assert!(
+                service
+                    .topic_table
+                    .as_ref()
+                    .unwrap()
+                    .write()
+                    .add(&seed, TOPIC, now)
+            );
+            Registrar {
+                service,
+                handler,
+                now,
+            }
+        }
+
+        fn request(
+            &mut self,
+            from: &NodeAddress,
+            enr: impl Into<RegTopicEnr>,
+            ticket: Vec<u8>,
+        ) -> Reply {
+            let id = RequestId(vec![7]);
+            self.service.handle_regtopic(
+                from.clone(),
+                id.clone(),
+                TOPIC,
+                ticket,
+                enr.into(),
+                vec![256],
+                self.now,
+            );
+            self.reply(from, &id)
+        }
+
+        fn reply(&mut self, from: &NodeAddress, id: &RequestId) -> Reply {
+            let mut confirmation = None;
+            let mut nodes = 0;
+            while let Ok(message) = self.handler.try_recv() {
+                let HandlerIn::Response(to, response) = message else {
+                    continue;
+                };
+                assert_eq!(&to, from);
+                assert_eq!(&response.id, id);
+                match response.body {
+                    ResponseBody::RegConfirmation {
+                        total,
+                        ticket,
+                        wait_time,
+                    } => {
+                        assert!(confirmation.is_none(), "two REGCONFIRMATION");
+                        confirmation = Some((total, ticket, wait_time));
+                    }
+                    ResponseBody::Nodes { .. } => nodes += 1,
+                    body => panic!("unexpected response {body}"),
+                }
+            }
+            let (total, ticket, wait_time) = confirmation.expect("no REGCONFIRMATION");
+            Reply {
+                total,
+                ticket,
+                wait_time,
+                nodes,
+            }
+        }
+
+        /// Seals a ticket for `TOPIC` issued `ago` before now with wait `wait`, in a
+        /// session that started `first_ago` before now.
+        fn seal(
+            &mut self,
+            node_id: NodeId,
+            topic: TopicId,
+            ago: Duration,
+            wait: Duration,
+            first_ago: Duration,
+        ) -> Vec<u8> {
+            let mut ticket = Ticket {
+                key_id: 0,
+                topic,
+                node_id,
+                wait_time_issued: wait,
+                last_used: self.now - ago,
+                first_issued: self.now - first_ago,
+            };
+            let now = self.now;
+            self.service
+                .ticket_sealer
+                .as_mut()
+                .unwrap()
+                .pack(&mut ticket, now)
+        }
+
+        fn unpack(&mut self, ticket: &[u8]) -> Ticket {
+            let now = self.now;
+            self.service
+                .ticket_sealer
+                .as_mut()
+                .unwrap()
+                .unpack(&TOPIC, ticket, now)
+                .unwrap()
+        }
+
+        fn table(&self) -> &Arc<RwLock<crate::topic::TopicTable>> {
+            self.service.topic_table.as_ref().unwrap()
+        }
+
+        fn ads(&self) -> usize {
+            self.table().read().topic_size(&TOPIC)
+        }
+
+        fn admitted(&self) -> Reply {
+            Reply {
+                total: 2,
+                ticket: Vec::new(),
+                wait_time: wait_time_ms(self.table().read().ad_lifetime()),
+                nodes: 1,
+            }
+        }
+
+        /// The wait a new attempt of `adv` is quoted now.
+        fn fresh_wait(&self, adv: &Advertiser) -> u64 {
+            wait_time_ms(self.table().read().wait_time(&adv.enr, &TOPIC, self.now))
+        }
+    }
+
+    const SEC: Duration = Duration::from_secs(1);
+
+    fn rejected() -> Reply {
+        Reply {
+            total: 1,
+            ticket: Vec::new(),
+            wait_time: 0,
+            nodes: 0,
+        }
+    }
+
+    // A record that cannot be stored is answered with a rejection, without NODES; the
+    // UDP port is not checked.
+    #[tokio::test]
+    async fn regtopic_rejections_answered() {
+        let mut reg = Registrar::new();
+        let adv = advertiser(Ipv4Addr::new(10, 0, 1, 1));
+        let other = advertiser(Ipv4Addr::new(10, 0, 1, 2));
+        let build = |f: &dyn Fn(&mut enr::Builder<CombinedKey>)| {
+            let mut builder = Enr::builder();
+            f(&mut builder);
+            builder.build(&adv.key).unwrap()
+        };
+        let v6 = |ip: &str| ip.parse::<std::net::Ipv6Addr>().unwrap();
+        let with_v6 = |ip| {
+            build(&|b| {
+                b.ip4(Ipv4Addr::new(10, 0, 1, 1))
+                    .udp4(30303)
+                    .ip6(v6(ip))
+                    .udp6(30303);
+            })
+        };
+
+        let cases: Vec<(&str, RegTopicEnr)> = vec![
+            (
+                "invalid record",
+                RegTopicEnr {
+                    rlp: Vec::new(),
+                    enr: None,
+                },
+            ),
+            ("other node", other.enr.clone().into()),
+            (
+                "no IPv4",
+                build(&|b| {
+                    b.ip6(v6("2001:4860::1")).udp6(30303);
+                })
+                .into(),
+            ),
+            (
+                "other IPv4",
+                build(&|b| {
+                    b.ip4(Ipv4Addr::new(10, 0, 1, 2)).udp4(30303);
+                })
+                .into(),
+            ),
+            ("unspecified IPv6", with_v6("::").into()),
+            ("special IPv6", with_v6("2001:db8::1").into()),
+            ("LAN IPv6", with_v6("fe80::1").into()),
+        ];
+        for (name, enr) in cases {
+            assert_eq!(
+                reg.request(&adv.address, enr, Vec::new()),
+                rejected(),
+                "{name}"
+            );
+        }
+        assert_eq!(reg.ads(), 1);
+
+        // The same requests with a usable record get a ticket and NODES.
+        let low_port = build(&|b| {
+            b.ip4(Ipv4Addr::new(10, 0, 1, 1)).udp4(1);
+        });
+        let reply = reg.request(&adv.address, low_port, Vec::new());
+        assert!(!reply.ticket.is_empty());
+        assert_eq!((reply.total, reply.nodes), (2, 1));
+        let reply = reg.request(&adv.address, with_v6("2001:4860::1"), Vec::new());
+        assert!(!reply.ticket.is_empty());
+    }
+
+    // A ticket presented before its window comes back unchanged with the rest of its
+    // wait and no NODES, and is still credited in its window.
+    #[tokio::test]
+    async fn early_ticket_echoed() {
+        let mut reg = Registrar::new();
+        let adv = advertiser(Ipv4Addr::new(10, 0, 1, 1));
+        let ticket = reg.seal(
+            adv.address.node_id,
+            TOPIC,
+            Duration::ZERO,
+            60 * SEC,
+            Duration::ZERO,
+        );
+
+        let echo = |wait_time| Reply {
+            total: 1,
+            ticket: ticket.clone(),
+            wait_time,
+            nodes: 0,
+        };
+        assert_eq!(
+            reg.request(&adv.address, adv.enr.clone(), ticket.clone()),
+            echo(60_000)
+        );
+        reg.now += 10 * SEC;
+        assert_eq!(
+            reg.request(&adv.address, adv.enr.clone(), ticket.clone()),
+            echo(50_000)
+        );
+        assert_eq!(reg.ads(), 1);
+
+        // Early, but issued to another node: a new attempt.
+        let other = advertiser(Ipv4Addr::new(10, 0, 1, 2));
+        let fresh = reg.fresh_wait(&other);
+        let reply = reg.request(&other.address, other.enr.clone(), ticket.clone());
+        assert!(!reply.ticket.is_empty() && reply.ticket != ticket);
+        assert_eq!(reply.wait_time, fresh);
+        assert!((40_000..=50_000).contains(&reply.wait_time));
+
+        reg.now += 50 * SEC;
+        assert_eq!(
+            reg.request(&adv.address, adv.enr.clone(), ticket),
+            reg.admitted()
+        );
+        assert_eq!(reg.ads(), 2);
+    }
+
+    // A late ticket is credited the wait it was scheduled to have, and a ticket issued
+    // in reply starts its session that long before now.
+    #[tokio::test]
+    async fn late_ticket_credit() {
+        let first = Instant::now();
+        let ticket = Ticket {
+            key_id: 0,
+            topic: TOPIC,
+            node_id: NodeId::random(),
+            wait_time_issued: 20 * SEC,
+            last_used: first + 10 * SEC,
+            first_issued: first,
+        };
+        let start = ticket.window_start();
+        let now = start + SEC;
+        assert_eq!(
+            regtopic_credit(&ticket, TicketTiming::OnTime, now),
+            (31 * SEC, first)
+        );
+        let now = start + 10 * SEC;
+        assert_eq!(
+            regtopic_credit(&ticket, TicketTiming::Late, now),
+            (30 * SEC, now - 30 * SEC)
+        );
+        let now = start + 60 * SEC;
+        assert_eq!(
+            regtopic_credit(&ticket, TicketTiming::Expired, now),
+            (Duration::ZERO, now)
+        );
+
+        let mut reg = Registrar::new();
+        // 10 s past the window start, inside the grace: credited the scheduled 60 s.
+        let adv = advertiser(Ipv4Addr::new(10, 0, 1, 1));
+        let ticket = reg.seal(adv.address.node_id, TOPIC, 20 * SEC, 10 * SEC, 70 * SEC);
+        assert_eq!(
+            reg.request(&adv.address, adv.enr.clone(), ticket),
+            reg.admitted()
+        );
+        assert_eq!(reg.ads(), 2);
+
+        // Credited 20 s, short of the wait: the new ticket's session started 20 s ago.
+        let adv = advertiser(Ipv4Addr::new(10, 0, 1, 2));
+        let ticket = reg.seal(adv.address.node_id, TOPIC, 20 * SEC, 10 * SEC, 30 * SEC);
+        let reply = reg.request(&adv.address, adv.enr.clone(), ticket);
+        assert!(!reply.ticket.is_empty());
+        let issued = reg.unpack(&reply.ticket);
+        assert_eq!(issued.node_id, adv.address.node_id);
+        assert_eq!(issued.first_issued, reg.now - 20 * SEC);
+        assert_eq!(issued.last_used, reg.now);
+        assert_eq!(wait_time_ms(issued.wait_time_issued), reply.wait_time);
+    }
+
+    // A credited ticket presented again, an expired one and one that fails to
+    // authenticate are new attempts.
+    #[tokio::test]
+    async fn replayed_ticket_new_attempt() {
+        let mut reg = Registrar::new();
+        let adv = advertiser(Ipv4Addr::new(10, 0, 1, 1));
+        let on_time = reg.seal(adv.address.node_id, TOPIC, 2 * SEC, SEC, 60 * SEC);
+        assert_eq!(
+            reg.request(&adv.address, adv.enr.clone(), on_time.clone()),
+            reg.admitted()
+        );
+
+        // Within the grace the replay finds the ad in the cache, which stays as it is.
+        reg.now += SEC;
+        assert_eq!(
+            reg.request(&adv.address, adv.enr.clone(), on_time.clone()),
+            reg.admitted()
+        );
+        assert_eq!(reg.ads(), 2);
+
+        // After an eviction the replay waits like a fresh attempt.
+        for _ in 0..2 {
+            reg.table().write().remove_node(&adv.address.node_id);
+            reg.now += SEC;
+            let fresh = reg.fresh_wait(&adv);
+            let reply = reg.request(&adv.address, adv.enr.clone(), on_time.clone());
+            assert!(!reply.ticket.is_empty() && reply.ticket != on_time);
+            assert_eq!(reply.wait_time, fresh);
+            assert_eq!(reg.ads(), 1);
+        }
+
+        let mut bad_mac = on_time.clone();
+        bad_mac[0] ^= 0xff;
+        let mut unknown_key = on_time.clone();
+        unknown_key[32..34].copy_from_slice(&[0xff, 0xff]);
+        let id = adv.address.node_id;
+        let tickets = [
+            (
+                "expired",
+                reg.seal(id, TOPIC, 20 * 60 * SEC, 50 * SEC, 20 * 60 * SEC),
+            ),
+            ("bad mac", bad_mac),
+            ("unknown key", unknown_key),
+            ("wrong topic", reg.seal(id, [4; 32], 2 * SEC, SEC, 60 * SEC)),
+            ("wrong size", vec![1]),
+        ];
+        for (name, ticket) in tickets {
+            let fresh = reg.fresh_wait(&adv);
+            let reply = reg.request(&adv.address, adv.enr.clone(), ticket.clone());
+            assert!(!reply.ticket.is_empty() && reply.ticket != ticket, "{name}");
+            assert_eq!(reply.wait_time, fresh, "{name}");
+            assert!((40_000..=50_000).contains(&reply.wait_time), "{name}");
+        }
+        assert_eq!(reg.ads(), 1);
+    }
+
+    // A ticket presented by another node is a new attempt for it and is not used up:
+    // its owner still redeems it in its window.
+    #[tokio::test]
+    async fn foreign_ticket_not_consumed() {
+        let mut reg = Registrar::new();
+        let owner = advertiser(Ipv4Addr::new(10, 0, 1, 1));
+        let holder = advertiser(Ipv4Addr::new(10, 0, 2, 1));
+        let ticket = reg.seal(owner.address.node_id, TOPIC, 2 * SEC, SEC, 60 * SEC);
+
+        let reply = reg.request(&holder.address, holder.enr.clone(), ticket.clone());
+        assert!(!reply.ticket.is_empty());
+        assert!((40_000..=50_000).contains(&reply.wait_time));
+        assert_eq!(reg.unpack(&reply.ticket).node_id, holder.address.node_id);
+        assert_eq!(reg.ads(), 1);
+
+        assert_eq!(
+            reg.request(&owner.address, owner.enr.clone(), ticket),
+            reg.admitted()
+        );
+        assert_eq!(reg.ads(), 2);
+    }
+
+    // A well-formed record with a bad signature decodes and is rejected; a field that
+    // is not a well-formed record makes the REGTOPIC undecodable.
+    #[tokio::test]
+    async fn bad_signature_enr_rejected() {
+        let mut reg = Registrar::new();
+        let adv = advertiser(Ipv4Addr::new(10, 0, 1, 1));
+        let message = |rlp: Vec<u8>| {
+            crate::rpc::Message::Request(Request {
+                id: RequestId(vec![7]),
+                body: RequestBody::RegTopic {
+                    topic: TOPIC,
+                    ticket: Vec::new(),
+                    enr: RegTopicEnr { rlp, enr: None },
+                    buckets: vec![256],
+                },
+            })
+            .encode()
+        };
+
+        let mut rlp = RegTopicEnr::from(adv.enr.clone()).rlp;
+        // The signature follows the record's list header and its own header.
+        assert_eq!(&rlp[2..4], &[0xb8, 0x40]);
+        rlp[4] ^= 0xff;
+        let crate::rpc::Message::Request(request) =
+            crate::rpc::Message::decode(&message(rlp.clone())).unwrap()
+        else {
+            panic!("not a request");
+        };
+        let RequestBody::RegTopic { ref enr, .. } = request.body else {
+            panic!("not a REGTOPIC");
+        };
+        assert_eq!(enr, &RegTopicEnr { rlp, enr: None });
+        reg.service
+            .handle_rpc_request(adv.address.clone(), request.clone());
+        assert_eq!(reg.reply(&adv.address, &request.id), rejected());
+        assert_eq!(reg.ads(), 1);
+
+        // Not a list; unsorted keys; a key without a value; a truncated list.
+        let valid = RegTopicEnr::from(adv.enr.clone()).rlp;
+        let unsorted = {
+            let mut items = Vec::new();
+            alloy_rlp::Encodable::encode(&[1u8; 64][..], &mut items);
+            alloy_rlp::Encodable::encode(&1u64, &mut items);
+            for (k, v) in [("udp", 1u64), ("id", 2)] {
+                alloy_rlp::Encodable::encode(k.as_bytes(), &mut items);
+                alloy_rlp::Encodable::encode(&v, &mut items);
+            }
+            let mut out = Vec::new();
+            alloy_rlp::Header {
+                list: true,
+                payload_length: items.len(),
+            }
+            .encode(&mut out);
+            out.extend_from_slice(&items);
+            out
+        };
+        let odd = {
+            let mut out = vec![0xf8, 66 + 1 + 3];
+            out.extend_from_slice(&[0xb8, 0x40]);
+            out.extend_from_slice(&[1; 64]);
+            out.push(0x01);
+            out.extend_from_slice(&[0x82, b'i', b'd']);
+            out
+        };
+        assert!(crate::rpc::Message::decode(&message(valid.clone())).is_ok());
+        for rlp in [
+            vec![0x83, 1, 2, 3],
+            unsorted,
+            odd,
+            valid[..valid.len() - 1].to_vec(),
+        ] {
+            assert!(crate::rpc::Message::decode(&message(rlp)).is_err());
+        }
+    }
+
+    // Ads expired at the time of a REGTOPIC are removed before it is served: the
+    // advertiser of an expired ad is not answered from the old entry, and an expired ad
+    // frees its slot in a full cache.
+    #[tokio::test]
+    async fn regtopic_expires_ads_first() {
+        let mut reg = Registrar::new();
+        let adv = advertiser(Ipv4Addr::new(10, 0, 1, 1));
+        let lifetime = reg.table().read().ad_lifetime();
+        assert!(reg.table().write().add(&adv.enr, TOPIC, reg.now));
+        reg.now += lifetime;
+        assert_eq!(
+            reg.request(&adv.address, adv.enr.clone(), Vec::new()),
+            reg.admitted()
+        );
+        let ads = reg.table().read().ads(&TOPIC);
+        assert_eq!(ads.len(), 1);
+        assert_eq!(ads[0].node.node_id(), adv.address.node_id);
+        assert_eq!(ads[0].expiry, reg.now + lifetime);
+
+        let mut reg = Registrar::with_config(TopicConfig {
+            ad_cache_size: 1,
+            ..TopicConfig::default()
+        });
+        assert_eq!(reg.table().read().occupancy(), (1, 1));
+        reg.now += lifetime;
+        assert_eq!(
+            reg.request(&adv.address, adv.enr.clone(), Vec::new()),
+            reg.admitted()
+        );
+        assert!(
+            reg.table()
+                .read()
+                .is_registered(&adv.address.node_id, &TOPIC)
+        );
+        assert_eq!(reg.table().read().occupancy(), (1, 1));
     }
 }

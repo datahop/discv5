@@ -1,7 +1,12 @@
-use super::{TopicId, params::DELTA};
+use super::{
+    TopicId,
+    params::{DELTA, EPSILON, USED_TICKET_LIMIT, USED_TICKET_TTL},
+};
+use enr::NodeId;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::{
+    collections::{HashSet, VecDeque},
     fmt,
     time::{Duration, Instant},
 };
@@ -9,8 +14,8 @@ use std::{
 type HmacSha256 = Hmac<Sha256>;
 
 const TICKET_MAC_SIZE: usize = 32;
-// key id (u16) | topic (32) | wait time issued (u64 ns) | last used (u64 ns) | first issued (u64 ns)
-const TICKET_BODY_SIZE: usize = 2 + 32 + 8 + 8 + 8;
+// key id (u16) | topic (32) | node id (32) | twait (u64 ns) | tmod (u64 ns) | tinit (u64 ns)
+const TICKET_BODY_SIZE: usize = 2 + 32 + 32 + 8 + 8 + 8;
 /// Size of a sealed ticket on the wire. The layout matches the Go implementation:
 /// a 32-byte HMAC-SHA256 followed by the big-endian body.
 pub const TICKET_SIZE: usize = TICKET_MAC_SIZE + TICKET_BODY_SIZE;
@@ -25,24 +30,42 @@ const TICKET_REKEY_INTERVAL: usize = 100_000;
 pub struct Ticket {
     pub key_id: u16,
     pub topic: TopicId,
-    /// Wait time returned in the last REGCONFIRMATION.
+    /// The advertiser the ticket was issued to.
+    pub node_id: NodeId,
+    /// Wait time returned in the last REGCONFIRMATION (`twait`).
     pub wait_time_issued: Duration,
-    /// Last request in this waiting session.
+    /// Last request in this waiting session (`tmod`).
     pub last_used: Instant,
-    /// Creation time of the first ticket in this waiting session.
+    /// Creation time of the first ticket in this waiting session (`tinit`).
     pub first_issued: Instant,
 }
 
+/// Where a time falls relative to a ticket's window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketTiming {
+    Early,
+    OnTime,
+    Late,
+    Expired,
+}
+
 impl Ticket {
-    /// A ticket may only be used within a short window once its wait time has elapsed.
-    pub fn is_valid_at(&self, now: Instant) -> bool {
-        let Some(start) = self.last_used.checked_add(self.wait_time_issued) else {
-            return false;
-        };
-        let Some(end) = start.checked_add(DELTA) else {
-            return false;
-        };
-        now >= start && now < end
+    /// The earliest time the ticket may be used, `tmod + twait`.
+    pub fn window_start(&self) -> Instant {
+        self.last_used + self.wait_time_issued
+    }
+
+    pub fn timing_at(&self, now: Instant) -> TicketTiming {
+        let start = self.window_start();
+        if now < start {
+            TicketTiming::Early
+        } else if now >= start + DELTA + EPSILON {
+            TicketTiming::Expired
+        } else if now >= start + DELTA {
+            TicketTiming::Late
+        } else {
+            TicketTiming::OnTime
+        }
     }
 }
 
@@ -56,8 +79,6 @@ pub enum TicketError {
     NoKey,
     /// The ticket was issued for another topic.
     WrongTopic,
-    /// The ticket is used outside its validity window.
-    TimeInvalid,
     /// The body cannot be decoded.
     Malformed,
 }
@@ -69,7 +90,6 @@ impl fmt::Display for TicketError {
             TicketError::BadMac => "invalid ticket MAC",
             TicketError::NoKey => "unknown ticket MAC key id",
             TicketError::WrongTopic => "ticket used with wrong topic",
-            TicketError::TimeInvalid => "ticket used at the wrong time",
             TicketError::Malformed => "malformed ticket body",
         };
         f.write_str(msg)
@@ -119,40 +139,34 @@ impl TicketSealer {
         }
     }
 
-    /// Authenticates and decodes a ticket presented for `topic`. Empty input means the
-    /// sender has no ticket and yields `Ok(None)`.
+    /// Authenticates and decodes a non-empty ticket presented for `topic`. Neither the
+    /// timing nor the node the ticket was issued to is checked.
     pub fn unpack(
         &mut self,
         topic: &TopicId,
         input: &[u8],
         now: Instant,
-    ) -> Result<Option<Ticket>, TicketError> {
-        if input.is_empty() {
-            return Ok(None);
-        }
+    ) -> Result<Ticket, TicketError> {
         if input.len() != TICKET_SIZE {
             return Err(TicketError::BadSize);
         }
         let (tag, body) = input.split_at(TICKET_MAC_SIZE);
-        // The key id is needed to find the key before the MAC can be checked.
-        let ticket = self.decode_body(body)?;
+        let key_id = u16::from_be_bytes([body[0], body[1]]);
 
         self.gc_keys(now);
         let key = self
             .keys
             .iter()
-            .find(|k| k.key_id == ticket.key_id)
+            .find(|k| k.key_id == key_id)
             .ok_or(TicketError::NoKey)?;
         if !key.verify(body, tag) {
             return Err(TicketError::BadMac);
         }
+        let ticket = self.decode_body(body)?;
         if ticket.topic != *topic {
             return Err(TicketError::WrongTopic);
         }
-        if !ticket.is_valid_at(now) {
-            return Err(TicketError::TimeInvalid);
-        }
-        Ok(Some(ticket))
+        Ok(ticket)
     }
 
     /// Encodes and seals a ticket, assigning the key id of the key used.
@@ -171,24 +185,26 @@ impl TicketSealer {
     }
 
     fn decode_body(&self, body: &[u8]) -> Result<Ticket, TicketError> {
-        let key_id = u16::from_be_bytes([body[0], body[1]]);
-        let mut topic = [0u8; 32];
-        topic.copy_from_slice(&body[2..34]);
-        let wait_ns = u64::from_be_bytes(body[34..42].try_into().expect("8 bytes"));
-        let last_used_ns = u64::from_be_bytes(body[42..50].try_into().expect("8 bytes"));
-        let first_issued_ns = u64::from_be_bytes(body[50..58].try_into().expect("8 bytes"));
+        let u64_at = |at: usize| u64::from_be_bytes(body[at..at + 8].try_into().expect("8 bytes"));
         let since_epoch = |ns: u64| {
             self.epoch
                 .checked_add(Duration::from_nanos(ns))
                 .ok_or(TicketError::Malformed)
         };
-        Ok(Ticket {
-            key_id,
-            topic,
-            wait_time_issued: Duration::from_nanos(wait_ns),
-            last_used: since_epoch(last_used_ns)?,
-            first_issued: since_epoch(first_issued_ns)?,
-        })
+        let ticket = Ticket {
+            key_id: u16::from_be_bytes([body[0], body[1]]),
+            topic: body[2..34].try_into().expect("32 bytes"),
+            node_id: NodeId::new(&body[34..66].try_into().expect("32 bytes")),
+            wait_time_issued: Duration::from_nanos(u64_at(66)),
+            last_used: since_epoch(u64_at(74))?,
+            first_issued: since_epoch(u64_at(82))?,
+        };
+        // The window must be representable for `window_start` and `timing_at`.
+        ticket
+            .last_used
+            .checked_add(ticket.wait_time_issued + DELTA + EPSILON)
+            .ok_or(TicketError::Malformed)?;
+        Ok(ticket)
     }
 
     /// Drops keys that have not been used for longer than the key lifetime.
@@ -235,10 +251,54 @@ fn encode_body(ticket: &Ticket, epoch: Instant) -> [u8; TICKET_BODY_SIZE] {
     let mut body = [0u8; TICKET_BODY_SIZE];
     body[0..2].copy_from_slice(&ticket.key_id.to_be_bytes());
     body[2..34].copy_from_slice(&ticket.topic);
-    body[34..42].copy_from_slice(&(ticket.wait_time_issued.as_nanos() as u64).to_be_bytes());
-    body[42..50].copy_from_slice(&ns(ticket.last_used).to_be_bytes());
-    body[50..58].copy_from_slice(&ns(ticket.first_issued).to_be_bytes());
+    body[34..66].copy_from_slice(&ticket.node_id.raw());
+    body[66..74].copy_from_slice(&(ticket.wait_time_issued.as_nanos() as u64).to_be_bytes());
+    body[74..82].copy_from_slice(&ns(ticket.last_used).to_be_bytes());
+    body[82..90].copy_from_slice(&ns(ticket.first_issued).to_be_bytes());
     body
+}
+
+/// Remembers credited tickets by their MAC, so that a ticket is credited once.
+#[derive(Default)]
+pub struct UsedTickets {
+    set: HashSet<[u8; TICKET_MAC_SIZE]>,
+    /// In insertion order, with the time each entry is forgotten.
+    queue: VecDeque<([u8; TICKET_MAC_SIZE], Instant)>,
+}
+
+impl UsedTickets {
+    /// Records a ticket as credited at `now` and reports whether it already was. The
+    /// ticket must be one that `TicketSealer::unpack` accepted.
+    pub fn use_ticket(&mut self, enc: &[u8], now: Instant) -> bool {
+        while self.queue.front().is_some_and(|(_, exp)| *exp <= now) {
+            self.drop_oldest();
+        }
+        let mac: [u8; TICKET_MAC_SIZE] = enc[..TICKET_MAC_SIZE].try_into().expect("sealed ticket");
+        if self.set.contains(&mac) {
+            return true;
+        }
+        if self.queue.len() >= USED_TICKET_LIMIT {
+            self.drop_oldest();
+        }
+        self.set.insert(mac);
+        self.queue.push_back((mac, now + USED_TICKET_TTL));
+        false
+    }
+
+    /// The number of remembered tickets.
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn drop_oldest(&mut self) {
+        if let Some((mac, _)) = self.queue.pop_front() {
+            self.set.remove(&mac);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -254,10 +314,17 @@ mod tests {
     };
     const TOPIC2: TopicId = [8u8; 32];
 
+    fn node() -> NodeId {
+        let mut id = [0u8; 32];
+        id[..3].copy_from_slice(&[1, 2, 3]);
+        NodeId::new(&id)
+    }
+
     fn ticket(topic: TopicId, wait: Duration, now: Instant) -> Ticket {
         Ticket {
             key_id: 0,
             topic,
+            node_id: node(),
             wait_time_issued: wait,
             last_used: now,
             first_issued: now,
@@ -269,47 +336,54 @@ mod tests {
         let t0 = Instant::now();
         let mut sealer = TicketSealer::new(t0);
         let mut t = ticket(TOPIC1, Duration::from_secs(60), t0);
-        let enc = sealer.pack(&mut t, t0);
+        let mut enc = sealer.pack(&mut t, t0);
         assert_eq!(enc.len(), TICKET_SIZE);
+        assert_eq!(TICKET_SIZE, 122);
 
         let now = t0 + Duration::from_secs(60);
-        let got = sealer.unpack(&TOPIC1, &enc, now).unwrap().unwrap();
-        assert_eq!(got, t);
+        assert_eq!(sealer.unpack(&TOPIC1, &enc, now), Ok(t));
+
+        // The node is covered by the MAC.
+        enc[TICKET_MAC_SIZE + 2 + 32] ^= 0xff;
+        assert_eq!(sealer.unpack(&TOPIC1, &enc, now), Err(TicketError::BadMac));
     }
 
     #[test]
-    fn empty_input_is_no_ticket() {
-        let t0 = Instant::now();
-        let mut sealer = TicketSealer::new(t0);
-        assert_eq!(sealer.unpack(&TOPIC1, &[], t0), Ok(None));
-    }
-
-    #[test]
-    fn rejects_wrong_topic_and_time() {
+    fn wrong_topic_and_early_ticket() {
         let t0 = Instant::now();
         let mut sealer = TicketSealer::new(t0);
         let mut t = ticket(TOPIC1, Duration::from_secs(300), t0);
         let enc = sealer.pack(&mut t, t0);
 
         assert_eq!(
-            sealer.unpack(&TOPIC2, &enc, t0 + Duration::from_secs(300)),
+            sealer.unpack(&TOPIC2, &enc, t0),
             Err(TicketError::WrongTopic)
         );
-        // Too early.
-        assert_eq!(
-            sealer.unpack(&TOPIC1, &enc, t0 + Duration::from_secs(299)),
-            Err(TicketError::TimeInvalid)
-        );
-        // Too late: the validity window is 5 s.
-        assert_eq!(
-            sealer.unpack(&TOPIC1, &enc, t0 + Duration::from_secs(305)),
-            Err(TicketError::TimeInvalid)
-        );
-        assert!(
-            sealer
-                .unpack(&TOPIC1, &enc, t0 + Duration::from_secs(304))
-                .is_ok()
-        );
+        // Unpacking does not check the timing.
+        let got = sealer.unpack(&TOPIC1, &enc, t0).unwrap();
+        assert_eq!(got.timing_at(t0), TicketTiming::Early);
+    }
+
+    #[test]
+    fn ticket_timing() {
+        let issued = Instant::now();
+        let wait = Duration::from_secs(60);
+        let start = issued + wait;
+        let t = ticket(TOPIC1, wait, issued);
+        assert_eq!(t.window_start(), start);
+
+        let ns = Duration::from_nanos(1);
+        let cases = [
+            (start - ns, TicketTiming::Early),
+            (start, TicketTiming::OnTime),
+            (start + DELTA - ns, TicketTiming::OnTime),
+            (start + DELTA, TicketTiming::Late),
+            (start + DELTA + EPSILON - ns, TicketTiming::Late),
+            (start + DELTA + EPSILON, TicketTiming::Expired),
+        ];
+        for (at, want) in cases {
+            assert_eq!(t.timing_at(at), want, "at start{:+?}", at - issued);
+        }
     }
 
     #[test]
@@ -329,7 +403,7 @@ mod tests {
 
         // Shortening the issued wait time to skip the wait breaks the MAC.
         let mut bad_body = enc.clone();
-        bad_body[TICKET_MAC_SIZE + 40] ^= 0x01;
+        bad_body[TICKET_MAC_SIZE + 72] ^= 0x01;
         assert_eq!(
             sealer.unpack(&TOPIC1, &bad_body, now),
             Err(TicketError::BadMac)
@@ -346,6 +420,7 @@ mod tests {
             sealer.unpack(&TOPIC1, &enc[..enc.len() - 1], now),
             Err(TicketError::BadSize)
         );
+        assert_eq!(sealer.unpack(&TOPIC1, &[1], now), Err(TicketError::BadSize));
         // A ticket sealed by another node fails to authenticate.
         let mut other = TicketSealer::new(t0);
         let enc2 = other.pack(&mut ticket(TOPIC1, Duration::from_secs(10), t0), t0);
@@ -377,5 +452,41 @@ mod tests {
             assert_eq!(sealer.unpack(&TOPIC1, enc, now), Err(TicketError::NoKey));
         }
         assert!(sealer.keys.is_empty());
+    }
+
+    #[test]
+    fn used_tickets_ttl_and_limit() {
+        let t0 = Instant::now();
+        let mac = |i: u32| {
+            let mut enc = vec![0u8; TICKET_SIZE];
+            enc[..4].copy_from_slice(&i.to_be_bytes());
+            enc
+        };
+
+        let mut used = UsedTickets::default();
+        assert!(!used.use_ticket(&mac(0), t0));
+        assert!(used.use_ticket(&mac(0), t0));
+        let ns = Duration::from_nanos(1);
+        assert!(
+            used.use_ticket(&mac(0), t0 + USED_TICKET_TTL - ns),
+            "forgotten before its TTL"
+        );
+        assert!(
+            !used.use_ticket(&mac(0), t0 + USED_TICKET_TTL),
+            "remembered past its TTL"
+        );
+
+        let mut used = UsedTickets::default();
+        for i in 0..=USED_TICKET_LIMIT as u32 {
+            assert!(
+                !used.use_ticket(&mac(i), t0),
+                "ticket {i} reported as replay"
+            );
+        }
+        assert_eq!(used.len(), USED_TICKET_LIMIT);
+        assert!(
+            !used.use_ticket(&mac(0), t0),
+            "oldest ticket not dropped past the limit"
+        );
     }
 }

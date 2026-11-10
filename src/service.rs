@@ -253,6 +253,9 @@ pub(crate) struct Service {
     /// Seals the tickets handed out by the registrar, with the ad cache.
     #[cfg(feature = "topic-discovery")]
     ticket_sealer: Option<crate::topic::TicketSealer>,
+    /// The tickets the registrar credited recently.
+    #[cfg(feature = "topic-discovery")]
+    used_tickets: crate::topic::UsedTickets,
     /// The topic registrations and searches of the local node.
     #[cfg(feature = "topic-discovery")]
     topics: topic::TopicSystem,
@@ -379,6 +382,8 @@ impl Service {
                     ticket_sealer: topic_table
                         .as_ref()
                         .map(|_| crate::topic::TicketSealer::new(Instant::now())),
+                    #[cfg(feature = "topic-discovery")]
+                    used_tickets: Default::default(),
                     #[cfg(feature = "topic-discovery")]
                     topic_table,
                     #[cfg(feature = "topic-discovery")]
@@ -779,7 +784,15 @@ impl Service {
                 buckets,
             } => {
                 METRICS.topic.regtopic_recv.fetch_add(1, Ordering::Relaxed);
-                self.handle_regtopic(node_address, id, topic, ticket, enr, buckets);
+                self.handle_regtopic(
+                    node_address,
+                    id,
+                    topic,
+                    ticket,
+                    enr,
+                    buckets,
+                    Instant::now(),
+                );
             }
             #[cfg(feature = "topic-discovery")]
             RequestBody::TopicQuery { topic, buckets } => {

@@ -93,7 +93,7 @@ pub enum RequestBody {
         /// The ticket issued by the recipient on the previous attempt; empty on the first.
         ticket: Vec<u8>,
         /// The sender's current record.
-        enr: Enr<CombinedKey>,
+        enr: RegTopicEnr,
         /// Log2 distances from the topic where the sender's service table has space.
         buckets: Vec<u64>,
     },
@@ -248,7 +248,7 @@ impl Request {
                 id.as_bytes().encode(&mut list);
                 topic.encode(&mut list);
                 ticket.as_slice().encode(&mut list);
-                enr.encode(&mut list);
+                list.extend_from_slice(&enr.rlp);
                 buckets.encode(&mut list);
                 wrap_list(buf, &list)
             }
@@ -425,6 +425,74 @@ fn decode_enr(payload: &mut &[u8]) -> Result<Enr<CombinedKey>, DecoderError> {
     let enr = Enr::<CombinedKey>::decode(&mut &payload[..len])?;
     payload.advance(len);
     Ok(enr)
+}
+
+/// The record of a REGTOPIC: its RLP, and the record itself when it is valid. A
+/// well-formed record that does not verify is kept so the registrar can reject it.
+#[cfg(feature = "topic-discovery")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegTopicEnr {
+    pub rlp: Vec<u8>,
+    pub enr: Option<Box<Enr<CombinedKey>>>,
+}
+
+#[cfg(feature = "topic-discovery")]
+impl From<Enr<CombinedKey>> for RegTopicEnr {
+    fn from(enr: Enr<CombinedKey>) -> Self {
+        let mut rlp = Vec::new();
+        enr.encode(&mut rlp);
+        RegTopicEnr {
+            rlp,
+            enr: Some(Box::new(enr)),
+        }
+    }
+}
+
+#[cfg(feature = "topic-discovery")]
+impl RegTopicEnr {
+    /// Decodes a record that is well-formed as in go-ethereum's `enr.Record`: at most
+    /// 300 bytes, a list of signature, sequence number and strictly sorted key/value
+    /// pairs. Anything else is a decoding error.
+    fn decode(payload: &mut &[u8]) -> Result<Self, DecoderError> {
+        const MAX_ENR_SIZE: usize = 300;
+        let mut rest = *payload;
+        let header = Header::decode(&mut rest)?;
+        if !header.list {
+            return Err(DecoderError::UnexpectedString);
+        }
+        if header.payload_length > rest.len() {
+            return Err(DecoderError::InputTooShort);
+        }
+        let len = payload.len() - rest.len() + header.payload_length;
+        let rlp = payload[..len].to_vec();
+        if len > MAX_ENR_SIZE {
+            return Err(DecoderError::Custom("enr exceeds max size"));
+        }
+
+        let mut items = &rest[..header.payload_length];
+        Header::decode_bytes(&mut items, false)?;
+        u64::decode(&mut items)?;
+        let mut prev: Option<&[u8]> = None;
+        while !items.is_empty() {
+            let key = Header::decode_bytes(&mut items, false)?;
+            if prev.is_some_and(|prev| prev >= key) {
+                return Err(DecoderError::Custom("Unsorted or duplicate keys"));
+            }
+            prev = Some(key);
+            if items.is_empty() {
+                return Err(DecoderError::Custom("Incomplete key/value pair"));
+            }
+            let value = Header::decode(&mut items)?;
+            if value.payload_length > items.len() {
+                return Err(DecoderError::InputTooShort);
+            }
+            items.advance(value.payload_length);
+        }
+
+        let enr = Enr::<CombinedKey>::decode(&mut &rlp[..]).ok().map(Box::new);
+        payload.advance(len);
+        Ok(RegTopicEnr { rlp, enr })
+    }
 }
 
 /// Decodes the REGCONFIRMATION wait time. Values wider than 64 bits saturate.
@@ -721,7 +789,7 @@ impl Message {
                 // REGTOPIC: [request-id, topic, ticket, ENR, [distance, ...]]
                 let topic = <[u8; 32]>::decode(payload)?;
                 let ticket = Bytes::decode(payload)?.to_vec();
-                let enr = decode_enr(payload)?;
+                let enr = RegTopicEnr::decode(payload)?;
                 let buckets = Vec::<u64>::decode(payload)?;
                 if buckets.len() > MAX_TOPIC_DISTANCES {
                     return Err(DecoderError::Custom("Too many distances in REGTOPIC"));
@@ -1289,7 +1357,7 @@ mod topic_tests {
                 body: RequestBody::RegTopic {
                     topic: topic(take("topic")),
                     ticket: bytes(take("ticket")),
-                    enr: enr(take("ENR")),
+                    enr: enr(take("ENR")).into(),
                     buckets: distances(take("topic-distances")),
                 },
             }),
@@ -1427,7 +1495,7 @@ mod topic_tests {
             .match_request(&RequestBody::RegTopic {
                 topic: topic(),
                 ticket: vec![],
-                enr: record(),
+                enr: record().into(),
                 buckets: vec![]
             })
         );
@@ -1466,7 +1534,7 @@ mod topic_tests {
             body: RequestBody::RegTopic {
                 topic: topic(),
                 ticket: vec![],
-                enr: record(),
+                enr: record().into(),
                 buckets: vec![1; MAX_TOPIC_DISTANCES],
             },
         })

@@ -112,6 +112,8 @@ async fn build_service_with(
         #[cfg(feature = "topic-discovery")]
         ticket_sealer: None,
         #[cfg(feature = "topic-discovery")]
+        used_tickets: Default::default(),
+        #[cfg(feature = "topic-discovery")]
         topics: Default::default(),
         config,
         ip_mode,
@@ -202,6 +204,8 @@ pub(super) fn build_non_handler_service(
         topic_table: None,
         #[cfg(feature = "topic-discovery")]
         ticket_sealer: None,
+        #[cfg(feature = "topic-discovery")]
+        used_tickets: Default::default(),
         #[cfg(feature = "topic-discovery")]
         topics: Default::default(),
         config,
@@ -822,12 +826,12 @@ mod topic {
             body: RequestBody::RegTopic {
                 topic,
                 ticket: vec![],
-                enr,
+                enr: enr.into(),
                 buckets: vec![256, 255],
             },
         };
 
-        // A record that does not belong to the sender is dropped.
+        // A record that does not belong to the sender is rejected.
         let (other, _) = capable_enr(12333);
         service.handle_rpc_request(node_address.clone(), regtopic(other.clone()));
         assert!(
@@ -843,7 +847,7 @@ mod topic {
             0
         );
 
-        // A record whose address differs from the packet source is dropped.
+        // A record whose address differs from the packet source is rejected.
         let key = CombinedKey::generate_secp256k1();
         let elsewhere = Enr::builder()
             .ip4(Ipv4Addr::new(1, 2, 3, 4))
@@ -880,15 +884,15 @@ mod topic {
             1
         );
 
-        // A garbage ticket gets no reply and changes nothing.
+        // A garbage ticket is a new attempt, and the stored ad stays as it is.
         service.handle_rpc_request(
             node_address.clone(),
             Request {
                 id: RequestId(vec![2]),
                 body: RequestBody::RegTopic {
-                    topic: [1u8; 32],
+                    topic,
                     ticket: vec![0xaa; 90],
-                    enr: adv.clone(),
+                    enr: adv.clone().into(),
                     buckets: vec![],
                 },
             },

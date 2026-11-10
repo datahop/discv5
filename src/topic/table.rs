@@ -183,7 +183,8 @@ impl TopicTable {
     }
 
     /// Attempts to register `node` for `topic` after it has waited `waited`. Returns
-    /// zero when admitted, otherwise the further time to wait before retrying.
+    /// zero when admitted, otherwise the further time to wait before retrying. Ads
+    /// expired at `now` are removed first.
     pub fn register(
         &mut self,
         node: &Enr,
@@ -191,6 +192,7 @@ impl TopicTable {
         waited: Duration,
         now: Instant,
     ) -> Duration {
+        self.expire(now);
         if self.is_registered(&node.node_id(), &topic) {
             return Duration::ZERO;
         }

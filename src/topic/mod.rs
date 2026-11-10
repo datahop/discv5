@@ -28,7 +28,7 @@ pub use registration::{RegAttempt, RegAttemptState, Registration};
 pub use search::Search;
 pub use searchfilter::SearchFilter;
 pub use table::TopicTable;
-pub use ticket::{TICKET_SIZE, Ticket, TicketError, TicketSealer};
+pub use ticket::{TICKET_SIZE, Ticket, TicketError, TicketSealer, TicketTiming, UsedTickets};
 
 /// A topic (service) identifier: a 32-byte hash.
 pub type TopicId = [u8; 32];
