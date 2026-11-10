@@ -61,15 +61,9 @@ struct Args {
     /// Search the topic for this many advertisers, again and again.
     #[clap(long)]
     search: Option<usize>,
-    /// Adaptive search: ads per reply below which the search moves closer. 0 turns it off.
-    #[clap(long, default_value_t = 8)]
-    yield_floor: usize,
-    /// Adaptive search: buckets around the active one to refill. -1 asks for every bucket.
-    #[clap(long, default_value_t = 1)]
-    aux_radius: i64,
-    /// Cap on the gap between search passes, in seconds. -1 keeps 2 s.
-    #[clap(long, default_value_t = 60)]
-    pass_backoff: i64,
+    /// Run plain discv5: no `td` entry, topic requests are not answered.
+    #[clap(long, conflicts_with_all = ["register", "search"])]
+    no_topic_discovery: bool,
     /// Ad lifetime in seconds.
     #[clap(long, default_value_t = 900)]
     ad_lifetime: u64,
@@ -154,12 +148,8 @@ async fn main() {
         .unwrap();
 
     let mut topic_config = TopicConfig {
+        enabled: !args.no_topic_discovery,
         ad_lifetime: Duration::from_secs(args.ad_lifetime),
-        search_yield_floor: args.yield_floor,
-        search_aux_radius: usize::try_from(args.aux_radius).ok(),
-        search_pass_backoff: u64::try_from(args.pass_backoff)
-            .ok()
-            .map(Duration::from_secs),
         ..Default::default()
     };
     topic_config.reg_attempt_timeout = topic_config.ad_lifetime + topic_config.ad_lifetime / 2;
@@ -357,6 +347,7 @@ fn status_json(
     for t in report_topics {
         let ads: Vec<[u8; 32]> = discv5
             .local_topic_nodes(*t)
+            .unwrap_or_default()
             .iter()
             .map(|n| n.node_id().raw())
             .collect();

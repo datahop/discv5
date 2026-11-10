@@ -1,4 +1,4 @@
-use super::TopicId;
+use super::{TopicId, params::DELTA};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::{
@@ -16,7 +16,6 @@ const TICKET_BODY_SIZE: usize = 2 + 32 + 8 + 8 + 8;
 pub const TICKET_SIZE: usize = TICKET_MAC_SIZE + TICKET_BODY_SIZE;
 
 const TICKET_KEY_LIFETIME: Duration = Duration::from_secs(6 * 3600);
-const TICKET_VALIDITY_WINDOW: Duration = Duration::from_secs(5);
 const TICKET_REKEY_INTERVAL: usize = 100_000;
 
 /// The content of a ticket issued by this registrar. Times are registrar-local: a
@@ -40,7 +39,7 @@ impl Ticket {
         let Some(start) = self.last_used.checked_add(self.wait_time_issued) else {
             return false;
         };
-        let Some(end) = start.checked_add(TICKET_VALIDITY_WINDOW) else {
+        let Some(end) = start.checked_add(DELTA) else {
             return false;
         };
         now >= start && now < end

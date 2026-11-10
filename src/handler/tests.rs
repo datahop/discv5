@@ -81,6 +81,8 @@ async fn build_handler(
         listen_sockets,
         socket,
         exit,
+        #[cfg(feature = "topic-discovery")]
+        topic_enabled: config.topic.enabled,
     };
     (exit_sender, handler_send, handler_recv, handler)
 }
@@ -1085,5 +1087,105 @@ async fn test_send_pending_request() {
         _ = sleep_future => {
             panic!("Test timed out");
         }
+    }
+}
+
+// Disabled, topic messages are dropped before they are matched to a request: a
+// TOPICNODES or REGCONFIRMATION carrying the id of a pending FINDNODE leaves it pending,
+// and the NODES that follows completes it.
+#[cfg(feature = "topic-discovery")]
+#[tokio::test]
+async fn topic_responses_dropped_when_disabled() {
+    init();
+    let ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+    let node = |port: u16| {
+        let key = CombinedKey::generate_secp256k1();
+        let enr = Enr::builder().ip4(ip).udp4(port).build(&key).unwrap();
+        let config = ConfigBuilder::new(ListenConfig::Ipv4 { ip, port }).build();
+        assert!(!config.topic.enabled);
+        (enr, key, config)
+    };
+    let (requester_enr, requester_key, requester_config) = node(12340);
+    let (responder_enr, responder_key, responder_config) = node(12341);
+    let (_exit_req, requester_send, mut requester_recv) = Handler::spawn(
+        arc_rw!(requester_enr.clone()),
+        arc_rw!(requester_key),
+        requester_config,
+    )
+    .await
+    .unwrap();
+    let (_exit_resp, responder_send, mut responder_recv) = Handler::spawn(
+        arc_rw!(responder_enr.clone()),
+        arc_rw!(responder_key),
+        responder_config,
+    )
+    .await
+    .unwrap();
+
+    let id = RequestId(vec![1, 2, 3]);
+    let _ = requester_send.send(HandlerIn::Request(
+        responder_enr.into(),
+        Box::new(Request {
+            id: id.clone(),
+            body: RequestBody::FindNode {
+                distances: vec![256],
+            },
+        }),
+    ));
+
+    let responder = async move {
+        while let Some(message) = responder_recv.recv().await {
+            match message {
+                HandlerOut::WhoAreYou(wru_ref) => {
+                    let _ = responder_send
+                        .send(HandlerIn::WhoAreYou(wru_ref, Some(requester_enr.clone())));
+                }
+                HandlerOut::Request(address, request) => {
+                    let bodies = [
+                        ResponseBody::TopicNodes {
+                            total: 1,
+                            nodes: vec![],
+                        },
+                        ResponseBody::RegConfirmation {
+                            total: 1,
+                            ticket: vec![],
+                            wait_time: 0,
+                        },
+                        ResponseBody::Nodes {
+                            total: 1,
+                            nodes: vec![],
+                        },
+                    ];
+                    for body in bodies {
+                        let response = Response {
+                            id: request.id.clone(),
+                            body,
+                        };
+                        let _ = responder_send
+                            .send(HandlerIn::Response(address.clone(), Box::new(response)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    let requester = async move {
+        while let Some(message) = requester_recv.recv().await {
+            match message {
+                HandlerOut::Response(_, response) => return response,
+                HandlerOut::RequestFailed(_, error) => panic!("FINDNODE failed: {error:?}"),
+                _ => {}
+            }
+        }
+        panic!("handler closed");
+    };
+
+    tokio::select! {
+        _ = responder => panic!("responder ended"),
+        response = requester => {
+            assert_eq!(response.id, id);
+            assert!(matches!(response.body, ResponseBody::Nodes { total: 1, .. }));
+        }
+        _ = sleep(Duration::from_secs(2)) => panic!("Test timed out"),
     }
 }

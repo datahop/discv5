@@ -174,9 +174,12 @@ pub struct KBucket<TNodeId, TVal: Eq> {
     /// MAX_NODES_PER_BUCKET means there is no restriction on incoming nodes.
     max_incoming: usize,
 
-    /// Insertions and removals since the last call to `take_changes`.
+    /// Insertions and removals since the last call to `take_changes`, recorded only
+    /// with `track_changes` set.
     #[cfg(feature = "topic-discovery")]
     changes: VecDeque<TableChange<TNodeId>>,
+    #[cfg(feature = "topic-discovery")]
+    track_changes: bool,
 }
 
 /// The result of inserting an entry into a bucket.
@@ -277,11 +280,25 @@ where
             max_incoming,
             #[cfg(feature = "topic-discovery")]
             changes: VecDeque::new(),
+            #[cfg(feature = "topic-discovery")]
+            track_changes: false,
+        }
+    }
+
+    /// Turns the recording of insertions and removals on or off.
+    #[cfg(feature = "topic-discovery")]
+    pub fn track_changes(&mut self, on: bool) {
+        self.track_changes = on;
+        if !on {
+            self.changes.clear();
         }
     }
 
     #[cfg(feature = "topic-discovery")]
     fn note_change(&mut self, change: TableChange<TNodeId>) {
+        if !self.track_changes {
+            return;
+        }
         if self.changes.len() >= MAX_TABLE_CHANGES {
             self.changes.pop_front();
         }

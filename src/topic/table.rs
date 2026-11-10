@@ -1,4 +1,10 @@
-use super::{TopicConfig, TopicId, bound::LowerBound, iptree::IpTree, netutil};
+use super::{
+    TopicConfig, TopicId,
+    bound::LowerBound,
+    iptree::IpTree,
+    netutil,
+    params::{P_OCC, W_BASE, W_MIN},
+};
 use crate::Enr;
 use enr::NodeId;
 use rand::seq::IteratorRandom;
@@ -7,13 +13,6 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant},
 };
-
-const OCCUPANCY_EXP: i32 = 10;
-/// Scales the occupancy-based part of the waiting time.
-const WAIT_TIME_BASE_MODIFIER: f64 = 0.1;
-
-/// A node with less than this much left to wait is admitted anyway.
-pub const TOPIC_TABLE_WAIT_TIME_FLOOR: Duration = Duration::from_secs(1);
 
 /// The ad cache: advertisements admitted by this registrar, per topic, with the state
 /// of the waiting-time function (IP trees and lower bounds).
@@ -204,7 +203,7 @@ impl TopicTable {
             let (required, components) = self.wait_time_components(node, &topic, now);
             if waited < required {
                 let remaining = required - waited;
-                if remaining > TOPIC_TABLE_WAIT_TIME_FLOOR {
+                if remaining > W_MIN {
                     // A ticket is being issued: record the lower bounds so the node cannot
                     // get a cheaper quote by asking again.
                     self.record_wait_time(&components, now);
@@ -268,8 +267,7 @@ impl TopicTable {
         let occupancy = 1.0 - reg_count as f64 / self.config.ad_cache_size as f64;
         // Purely occupancy-based wait: AdLifetime/10 for an empty cache, growing past
         // AdLifetime as the cache fills.
-        let base_time = WAIT_TIME_BASE_MODIFIER * self.config.ad_lifetime.as_secs_f64()
-            / occupancy.powi(OCCUPANCY_EXP);
+        let base_time = W_BASE * self.config.ad_lifetime.as_secs_f64() / occupancy.powi(P_OCC);
         // Share of the cache already taken by this topic.
         let topic_mod = self.topic_size(topic) as f64 / (reg_count + 1) as f64;
         let (ip_mod, ip_nodes, ip_floor) = self.wt.ip_score(node, now);
@@ -421,7 +419,7 @@ mod tests {
         }
         let m = node();
         let wt = tab.register(&m, TOPIC1, Duration::ZERO, now);
-        assert!(wt > TOPIC_TABLE_WAIT_TIME_FLOOR, "got {wt:?}");
+        assert!(wt > W_MIN, "got {wt:?}");
         assert!(!tab.is_registered(&m.node_id(), &TOPIC1));
         assert_eq!(tab.register(&m, TOPIC1, wt, now), Duration::ZERO);
         assert!(tab.is_registered(&m.node_id(), &TOPIC1));
@@ -567,7 +565,7 @@ mod tests {
             assert!(tab.add(&node(), TOPIC1, now));
         }
         let wt = tab.register(&node(), TOPIC1, Duration::ZERO, now);
-        assert!(wt > TOPIC_TABLE_WAIT_TIME_FLOOR);
+        assert!(wt > W_MIN);
         let recorded = tab.wt.topic_bounds[&TOPIC1].remaining(now);
         assert!(recorded > Duration::ZERO);
         // The service component is floored at the recorded bound.
@@ -592,7 +590,7 @@ mod tests {
 
         // Registering for an empty topic exercises only the IP component.
         let wt = tab.register(&node_with_ip(target), TOPIC2, Duration::ZERO, now);
-        assert!(wt > TOPIC_TABLE_WAIT_TIME_FLOOR, "got {wt:?}");
+        assert!(wt > W_MIN, "got {wt:?}");
         let floor = tab.wt.ipv4.path_floor(&target.octets(), now);
         assert!(floor > Duration::ZERO);
         assert_eq!(tab.wt.ipv4.bound_at(&target.octets(), depth, now), floor);
@@ -620,10 +618,7 @@ mod tests {
             assert!(tab.add(&node_with_ip(Ipv4Addr::new(203, 0, 113, i)), TOPIC1, now));
         }
         let target = Ipv4Addr::new(203, 0, 113, 200);
-        assert!(
-            tab.register(&node_with_ip(target), TOPIC2, Duration::ZERO, now)
-                > TOPIC_TABLE_WAIT_TIME_FLOOR
-        );
+        assert!(tab.register(&node_with_ip(target), TOPIC2, Duration::ZERO, now) > W_MIN);
         let (_, bound_depth) = tab.wt.ipv4.score_node(&target.octets());
         assert!(tab.wt.ipv4.bound_at(&target.octets(), bound_depth, now) > Duration::ZERO);
 

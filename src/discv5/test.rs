@@ -826,12 +826,23 @@ async fn test_bucket_limits() {
 #[cfg(feature = "topic-discovery")]
 mod topic {
     use super::*;
-    use crate::topic::{TopicConfig, TopicId, supports_topic_discovery};
+    use crate::topic::{
+        TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION, TopicConfig, TopicId,
+        supports_topic_discovery,
+    };
     use std::time::Duration;
 
     const TOPIC: TopicId = [7u8; 32];
 
-    /// Starts `n` nodes that all have each other in the routing table.
+    fn enabled(config: TopicConfig) -> TopicConfig {
+        TopicConfig {
+            enabled: true,
+            ..config
+        }
+    }
+
+    /// Starts `n` nodes with topic discovery enabled that all have each other in the
+    /// routing table.
     async fn build_topic_nodes(n: usize, base_port: u16, topic: TopicConfig) -> Vec<Discv5> {
         let mut nodes = Vec::new();
         for port in base_port..base_port + n as u16 {
@@ -841,7 +852,7 @@ mod topic {
                 port,
             };
             let config = ConfigBuilder::new(listen_config)
-                .topic_config(topic.clone())
+                .topic_config(enabled(topic.clone()))
                 .query_timeout(Duration::from_secs(30))
                 .build();
             let enr = Enr::builder()
@@ -868,6 +879,7 @@ mod topic {
     async fn wait_registered(nodes: &[Discv5], advertiser: NodeId, registrars: usize) {
         let holds = |node: &Discv5| {
             node.local_topic_nodes(TOPIC)
+                .unwrap()
                 .iter()
                 .any(|enr| enr.node_id() == advertiser)
         };
@@ -887,19 +899,18 @@ mod topic {
     }
 
     // Two nodes register, the second one through a ticket and its waiting time, and a
-    // third node finds both with the default search.
+    // third node finds both.
     #[tokio::test]
     async fn register_and_search() {
         init();
         let config = TopicConfig {
             // The second ad of the topic has to wait 0.05 of this.
             ad_lifetime: Duration::from_secs(30),
-            search_yield_floor: 0,
             ..Default::default()
         };
         let nodes = build_topic_nodes(5, 12000, config).await;
         let ids: Vec<NodeId> = nodes.iter().map(|n| n.local_enr().node_id()).collect();
-        assert!(nodes[2].local_topic_nodes(TOPIC).is_empty());
+        assert!(nodes[2].local_topic_nodes(TOPIC).unwrap().is_empty());
 
         let mut events = nodes[1].event_stream().await.unwrap();
 
@@ -907,7 +918,7 @@ mod topic {
         // Registering again changes nothing.
         nodes[0].register_topic(TOPIC).unwrap();
         wait_registered(&nodes, ids[0], 4).await;
-        assert!(nodes[0].local_topic_nodes(TOPIC).is_empty());
+        assert!(nodes[0].local_topic_nodes(TOPIC).unwrap().is_empty());
 
         let started = std::time::Instant::now();
         nodes[1].register_topic(TOPIC).unwrap();
@@ -959,13 +970,12 @@ mod topic {
         nodes[0].stop_topic_registration(TOPIC).unwrap();
     }
 
-    // The same with the adaptive search distance.
+    // The same on eight nodes, three of them advertisers.
     #[tokio::test]
-    async fn register_and_search_adaptive() {
+    async fn register_and_search_eight_nodes() {
         init();
         let config = TopicConfig {
             ad_lifetime: Duration::from_secs(10),
-            search_yield_floor: 4,
             // All registrars of a bucket are active, wherever the node ids fall.
             reg_bucket_size: 16,
             ..Default::default()
@@ -997,6 +1007,7 @@ mod topic {
                 port,
             };
             let config = ConfigBuilder::new(listen_config)
+                .topic_config(enabled(TopicConfig::default()))
                 .query_timeout(Duration::from_secs(3))
                 .build();
             let enr = Enr::builder()
@@ -1036,13 +1047,13 @@ mod topic {
             .await
             .unwrap();
         assert!(confirmation.admitted);
-        assert_eq!(nodes[1].local_topic_nodes(TOPIC).len(), 1);
+        assert_eq!(nodes[1].local_topic_nodes(TOPIC).unwrap().len(), 1);
 
         assert!(nodes[1].remove_node(&advertiser));
         // The service sees the removal when it next runs.
         nodes[2].send_ping(nodes[1].local_enr()).await.unwrap();
         for _ in 0..100 {
-            if nodes[1].local_topic_nodes(TOPIC).is_empty() {
+            if nodes[1].local_topic_nodes(TOPIC).unwrap().is_empty() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1076,7 +1087,7 @@ mod topic {
         assert!(confirmation.aux.iter().all(|e| e.node_id() != registrar_id));
         assert!(confirmation.aux.iter().all(supports_topic_discovery));
         assert_eq!(
-            sorted_ids(&nodes[1].local_topic_nodes(TOPIC)),
+            sorted_ids(&nodes[1].local_topic_nodes(TOPIC).unwrap()),
             vec![nodes[0].local_enr().node_id()]
         );
 
@@ -1112,5 +1123,110 @@ mod topic {
             .send_topic_query(silent.into(), TOPIC, vec![256])
             .await;
         assert_eq!(result.unwrap_err(), RequestError::Timeout);
+    }
+
+    fn local_enr(port: u16, key: &CombinedKey) -> crate::Enr {
+        Enr::builder()
+            .ip4(Ipv4Addr::LOCALHOST)
+            .udp4(port)
+            .build(key)
+            .unwrap()
+    }
+
+    fn node_config(port: u16, topic: TopicConfig) -> crate::Config {
+        let listen_config = ListenConfig::Ipv4 {
+            ip: Ipv4Addr::LOCALHOST,
+            port,
+        };
+        ConfigBuilder::new(listen_config)
+            .topic_config(topic)
+            .build()
+    }
+
+    // Disabled by default: no `td` entry, no answer to topic requests, and the topic
+    // API refuses.
+    #[tokio::test]
+    async fn gate_off_no_td_no_reply() {
+        init();
+        assert!(!TopicConfig::default().enabled);
+        let key = CombinedKey::generate_secp256k1();
+        let enr = local_enr(12095, &key);
+        let seq = enr.seq();
+        let mut off = Discv5::new(enr, key, node_config(12095, TopicConfig::default())).unwrap();
+        assert!(
+            off.local_enr()
+                .get_raw_rlp(TOPIC_DISCOVERY_ENR_KEY)
+                .is_none()
+        );
+        assert_eq!(off.local_enr().seq(), seq);
+        off.start().await.unwrap();
+
+        const DISABLED: &str = "topic discovery disabled";
+        let disabled = |e: Error| matches!(e, Error::Custom(DISABLED));
+        assert!(disabled(off.register_topic(TOPIC).unwrap_err()));
+        assert!(disabled(off.stop_topic_registration(TOPIC).unwrap_err()));
+        assert!(disabled(off.local_topic_nodes(TOPIC).unwrap_err()));
+        assert!(matches!(
+            off.topic_search(TOPIC, 1).await,
+            Err(QueryError::ChannelFailed(e)) if e == DISABLED
+        ));
+        let target: NodeContact = off.local_enr().into();
+        let disabled_request = Err(RequestError::ChannelFailed(DISABLED.into()));
+        let result = off
+            .send_regtopic(target.clone(), TOPIC, vec![], vec![])
+            .await;
+        assert_eq!(result.map(|_| ()), disabled_request);
+        let result = off.send_topic_query(target, TOPIC, vec![]).await;
+        assert_eq!(result.map(|_| ()), disabled_request);
+
+        let key = CombinedKey::generate_secp256k1();
+        let enr = local_enr(12096, &key);
+        let mut on = Discv5::new(
+            enr,
+            key,
+            node_config(12096, enabled(TopicConfig::default())),
+        )
+        .unwrap();
+        on.start().await.unwrap();
+        on.add_enr(off.local_enr()).unwrap();
+
+        // The requests time out as messages of an unknown type would; the node answers
+        // ordinary requests.
+        let contact: NodeContact = off.local_enr().into();
+        let result = on
+            .send_regtopic(contact.clone(), TOPIC, vec![], vec![256])
+            .await;
+        assert_eq!(result.unwrap_err(), RequestError::Timeout);
+        let result = on.send_topic_query(contact, TOPIC, vec![256]).await;
+        assert_eq!(result.unwrap_err(), RequestError::Timeout);
+        on.send_ping(off.local_enr()).await.unwrap();
+    }
+
+    // Enabled: `td = 1` is added to a record without it, which bumps the sequence
+    // number; a record that has it stays as it is.
+    #[tokio::test]
+    async fn gate_on_inserts_td_and_bumps_seq() {
+        init();
+        let config = || node_config(12097, enabled(TopicConfig::default()));
+        let key = CombinedKey::generate_secp256k1();
+        let enr = local_enr(12097, &key);
+        let seq = enr.seq();
+        assert!(enr.get_raw_rlp(TOPIC_DISCOVERY_ENR_KEY).is_none());
+        let node = Discv5::new(enr, key, config()).unwrap();
+        let with_td = node.local_enr();
+        assert_eq!(
+            with_td.get_raw_rlp(TOPIC_DISCOVERY_ENR_KEY),
+            Some(&[0x01][..])
+        );
+        assert!(supports_topic_discovery(&with_td));
+        assert_eq!(with_td.seq(), seq + 1);
+        assert!(with_td.verify());
+
+        let key = CombinedKey::generate_secp256k1();
+        let mut enr = local_enr(12097, &key);
+        enr.insert(TOPIC_DISCOVERY_ENR_KEY, &TOPIC_DISCOVERY_VERSION, &key)
+            .unwrap();
+        let node = Discv5::new(enr.clone(), key, config()).unwrap();
+        assert_eq!(node.local_enr(), enr);
     }
 }

@@ -107,9 +107,10 @@ pub struct Discv5 {
     enr_key: Arc<RwLock<CombinedKey>>,
     // Type of socket we are using
     ip_mode: IpMode,
-    /// The ad cache of the topic discovery registrar.
+    /// The ad cache of the topic discovery registrar. `None` when topic discovery is
+    /// disabled.
     #[cfg(feature = "topic-discovery")]
-    topic_table: Arc<RwLock<TopicTable>>,
+    topic_table: Option<Arc<RwLock<TopicTable>>>,
 }
 
 impl Discv5 {
@@ -129,7 +130,7 @@ impl Discv5 {
         let local_enr = {
             use crate::topic::{TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION};
             let mut local_enr = local_enr;
-            if !crate::topic::supports_topic_discovery(&local_enr) {
+            if config.topic.enabled && !crate::topic::supports_topic_discovery(&local_enr) {
                 local_enr
                     .insert(TOPIC_DISCOVERY_ENR_KEY, &TOPIC_DISCOVERY_VERSION, &enr_key)
                     .map_err(|_| "Failed to add the topic-discovery entry to the ENR")?;
@@ -158,13 +159,17 @@ impl Discv5 {
 
         let local_enr = Arc::new(RwLock::new(local_enr));
         let enr_key = Arc::new(RwLock::new(enr_key));
-        let kbuckets = Arc::new(RwLock::new(KBucketsTable::new(
+        #[allow(unused_mut)]
+        let mut kbuckets = KBucketsTable::new(
             local_enr.read().node_id().into(),
             Duration::from_secs(60),
             config.incoming_bucket_limit,
             table_filter,
             bucket_filter,
-        )));
+        );
+        #[cfg(feature = "topic-discovery")]
+        kbuckets.track_changes(config.topic.enabled);
+        let kbuckets = Arc::new(RwLock::new(kbuckets));
 
         // Update the PermitBan list based on initial configuration
         *PERMIT_BAN_LIST.write() = config.permit_ban_list.clone();
@@ -173,7 +178,10 @@ impl Discv5 {
 
         Ok(Discv5 {
             #[cfg(feature = "topic-discovery")]
-            topic_table: Arc::new(RwLock::new(TopicTable::new(config.topic.clone()))),
+            topic_table: config
+                .topic
+                .enabled
+                .then(|| Arc::new(RwLock::new(TopicTable::new(config.topic.clone())))),
             config,
             service_channel: None,
             service_exit: None,
@@ -736,7 +744,7 @@ impl Discv5 {
 
     /// Keeps an advertisement of the local node for `topic` alive: runs the registration
     /// walk against the registrars around the topic hash until it is stopped. The
-    /// registrars are the nodes whose record carries the `ng` entry.
+    /// registrars are the nodes whose record carries the `td` entry.
     #[cfg(feature = "topic-discovery")]
     pub fn register_topic(&self, topic: TopicId) -> Result<(), Error> {
         self.send_topic_command(ServiceRequest::RegisterTopic(topic))
@@ -757,10 +765,13 @@ impl Discv5 {
         topic: TopicId,
         count: usize,
     ) -> impl Future<Output = Result<Vec<Enr>, QueryError>> + 'static + use<> {
-        let channel = self.clone_channel();
+        let channel = self.topic_enabled().and_then(|_| self.clone_channel());
 
         async move {
-            let channel = channel.map_err(|_| QueryError::ServiceNotStarted)?;
+            let channel = channel.map_err(|e| match e {
+                Error::Custom(e) => QueryError::ChannelFailed(e.into()),
+                _ => QueryError::ServiceNotStarted,
+            })?;
             let (callback_send, callback_recv) = oneshot::channel();
 
             let event = ServiceRequest::TopicSearch(topic, count, callback_send);
@@ -787,10 +798,10 @@ impl Discv5 {
         distances: Vec<u64>,
     ) -> impl Future<Output = Result<RegConfirmation, RequestError>> + 'static + use<> {
         let (callback_send, callback_recv) = oneshot::channel();
-        let channel = self.clone_channel();
+        let channel = self.topic_enabled().and_then(|_| self.clone_channel());
 
         async move {
-            let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
+            let channel = channel.map_err(topic_request_error)?;
 
             let event = ServiceRequest::RegTopic(contact, topic, ticket, distances, callback_send);
             channel
@@ -813,10 +824,10 @@ impl Discv5 {
         distances: Vec<u64>,
     ) -> impl Future<Output = Result<TopicQueryResult, RequestError>> + 'static + use<> {
         let (callback_send, callback_recv) = oneshot::channel();
-        let channel = self.clone_channel();
+        let channel = self.topic_enabled().and_then(|_| self.clone_channel());
 
         async move {
-            let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
+            let channel = channel.map_err(topic_request_error)?;
 
             let event = ServiceRequest::TopicQuery(contact, topic, distances, callback_send);
             channel
@@ -831,18 +842,32 @@ impl Discv5 {
 
     /// The advertisers that the local node, as a registrar, holds for `topic`.
     #[cfg(feature = "topic-discovery")]
-    pub fn local_topic_nodes(&self, topic: TopicId) -> Vec<Enr> {
-        self.topic_table.read().nodes(&topic, Instant::now())
+    pub fn local_topic_nodes(&self, topic: TopicId) -> Result<Vec<Enr>, Error> {
+        let table = self
+            .topic_table
+            .as_ref()
+            .ok_or(Error::Custom(TOPIC_DISABLED))?;
+        Ok(table.read().nodes(&topic, Instant::now()))
     }
 
     #[cfg(feature = "topic-discovery")]
     fn send_topic_command(&self, request: ServiceRequest) -> Result<(), Error> {
+        self.topic_enabled()?;
         self.clone_channel()?
             .try_send(request)
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => Error::Custom("Service channel full"),
                 mpsc::error::TrySendError::Closed(_) => Error::ServiceChannelClosed,
             })
+    }
+
+    #[cfg(feature = "topic-discovery")]
+    fn topic_enabled(&self) -> Result<(), Error> {
+        if self.config.topic.enabled {
+            Ok(())
+        } else {
+            Err(Error::Custom(TOPIC_DISABLED))
+        }
     }
 
     /// Creates an event stream channel which can be polled to receive Discv5 events.
@@ -873,6 +898,17 @@ impl Discv5 {
         } else {
             Err(Error::ServiceNotStarted)
         }
+    }
+}
+
+#[cfg(feature = "topic-discovery")]
+const TOPIC_DISABLED: &str = "topic discovery disabled";
+
+#[cfg(feature = "topic-discovery")]
+fn topic_request_error(error: Error) -> RequestError {
+    match error {
+        Error::Custom(e) => RequestError::ChannelFailed(e.into()),
+        _ => RequestError::ServiceNotStarted,
     }
 }
 

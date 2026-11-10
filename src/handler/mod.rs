@@ -228,6 +228,9 @@ pub struct Handler {
     socket: Socket,
     /// Exit channel to shutdown the handler.
     exit: oneshot::Receiver<()>,
+    /// Whether topic discovery messages are processed.
+    #[cfg(feature = "topic-discovery")]
+    topic_enabled: bool,
 }
 
 type HandlerReturn = (
@@ -324,6 +327,8 @@ impl Handler {
                     listen_sockets,
                     socket,
                     exit,
+                    #[cfg(feature = "topic-discovery")]
+                    topic_enabled: config.topic.enabled,
                 };
                 debug!("Handler Starting");
                 handler.start().await;
@@ -1055,6 +1060,12 @@ impl Handler {
             let message = match session.decrypt_message(message_nonce, message, authenticated_data)
             {
                 Ok(m) => match Message::decode(&m) {
+                    // Disabled, topic messages are dropped as messages of an unknown type.
+                    #[cfg(feature = "topic-discovery")]
+                    Ok(p) if !self.topic_enabled && p.is_topic_message() => {
+                        warn!(%node_address, "Failed to decode message: topic discovery is disabled");
+                        return;
+                    }
                     Ok(p) => p,
                     Err(e) => {
                         warn!(error = ?e, %node_address, "Failed to decode message");

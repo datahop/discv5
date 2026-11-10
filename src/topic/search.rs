@@ -1,16 +1,20 @@
 //! The searcher's table for one pass over a topic: the registrars to query, bucketed by
 //! their distance to the topic hash, the choice of the next registrar, and the results.
 //!
-//! With `search_yield_floor` set, the search is adaptive: it queries one bucket, the
-//! active one, and moves it by the number of ads the registrars there return.
+//! The search queries one bucket, the active one, and moves it by the number of ads the
+//! registrars there return.
 
 use super::{
     SearchFilter, TopicConfig, TopicId, TopicNode, bucket_index,
     netutil::{DistinctNetSet, is_lan},
+    params::{
+        F_RETURN, SEARCH_AUX_RADIUS, SEARCH_MAX_JUMP, SEARCH_MIN_SAMPLES, SEARCH_TABLE_DEPTH,
+        SEARCH_YIELD_FLOOR, SEARCH_YIELD_WINDOW,
+    },
 };
 use crate::Enr;
 use enr::NodeId;
-use rand::{RngExt, seq::IteratorRandom};
+use rand::seq::IteratorRandom;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::Instant,
@@ -21,15 +25,9 @@ use tracing::debug;
 const SEARCH_BUCKET_SUBNET: u8 = 24;
 const SEARCH_BUCKET_IP_LIMIT: usize = 1;
 
-// Adaptive distance: replies kept per bucket, and the largest jump.
-const SEARCH_YIELD_WINDOW: usize = 4;
-const SEARCH_MAX_JUMP: usize = 4;
-
 struct SearchBucket<N> {
     dist: u64,
     new: HashMap<NodeId, N>,
-    asked: HashMap<NodeId, N>,
-    num_requests: usize,
     /// Ad counts of the last `SEARCH_YIELD_WINDOW` replies.
     yields: VecDeque<usize>,
     ips: DistinctNetSet,
@@ -37,11 +35,11 @@ struct SearchBucket<N> {
 
 impl<N> SearchBucket<N> {
     fn contains(&self, id: &NodeId) -> bool {
-        self.new.contains_key(id) || self.asked.contains_key(id)
+        self.new.contains_key(id)
     }
 
     fn count(&self) -> usize {
-        self.new.len() + self.asked.len()
+        self.new.len()
     }
 }
 
@@ -53,7 +51,7 @@ pub struct Search<N: TopicNode = Enr> {
     config: TopicConfig,
     /// Ordered far to close.
     buckets: Vec<SearchBucket<N>>,
-    /// The bucket an adaptive search queries.
+    /// The bucket the search queries.
     active: usize,
     /// The nodes queried within the last ad lifetime.
     asked: SearchFilter,
@@ -66,13 +64,10 @@ pub struct Search<N: TopicNode = Enr> {
 
 impl<N: TopicNode> Search<N> {
     pub fn new(topic: TopicId, local_id: NodeId, config: TopicConfig) -> Self {
-        let depth = config.search_table_depth.clamp(1, 256);
-        let buckets = (0..depth)
+        let buckets = (0..SEARCH_TABLE_DEPTH)
             .map(|i| SearchBucket {
                 dist: (256 - i) as u64,
                 new: HashMap::new(),
-                asked: HashMap::new(),
-                num_requests: 0,
                 yields: VecDeque::new(),
                 ips: DistinctNetSet::new(SEARCH_BUCKET_SUBNET, SEARCH_BUCKET_IP_LIMIT),
             })
@@ -91,11 +86,7 @@ impl<N: TopicNode> Search<N> {
         }
     }
 
-    fn adaptive(&self) -> bool {
-        self.config.search_yield_floor > 0
-    }
-
-    /// The bucket an adaptive search queries.
+    /// The bucket the search queries.
     pub fn active_bucket(&self) -> usize {
         self.active
     }
@@ -115,58 +106,41 @@ impl<N: TopicNode> Search<N> {
         self.asked
     }
 
-    /// Reports whether the pass is over. In an adaptive search that has nothing left to
-    /// ask, this moves the active bucket one step closer for the next pass, so it must
-    /// be called once per such state.
+    /// Reports whether the pass is over. When nothing is left to ask, this moves the
+    /// active bucket one step closer for the next pass, so it must be called once per
+    /// such state.
     pub fn is_done(&mut self) -> bool {
         // Not done while there are unused results.
         if !self.result_buffer.is_empty() {
             return false;
         }
-        // An adaptive pass ends when the active bucket is exhausted and has enough
-        // replies to place the next pass.
-        if self.adaptive() {
-            let b = &self.buckets[self.active];
-            if b.new.is_empty() && b.yields.len() >= 2 {
-                return true;
-            }
+        // A pass ends when the active bucket is exhausted and has enough replies to
+        // place the next pass.
+        let b = &self.buckets[self.active];
+        if b.new.is_empty() && b.yields.len() >= SEARCH_MIN_SAMPLES {
+            return true;
         }
         if self.buckets.iter().any(|b| !b.new.is_empty()) {
             return false;
         }
-        if self.adaptive() && !self.spare_used && !self.spare.is_empty() {
+        if !self.spare_used && !self.spare.is_empty() {
             return false;
         }
-        if self.adaptive() && self.active < self.buckets.len() - 1 {
+        if self.active < self.buckets.len() - 1 {
             self.active += 1;
         }
         true
     }
 
-    /// The distances at which the table has space available. An adaptive search lists
-    /// the distances within `search_aux_radius` of its active bucket, and only those
-    /// unless the radius is `None`.
+    /// The distances within `SEARCH_AUX_RADIUS` of the active bucket at which the table
+    /// has space available.
     pub fn buckets_with_free_space(&self) -> Vec<u64> {
-        let free = |i: usize| self.buckets[i].count() < self.config.search_bucket_size;
-        let mut dists = Vec::with_capacity(self.buckets.len());
-        if self.adaptive() {
-            let last = self.buckets.len() - 1;
-            let r = self.config.search_aux_radius.unwrap_or(0).max(1);
-            for i in self.active.saturating_sub(r)..=(self.active + r).min(last) {
-                if free(i) {
-                    dists.push(self.buckets[i].dist);
-                }
-            }
-            if self.config.search_aux_radius.is_some() {
-                return dists;
-            }
-        }
-        for i in 0..self.buckets.len() {
-            if free(i) && !dists.contains(&self.buckets[i].dist) {
-                dists.push(self.buckets[i].dist);
-            }
-        }
-        dists
+        let last = self.buckets.len() - 1;
+        let r = SEARCH_AUX_RADIUS;
+        (self.active.saturating_sub(r)..=(self.active + r).min(last))
+            .filter(|&i| self.buckets[i].count() < self.config.search_bucket_size)
+            .map(|i| self.buckets[i].dist)
+            .collect()
     }
 
     /// Adds potential registrars to the table. `src` is the node that returned them, or
@@ -187,7 +161,7 @@ impl<N: TopicNode> Search<N> {
             }
             let bi = self.bucket_index(&id);
 
-            if self.adaptive() && self.asked.seen(&n, now) {
+            if self.asked.seen(&n, now) {
                 self.spare.insert(id, n);
                 continue;
             }
@@ -218,42 +192,16 @@ impl<N: TopicNode> Search<N> {
     fn remove_node(&mut self, id: &NodeId) {
         let bi = self.bucket_index(id);
         let b = &mut self.buckets[bi];
-        let node = b.new.remove(id).or(b.asked.remove(id));
-        b.asked.remove(id);
-        if let Some(ip) = node.and_then(|n| n.ip())
+        if let Some(ip) = b.new.remove(id).and_then(|n| n.ip())
             && !is_lan(ip)
         {
             b.ips.remove(ip);
         }
     }
 
-    /// A random node to send the next topic query to. The default search walks the
-    /// buckets far to close: the pool holds the buckets with unasked nodes up to, and
-    /// including, the first one that has not answered a request yet.
+    /// The node to send the next topic query to: an unasked node in the active bucket,
+    /// or in the nearest bucket that has one, the farther side first.
     pub fn query_target(&mut self) -> Option<N> {
-        if self.adaptive() {
-            return self.adaptive_target();
-        }
-        let mut with_new = Vec::with_capacity(self.buckets.len());
-        for b in &self.buckets {
-            if !b.new.is_empty() {
-                with_new.push(b);
-                if b.num_requests == 0 {
-                    break;
-                }
-            }
-        }
-        if with_new.is_empty() {
-            return None;
-        }
-        let mut rng = rand::rng();
-        let b = with_new[rng.random_range(0..with_new.len())];
-        b.new.values().choose(&mut rng).cloned()
-    }
-
-    /// An unasked node in the active bucket, or in the nearest bucket that has one, the
-    /// farther side first.
-    fn adaptive_target(&mut self) -> Option<N> {
         let mut rng = rand::rng();
         for d in 0..self.buckets.len() {
             for i in [self.active.checked_sub(d), self.active.checked_add(d)] {
@@ -283,14 +231,14 @@ impl<N: TopicNode> Search<N> {
         if b.yields.len() > SEARCH_YIELD_WINDOW {
             b.yields.pop_front();
         }
-        if b.yields.len() < 2 {
+        if b.yields.len() < SEARCH_MIN_SAMPLES {
             return;
         }
         let mut sorted: Vec<usize> = b.yields.iter().copied().collect();
         sorted.sort_unstable();
         let (lower, upper) = (sorted[(sorted.len() - 1) / 2], sorted[sorted.len() / 2]);
-        let floor = self.config.search_yield_floor;
-        self.active = if lower >= self.config.topic_nodes_limit {
+        let floor = SEARCH_YIELD_FLOOR;
+        self.active = if lower >= F_RETURN {
             bi.saturating_sub(1)
         } else if upper >= floor {
             bi
@@ -312,15 +260,9 @@ impl<N: TopicNode> Search<N> {
         let results: Vec<N> = results.into_iter().collect();
         let from_id = from.node_id();
         let bi = self.bucket_index(&from_id);
-        let b = &mut self.buckets[bi];
-        b.new.remove(&from_id);
-        b.asked.insert(from_id, from.clone());
-        b.num_requests += 1;
-        if self.adaptive() {
-            self.observe(bi, results.len());
-            self.asked.add(from, now);
-            self.remove_node(&from_id);
-        }
+        self.observe(bi, results.len());
+        self.asked.add(from, now);
+        self.remove_node(&from_id);
 
         for n in results {
             let id = n.node_id();
@@ -363,13 +305,6 @@ mod tests {
         Search::new(TOPIC1, local_id(), config)
     }
 
-    fn adaptive_config() -> TopicConfig {
-        TopicConfig {
-            search_yield_floor: 4,
-            ..test_config()
-        }
-    }
-
     fn contains_all(s: &Search<TestNode>, bi: usize, nodes: &[TestNode]) -> bool {
         nodes.iter().all(|n| s.buckets[bi].contains(&n.id))
     }
@@ -386,58 +321,6 @@ mod tests {
         assert_eq!(s.buckets.len(), DEPTH);
         assert!(contains_all(&s, DEPTH - 1, &close5));
         assert!(contains_all(&s, DEPTH - 1, &close20));
-    }
-
-    // Done when empty, not done with unasked nodes or buffered results.
-    #[test]
-    fn is_done() {
-        let now = Instant::now();
-        let mut s = search(test_config());
-        assert!(s.is_done());
-
-        s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 255, 2, 1), now);
-        assert!(!s.is_done());
-
-        let results = nodes_at_distance_from(&TOPIC1, 200, 2, 100);
-        while let Some(n) = s.query_target() {
-            s.add_query_results(&n, results.clone(), now);
-        }
-        assert!(!s.is_done(), "done while results are buffered");
-
-        while s.pop_result().is_some() {}
-        assert!(s.is_done());
-        assert_eq!(
-            s.active_bucket(),
-            0,
-            "default search moved the active bucket"
-        );
-    }
-
-    // The walk starts in the farthest bucket with candidates; closer buckets join after
-    // that bucket answered. Every node is picked once.
-    #[test]
-    fn query_target() {
-        let now = Instant::now();
-        let mut s = search(test_config());
-        assert!(s.query_target().is_none());
-
-        s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 253, 2, 1), now);
-        s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 249, 2, 10), now);
-        for _ in 0..20 {
-            let n = s.query_target().expect("no target on a populated table");
-            assert_eq!(s.bucket_index(&n.id), 3);
-        }
-
-        let mut asked = HashSet::new();
-        let mut buckets = Vec::new();
-        while let Some(n) = s.query_target() {
-            assert!(asked.insert(n.id), "node picked twice");
-            buckets.push(s.bucket_index(&n.id));
-            s.add_query_results(&n, [], now);
-        }
-        assert_eq!(asked.len(), 4);
-        assert_eq!(buckets[0], 3);
-        assert!(s.is_done());
     }
 
     // One node per bucket from one source in one call.
@@ -496,7 +379,6 @@ mod tests {
         s.add_nodes(None, [replacement.clone()], now);
         assert!(s.buckets[0].contains(&replacement.id));
 
-        // The failure is not a response: bucket 0 keeps gating the walk.
         let n = s.query_target().unwrap();
         assert!(s.buckets[0].contains(&n.id));
 
@@ -511,9 +393,9 @@ mod tests {
         assert!(s.is_done());
     }
 
-    // Removing an asked node frees its subnet entry too.
+    // An answered node leaves the table and frees its subnet entry.
     #[test]
-    fn remove_asked_node_frees_ip() {
+    fn answered_node_frees_ip() {
         let now = Instant::now();
         let mut s = search(test_config());
         let nodes = nodes_at_distance_from(&TOPIC1, 256, 1, 1);
@@ -521,9 +403,6 @@ mod tests {
         s.add_nodes(None, nodes, now);
 
         s.add_query_results(&n, [], now);
-        assert!(s.buckets[0].asked.contains_key(&n.id));
-
-        s.handle_error_response(&n.id);
         assert!(!s.buckets[0].contains(&n.id));
         let replacement = node_at_distance(&TOPIC1, 256, n.ip.unwrap());
         s.add_nodes(None, [replacement.clone()], now);
@@ -560,30 +439,29 @@ mod tests {
         assert!(s.pop_result().is_none());
     }
 
-    // Every bucket with room is listed; asked nodes keep their slot.
+    // The buckets with room around the active one are listed.
     #[test]
     fn buckets_with_free_space() {
         let now = Instant::now();
         let config = test_config();
         let mut s = search(config.clone());
-        let dists = s.buckets_with_free_space();
-        assert_eq!(dists, (239..=256).rev().collect::<Vec<u64>>());
+        assert_eq!(s.buckets_with_free_space(), [256, 255]);
 
         let full = nodes_at_distance_from(&TOPIC1, 256, config.search_bucket_size, 1);
-        s.add_nodes(None, full.clone(), now);
+        s.add_nodes(None, full, now);
         assert_eq!(s.buckets[0].count(), config.search_bucket_size);
-        let dists = s.buckets_with_free_space();
-        assert_eq!(dists.len(), DEPTH - 1);
-        assert!(!dists.contains(&256));
+        assert_eq!(s.buckets_with_free_space(), [255]);
 
-        s.add_query_results(&full[0], [], now);
-        assert!(!s.buckets_with_free_space().contains(&256));
+        s.set_active_bucket(3);
+        assert_eq!(s.buckets_with_free_space(), [254, 253, 252]);
+        s.set_active_bucket(DEPTH - 1);
+        assert_eq!(s.buckets_with_free_space(), [240, 239]);
     }
 
     /// An adaptive search with two candidates in every bucket the tests move through.
     fn adaptive_search() -> Search<TestNode> {
         let now = Instant::now();
-        let mut s = search(adaptive_config());
+        let mut s = search(test_config());
         for bi in 0..=12 {
             s.add_nodes(
                 None,
@@ -614,23 +492,26 @@ mod tests {
         reply(&mut s, 0, 1);
         assert_eq!(s.active_bucket(), 0, "moved on a single sample");
         reply(&mut s, 0, 1);
-        assert_eq!(s.active_bucket(), 2);
-        reply(&mut s, 2, 0);
-        reply(&mut s, 2, 0);
-        assert_eq!(s.active_bucket(), 2 + SEARCH_MAX_JUMP);
+        assert_eq!(s.active_bucket(), 3);
+        reply(&mut s, 3, 2);
+        reply(&mut s, 3, 2);
+        assert_eq!(s.active_bucket(), 5);
+        reply(&mut s, 5, 0);
+        reply(&mut s, 5, 0);
+        assert_eq!(s.active_bucket(), 5 + SEARCH_MAX_JUMP);
     }
 
     // Full replies move the search one bucket farther, replies at the floor keep it.
     #[test]
     fn adaptive_retreat() {
-        let limit = test_config().topic_nodes_limit;
+        let limit = F_RETURN;
         let mut s = adaptive_search();
         s.set_active_bucket(6);
         reply(&mut s, 6, limit);
         reply(&mut s, 6, limit);
         assert_eq!(s.active_bucket(), 5);
-        reply(&mut s, 5, 5);
-        reply(&mut s, 5, 6);
+        reply(&mut s, 5, 7);
+        reply(&mut s, 5, 8);
         assert_eq!(s.active_bucket(), 5);
         s.set_active_bucket(8);
         reply(&mut s, 8, limit);
@@ -642,19 +523,19 @@ mod tests {
     #[test]
     fn adaptive_liar() {
         let now = Instant::now();
-        let limit = test_config().topic_nodes_limit;
+        let limit = F_RETURN;
         let mut s = adaptive_search();
         s.set_active_bucket(4);
         s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 252, 2, 100), now);
         reply(&mut s, 4, limit);
-        reply(&mut s, 4, 1);
+        reply(&mut s, 4, 2);
         assert_eq!(s.active_bucket(), 4);
-        reply(&mut s, 4, 1);
+        reply(&mut s, 4, 2);
         assert_eq!(s.active_bucket(), 6);
 
         s.set_active_bucket(2);
         s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 254, 2, 100), now);
-        for n in [0, 4, 4, 4] {
+        for n in [0, 8, 8, 8] {
             reply(&mut s, 2, n);
             assert_eq!(s.active_bucket(), 2, "one empty reply advanced the search");
         }
@@ -665,7 +546,7 @@ mod tests {
     #[test]
     fn adaptive_helper() {
         let now = Instant::now();
-        let mut s = search(adaptive_config());
+        let mut s = search(test_config());
         s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 254, 1, 1), now);
         s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 249, 1, 2), now);
         s.set_active_bucket(5);
@@ -680,32 +561,6 @@ mod tests {
         assert_eq!(s.bucket_index(&n.id), 2);
     }
 
-    // An adaptive search asks to refill only the buckets within `search_aux_radius` of
-    // its active bucket; `None` lists every bucket with free space, the neighbourhood
-    // first.
-    #[test]
-    fn adaptive_free_space_radius() {
-        let mut s = search(adaptive_config());
-        s.set_active_bucket(3);
-        assert_eq!(s.buckets_with_free_space(), [254, 253, 252]);
-
-        let mut s = search(TopicConfig {
-            search_aux_radius: Some(2),
-            ..adaptive_config()
-        });
-        s.set_active_bucket(3);
-        assert_eq!(s.buckets_with_free_space(), [255, 254, 253, 252, 251]);
-
-        let mut s = search(TopicConfig {
-            search_aux_radius: None,
-            ..adaptive_config()
-        });
-        s.set_active_bucket(3);
-        let dists = s.buckets_with_free_space();
-        assert_eq!(dists.len(), DEPTH);
-        assert_eq!(dists[..4], [254, 253, 252, 256]);
-    }
-
     // An adaptive pass ends once the active bucket is exhausted, and not while results
     // are buffered.
     #[test]
@@ -714,15 +569,15 @@ mod tests {
         let mut s = adaptive_search();
         s.set_active_bucket(3);
         assert!(!s.is_done());
-        reply(&mut s, 3, 4);
-        reply(&mut s, 3, 4);
+        reply(&mut s, 3, 8);
+        reply(&mut s, 3, 8);
         assert!(!s.is_done(), "done while results are buffered");
         while s.pop_result().is_some() {}
         assert!(s.is_done());
         assert_eq!(s.active_bucket(), 3);
 
         // A bucket with a single candidate cannot decide on its own.
-        let mut s = search(adaptive_config());
+        let mut s = search(test_config());
         s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 251, 1, 1), now);
         s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 249, 2, 10), now);
         s.set_active_bucket(5);
@@ -739,7 +594,7 @@ mod tests {
         let now = Instant::now();
         let config = TopicConfig {
             search_bucket_size: 2,
-            ..adaptive_config()
+            ..test_config()
         };
         let mut s = search(config.clone());
         let nodes = nodes_at_distance_from(&TOPIC1, 256, 2, 1);
@@ -772,7 +627,7 @@ mod tests {
     #[test]
     fn adaptive_walked_dry() {
         let now = Instant::now();
-        let mut s = search(adaptive_config());
+        let mut s = search(test_config());
         s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 256, 1, 1), now);
         reply(&mut s, 0, 0);
         assert!(s.is_done());
@@ -788,13 +643,13 @@ mod tests {
     #[test]
     fn adaptive_spare() {
         let now = Instant::now();
-        let mut s = search(adaptive_config());
+        let mut s = search(test_config());
         let seeds = nodes_at_distance_from(&TOPIC1, 256, 2, 1);
         s.add_nodes(None, seeds.clone(), now);
         reply(&mut s, 0, 0);
         reply(&mut s, 0, 0);
 
-        let mut next = search(adaptive_config());
+        let mut next = search(test_config());
         next.set_asked_filter(s.into_asked_filter());
         next.add_nodes(None, seeds, now);
         assert!(!next.is_done(), "done with spare nodes still to ask");
@@ -812,7 +667,7 @@ mod tests {
     #[test]
     fn adaptive_asked_filter_expiry() {
         let now = Instant::now();
-        let config = adaptive_config();
+        let config = test_config();
         let mut s = search(config.clone());
         let seeds = nodes_at_distance_from(&TOPIC1, 256, 2, 1);
         s.add_nodes(None, seeds.clone(), now);

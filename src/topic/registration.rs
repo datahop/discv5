@@ -4,6 +4,7 @@
 use super::{
     TopicConfig, TopicId, TopicNode, bucket_index,
     netutil::{DistinctNetSet, is_lan, same_net},
+    params::REG_TABLE_DEPTH,
 };
 use crate::Enr;
 use enr::NodeId;
@@ -110,8 +111,7 @@ pub struct Registration<N: TopicNode = Enr> {
 
 impl<N: TopicNode> Registration<N> {
     pub fn new(topic: TopicId, local_id: NodeId, config: TopicConfig) -> Self {
-        let depth = config.reg_table_depth.clamp(1, 256);
-        let buckets = (0..depth)
+        let buckets = (0..REG_TABLE_DEPTH)
             .map(|i| RegBucket {
                 dist: (256 - i) as u64,
                 att: HashMap::new(),

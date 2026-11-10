@@ -246,12 +246,13 @@ pub(crate) struct Service {
     /// contactable or not. This decides if we should update our ENR or set it to None, if we are
     /// not contactable.
     connectivity_state: ConnectivityState,
-    /// The ad cache of the topic discovery registrar.
+    /// The ad cache of the topic discovery registrar. `None` when topic discovery is
+    /// disabled.
     #[cfg(feature = "topic-discovery")]
-    topic_table: Arc<RwLock<TopicTable>>,
-    /// Seals the tickets handed out by the registrar.
+    topic_table: Option<Arc<RwLock<TopicTable>>>,
+    /// Seals the tickets handed out by the registrar, with the ad cache.
     #[cfg(feature = "topic-discovery")]
-    ticket_sealer: crate::topic::TicketSealer,
+    ticket_sealer: Option<crate::topic::TicketSealer>,
     /// The topic registrations and searches of the local node.
     #[cfg(feature = "topic-discovery")]
     topics: topic::TopicSystem,
@@ -330,7 +331,7 @@ impl Service {
         enr_key: Arc<RwLock<CombinedKey>>,
         kbuckets: Arc<RwLock<KBucketsTable<NodeId, Enr>>>,
         config: Config,
-        #[cfg(feature = "topic-discovery")] topic_table: Arc<RwLock<TopicTable>>,
+        #[cfg(feature = "topic-discovery")] topic_table: Option<Arc<RwLock<TopicTable>>>,
     ) -> Result<(oneshot::Sender<()>, mpsc::Sender<ServiceRequest>), std::io::Error> {
         // process behaviour-level configuration parameters
         let ip_votes = if config.enr_update {
@@ -375,9 +376,11 @@ impl Service {
                     event_stream: None,
                     exit,
                     #[cfg(feature = "topic-discovery")]
-                    topic_table,
+                    ticket_sealer: topic_table
+                        .as_ref()
+                        .map(|_| crate::topic::TicketSealer::new(Instant::now())),
                     #[cfg(feature = "topic-discovery")]
-                    ticket_sealer: crate::topic::TicketSealer::new(Instant::now()),
+                    topic_table,
                     #[cfg(feature = "topic-discovery")]
                     topics: Default::default(),
                     config: config.clone(),
@@ -396,7 +399,9 @@ impl Service {
     async fn start(&mut self) {
         loop {
             #[cfg(feature = "topic-discovery")]
-            self.topic_table_changes();
+            if self.config.topic.enabled {
+                self.topic_table_changes();
+            }
             let topic_wakeup = self.topic_wakeup();
             tokio::select! {
                 _ = &mut self.exit => {
@@ -1789,6 +1794,7 @@ impl Service {
         #[cfg(feature = "topic-discovery")]
         {
             self.topic_next_wakeup()
+                .filter(|_| self.config.topic.enabled)
         }
         #[cfg(not(feature = "topic-discovery"))]
         {

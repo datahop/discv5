@@ -1,0 +1,106 @@
+## TopDisc Message Encodings
+
+These vectors give the plaintext of each TopDisc message: the message type byte followed by
+the RLP encoding of `message-data`. They are carried in an ordinary message packet, encrypted
+as in the packet encodings above. The ticket shown is an arbitrary opaque value.
+
+The ENR used below is signed with `node-a-key`, has sequence number 1, `ip` 127.0.0.1, `udp` 30303
+and `td` 1:
+
+    f888b840f36f7d2609019afe961991302e5269e47d9401f33faf6e56ba1b81f9
+    a827de5778c20038bcf71e98ed832aec61ff7ed9454b1893ad41ff20d3bf9d63
+    ca65c04901826964827634826970847f00000189736563703235366b31a10313
+    d14211e0287b2361a1615890a9b5212080546d0a257ae4cff96cf534992cb982
+    7464018375647082765f
+
+The service identifier is:
+
+    topic = SHA-256("example-service")
+          = 0xacac0a3cfc659b9392c42a643065965e71cae5229afeade460788cca53315f89
+
+REGTOPIC, first request (no ticket):
+
+    # regtopic.req-id = 0x00000001
+    # regtopic.topic = SHA-256("example-service")
+    # regtopic.ticket = (empty)
+    # regtopic.ENR = the ENR above
+    # regtopic.topic-distances = [256, 255, 254]
+
+    07f8b98400000001a0acac0a3cfc659b9392c42a643065965e71cae5229afead
+    e460788cca53315f8980f888b840f36f7d2609019afe961991302e5269e47d94
+    01f33faf6e56ba1b81f9a827de5778c20038bcf71e98ed832aec61ff7ed9454b
+    1893ad41ff20d3bf9d63ca65c04901826964827634826970847f000001897365
+    63703235366b31a10313d14211e0287b2361a1615890a9b5212080546d0a257a
+    e4cff96cf534992cb9827464018375647082765fc782010081ff81fe
+
+REGTOPIC, retry with a ticket:
+
+    # regtopic.req-id = 0x00000002
+    # regtopic.topic = SHA-256("example-service")
+    # regtopic.ticket = 0x0102030405060708090a0b0c0d0e0f10
+    # regtopic.ENR = the ENR above
+    # regtopic.topic-distances = [256, 255, 254]
+
+    07f8c98400000002a0acac0a3cfc659b9392c42a643065965e71cae5229afead
+    e460788cca53315f89900102030405060708090a0b0c0d0e0f10f888b840f36f
+    7d2609019afe961991302e5269e47d9401f33faf6e56ba1b81f9a827de5778c2
+    0038bcf71e98ed832aec61ff7ed9454b1893ad41ff20d3bf9d63ca65c0490182
+    6964827634826970847f00000189736563703235366b31a10313d14211e0287b
+    2361a1615890a9b5212080546d0a257ae4cff96cf534992cb982746401837564
+    7082765fc782010081ff81fe
+
+REGCONFIRMATION, admitted:
+
+    # regconfirmation.req-id = 0x00000001
+    # regconfirmation.total = 1
+    # regconfirmation.ticket = (empty)
+    # regconfirmation.wait-time = 900000
+
+    08cb84000000010180830dbba0
+
+REGCONFIRMATION, ticket issued:
+
+    # regconfirmation.req-id = 0x00000001
+    # regconfirmation.total = 2
+    # regconfirmation.ticket = 0x0102030405060708090a0b0c0d0e0f10
+    # regconfirmation.wait-time = 12345
+
+    08da840000000102900102030405060708090a0b0c0d0e0f10823039
+
+REGCONFIRMATION, rejected:
+
+    # regconfirmation.req-id = 0x00000001
+    # regconfirmation.total = 1
+    # regconfirmation.ticket = (empty)
+    # regconfirmation.wait-time = 0
+
+    08c88400000001018080
+
+TOPICQUERY:
+
+    # topicquery.req-id = 0x00000003
+    # topicquery.topic = SHA-256("example-service")
+    # topicquery.topic-distances = [256, 255]
+
+    09ec8400000003a0acac0a3cfc659b9392c42a643065965e71cae5229afeade4
+    60788cca53315f89c582010081ff
+
+TOPICNODES, one advertisement:
+
+    # topicnodes.req-id = 0x00000003
+    # topicnodes.total = 1
+    # topicnodes.ENRs = [the ENR above]
+
+    0af892840000000301f88af888b840f36f7d2609019afe961991302e5269e47d
+    9401f33faf6e56ba1b81f9a827de5778c20038bcf71e98ed832aec61ff7ed945
+    4b1893ad41ff20d3bf9d63ca65c04901826964827634826970847f0000018973
+    6563703235366b31a10313d14211e0287b2361a1615890a9b5212080546d0a25
+    7ae4cff96cf534992cb9827464018375647082765f
+
+TOPICNODES, empty:
+
+    # topicnodes.req-id = 0x00000003
+    # topicnodes.total = 1
+    # topicnodes.ENRs = []
+
+    0ac7840000000301c0

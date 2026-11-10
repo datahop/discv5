@@ -16,6 +16,7 @@ mod bound;
 mod config;
 mod iptree;
 pub(crate) mod netutil;
+pub mod params;
 mod registration;
 mod search;
 mod searchfilter;
@@ -26,11 +27,17 @@ pub use config::TopicConfig;
 pub use registration::{RegAttempt, RegAttemptState, Registration};
 pub use search::Search;
 pub use searchfilter::SearchFilter;
-pub use table::{TOPIC_TABLE_WAIT_TIME_FLOOR, TopicTable};
+pub use table::TopicTable;
 pub use ticket::{TICKET_SIZE, Ticket, TicketError, TicketSealer};
 
 /// A topic (service) identifier: a 32-byte hash.
 pub type TopicId = [u8; 32];
+
+/// The service identifier of a service name: SHA-256 of its UTF-8 bytes.
+pub fn topic_id(service: &str) -> TopicId {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(service.as_bytes()).into()
+}
 
 /// The answer of a registrar to one REGTOPIC request.
 #[derive(Debug, Clone)]
@@ -96,9 +103,9 @@ pub(crate) fn bucket_index(topic: &TopicId, id: &NodeId, depth: usize) -> usize 
 }
 
 /// ENR key signalling the topic discovery capability.
-pub const TOPIC_DISCOVERY_ENR_KEY: &str = "ng";
+pub const TOPIC_DISCOVERY_ENR_KEY: &str = "td";
 
-/// Protocol version advertised in the `ng` entry and required from peers.
+/// Protocol version advertised in the `td` entry and required from peers.
 pub const TOPIC_DISCOVERY_VERSION: u64 = 1;
 
 /// Reports whether the record advertises a supported version of the topic discovery
@@ -187,16 +194,11 @@ pub(crate) mod test_util {
         nodes_at_distance_from(base, dist, n, 1)
     }
 
-    /// The table sizes the Go tests were written for.
+    /// The defaults with a small ad cache, as the Go tests use.
     pub(crate) fn test_config() -> TopicConfig {
         TopicConfig {
+            enabled: true,
             ad_cache_size: 20,
-            reg_table_depth: 18,
-            search_table_depth: 18,
-            reg_bucket_size: 10,
-            reg_bucket_standby_limit: 20,
-            search_bucket_size: 8,
-            search_yield_floor: 0,
             ..Default::default()
         }
     }
@@ -233,5 +235,13 @@ mod tests {
 
         enr.insert(TOPIC_DISCOVERY_ENR_KEY, &2u64, &key).unwrap();
         assert!(!supports_topic_discovery(&enr));
+    }
+
+    #[test]
+    fn topic_id_sha256() {
+        assert_eq!(
+            hex::encode(topic_id("example-service")),
+            "acac0a3cfc659b9392c42a643065965e71cae5229afeade460788cca53315f89"
+        );
     }
 }

@@ -108,11 +108,9 @@ async fn build_service_with(
         event_stream: None,
         exit,
         #[cfg(feature = "topic-discovery")]
-        topic_table: Arc::new(RwLock::new(crate::topic::TopicTable::new(
-            config.topic.clone(),
-        ))),
+        topic_table: None,
         #[cfg(feature = "topic-discovery")]
-        ticket_sealer: crate::topic::TicketSealer::new(std::time::Instant::now()),
+        ticket_sealer: None,
         #[cfg(feature = "topic-discovery")]
         topics: Default::default(),
         config,
@@ -201,11 +199,9 @@ pub(super) fn build_non_handler_service(
         event_stream: None,
         exit,
         #[cfg(feature = "topic-discovery")]
-        topic_table: Arc::new(RwLock::new(crate::topic::TopicTable::new(
-            config.topic.clone(),
-        ))),
+        topic_table: None,
         #[cfg(feature = "topic-discovery")]
-        ticket_sealer: crate::topic::TicketSealer::new(std::time::Instant::now()),
+        ticket_sealer: None,
         #[cfg(feature = "topic-discovery")]
         topics: Default::default(),
         config,
@@ -668,6 +664,20 @@ async fn test_connectivity_metrics_updated_on_incoming_connections_ipv6() {
     METRICS.ipv6_contactable.store(false, Ordering::Relaxed);
 }
 
+/// Sets the topic configuration of a service built without one, with the registrar
+/// state and the routing-table change log it implies.
+#[cfg(feature = "topic-discovery")]
+pub(crate) fn set_topic_config(service: &mut Service, config: crate::topic::TopicConfig) {
+    service.kbuckets.write().track_changes(config.enabled);
+    service.topic_table = config
+        .enabled
+        .then(|| Arc::new(RwLock::new(crate::topic::TopicTable::new(config.clone()))));
+    service.ticket_sealer = config
+        .enabled
+        .then(|| crate::topic::TicketSealer::new(std::time::Instant::now()));
+    service.config.topic = config;
+}
+
 #[cfg(feature = "topic-discovery")]
 mod topic {
     use super::*;
@@ -691,12 +701,17 @@ mod topic {
 
     async fn service_with_table(port: u16, table: &[Enr]) -> Service {
         let (enr, enr_key) = capable_enr(port);
-        let service = build_service(
+        let mut service = build_service(
             Arc::new(RwLock::new(enr)),
             Arc::new(RwLock::new(enr_key)),
             false,
         )
         .await;
+        let config = crate::topic::TopicConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        set_topic_config(&mut service, config);
         for enr in table {
             let key = kbucket::Key::from(enr.node_id());
             let _ = service.kbuckets.write().insert_or_update(
@@ -732,7 +747,7 @@ mod topic {
             }
             table.push(enr);
         }
-        let service = service_with_table(10030, &table).await;
+        let service = service_with_table(12330, &table).await;
         let held: Vec<Enr> = service
             .kbuckets
             .read()
@@ -746,7 +761,7 @@ mod topic {
         let requested: Vec<u64> = (1..=256).rev().collect();
         let aux = service.collect_topic_aux_nodes(&topic, &requested, Ipv4Addr::LOCALHOST.into());
         assert!(!aux.is_empty());
-        assert!(aux.len() <= service.config.topic.aux_nodes_limit);
+        assert!(aux.len() <= crate::topic::params::AUX_ENR_LIMIT);
         let mut distances: Vec<u64> = aux
             .iter()
             .map(|enr| {
@@ -797,9 +812,9 @@ mod topic {
     async fn regtopic_admits_and_topicquery_serves() {
         init();
         let topic = [9u8; 32];
-        let mut service = service_with_table(10031, &[]).await;
+        let mut service = service_with_table(12331, &[]).await;
 
-        let (adv, _) = capable_enr(10032);
+        let (adv, _) = capable_enr(12332);
         let contact: NodeContact = adv.clone().into();
         let node_address = contact.node_address();
         let regtopic = |enr: Enr| Request {
@@ -813,32 +828,39 @@ mod topic {
         };
 
         // A record that does not belong to the sender is dropped.
-        let (other, _) = capable_enr(10033);
+        let (other, _) = capable_enr(12333);
         service.handle_rpc_request(node_address.clone(), regtopic(other.clone()));
         assert!(
             !service
                 .topic_table
+                .as_ref()
+                .unwrap()
                 .read()
                 .is_registered(&other.node_id(), &topic)
         );
-        assert_eq!(service.topic_table.read().occupancy().0, 0);
+        assert_eq!(
+            service.topic_table.as_ref().unwrap().read().occupancy().0,
+            0
+        );
 
         // A record whose address differs from the packet source is dropped.
         let key = CombinedKey::generate_secp256k1();
         let elsewhere = Enr::builder()
             .ip4(Ipv4Addr::new(1, 2, 3, 4))
-            .udp4(10034)
+            .udp4(12334)
             .build(&key)
             .unwrap();
         let bad_contact = NodeContact::new(
             elsewhere.public_key(),
-            (Ipv4Addr::new(1, 2, 3, 5), 10034).into(),
+            (Ipv4Addr::new(1, 2, 3, 5), 12334).into(),
             Some(elsewhere.clone()),
         );
         service.handle_rpc_request(bad_contact.node_address(), regtopic(elsewhere.clone()));
         assert!(
             !service
                 .topic_table
+                .as_ref()
+                .unwrap()
                 .read()
                 .is_registered(&elsewhere.node_id(), &topic)
         );
@@ -848,10 +870,15 @@ mod topic {
         assert!(
             service
                 .topic_table
+                .as_ref()
+                .unwrap()
                 .read()
                 .is_registered(&adv.node_id(), &topic)
         );
-        assert_eq!(service.topic_table.read().occupancy().0, 1);
+        assert_eq!(
+            service.topic_table.as_ref().unwrap().read().occupancy().0,
+            1
+        );
 
         // A garbage ticket gets no reply and changes nothing.
         service.handle_rpc_request(
@@ -866,7 +893,10 @@ mod topic {
                 },
             },
         );
-        assert_eq!(service.topic_table.read().occupancy().0, 1);
+        assert_eq!(
+            service.topic_table.as_ref().unwrap().read().occupancy().0,
+            1
+        );
 
         service.handle_rpc_request(
             node_address.clone(),
@@ -880,6 +910,8 @@ mod topic {
         );
         let found = service
             .topic_table
+            .as_ref()
+            .unwrap()
             .read()
             .random_nodes(&topic, 16, |_| true);
         assert_eq!(found.len(), 1);

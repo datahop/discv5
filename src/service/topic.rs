@@ -15,6 +15,10 @@ use crate::{
         netutil::{
             check_regtopic_record_ip, check_relay_addr, preferred_ip, preferred_udp_port, unmap,
         },
+        params::{
+            AUX_ENR_LIMIT, ENRS_PER_PACKET, F_RETURN, QUERY_RESP_LIMIT, REG_RESP_LIMIT,
+            SEARCH_PASS_BACKOFF, SEARCH_PASS_GAP,
+        },
         supports_topic_discovery,
     },
 };
@@ -28,9 +32,6 @@ use std::{
 };
 use tokio::sync::oneshot;
 use tracing::{debug, trace, warn};
-
-/// Records per NODES / TOPICNODES message, as the Go implementation packs them.
-const NODES_RESPONSE_ITEM_LIMIT: usize = 3;
 
 /// The least time between two seedings of a registration or search table from the
 /// routing table, so the loops do not run hot on an empty table.
@@ -132,18 +133,18 @@ impl TopicSearch {
         Some(seed.map_or(self.deadline, |t| t.min(self.deadline)))
     }
 
-    /// The minimum length of the next pass: `LOOP_MIN_TIME`, doubling after every pass
-    /// that returned nothing new, up to `backoff`.
-    fn pass_gap(&mut self, nresults: usize, backoff: Option<Duration>) -> Duration {
-        let Some(backoff) = backoff.filter(|_| nresults == 0) else {
+    /// The minimum length of the next pass: `SEARCH_PASS_GAP`, doubling after every
+    /// pass that returned nothing new, up to `SEARCH_PASS_BACKOFF`.
+    fn pass_gap(&mut self, nresults: usize) -> Duration {
+        if nresults > 0 {
             self.idle_passes = 0;
-            return LOOP_MIN_TIME;
-        };
+            return SEARCH_PASS_GAP;
+        }
         self.idle_passes += 1;
         if self.idle_passes >= 30 {
-            return backoff;
+            return SEARCH_PASS_BACKOFF;
         }
-        backoff.min(LOOP_MIN_TIME * (1 << self.idle_passes))
+        SEARCH_PASS_BACKOFF.min(SEARCH_PASS_GAP * (1 << self.idle_passes))
     }
 
     /// Feeds the answer of a registrar into the pass.
@@ -181,8 +182,11 @@ impl Service {
         enr: Enr,
         buckets: Vec<u64>,
     ) {
+        let Some(sealer) = &mut self.ticket_sealer else {
+            return;
+        };
         let now = Instant::now();
-        let ticket = match self.ticket_sealer.unpack(&topic, &ticket, now) {
+        let ticket = match sealer.unpack(&topic, &ticket, now) {
             Ok(ticket) => ticket,
             Err(error) => {
                 debug!(%node_address, %error, "Invalid ticket in REGTOPIC");
@@ -211,7 +215,10 @@ impl Service {
         let nodes_responses = pack_node_records(aux);
         let total = 1 + nodes_responses.len() as u64;
 
-        let new_wait = self.topic_table.write().register(&enr, topic, waited, now);
+        let (Some(table), Some(sealer)) = (&self.topic_table, &mut self.ticket_sealer) else {
+            return;
+        };
+        let new_wait = table.write().register(&enr, topic, waited, now);
         let (ticket, wait_time) = if new_wait > Duration::ZERO {
             let first_issued = ticket.map_or(now, |t| t.first_issued);
             let mut ticket = Ticket {
@@ -221,15 +228,9 @@ impl Service {
                 last_used: now,
                 first_issued,
             };
-            (
-                self.ticket_sealer.pack(&mut ticket, now),
-                wait_time_ms(new_wait),
-            )
+            (sealer.pack(&mut ticket, now), wait_time_ms(new_wait))
         } else {
-            (
-                Vec::new(),
-                wait_time_ms(self.topic_table.read().ad_lifetime()),
-            )
+            (Vec::new(), wait_time_ms(table.read().ad_lifetime()))
         };
         trace!(
             %node_address,
@@ -271,15 +272,16 @@ impl Service {
         topic: TopicId,
         buckets: Vec<u64>,
     ) {
+        let Some(table) = &self.topic_table else {
+            return;
+        };
         let src_ip = node_address.socket_addr.ip();
         let aux_responses =
             pack_node_records(self.collect_topic_aux_nodes(&topic, &buckets, src_ip));
 
-        let topic_nodes = self.topic_table.read().random_nodes(
-            &topic,
-            self.config.topic.topic_nodes_limit,
-            |enr| preferred_ip(enr).is_some_and(|ip| check_relay_addr(src_ip, ip).is_ok()),
-        );
+        let topic_nodes = table.read().random_nodes(&topic, F_RETURN, |enr| {
+            preferred_ip(enr).is_some_and(|ip| check_relay_addr(src_ip, ip).is_ok())
+        });
         let topic_responses = pack_node_records(topic_nodes);
 
         let total = (aux_responses.len() + topic_responses.len()) as u64;
@@ -338,7 +340,7 @@ impl Service {
         };
 
         // One node per distance, so the response is bounded by the number of distances.
-        let limit = self.config.topic.aux_nodes_limit.min(requested.len());
+        let limit = AUX_ENR_LIMIT.min(requested.len());
         let requested = &requested[..limit];
         let wanted: HashSet<u64> = requested
             .iter()
@@ -455,9 +457,9 @@ impl Service {
         let is_regtopic = matches!(active_request.request_body, RequestBody::RegTopic { .. });
         // The cap on the messages and on the records of each kind.
         let limit = if is_regtopic {
-            self.config.topic.aux_nodes_limit
+            REG_RESP_LIMIT
         } else {
-            self.config.topic.topic_nodes_limit
+            QUERY_RESP_LIMIT
         };
         let sender = node_address.socket_addr.ip();
         let mut response = self.topics.responses.remove(&id).unwrap_or_default();
@@ -609,7 +611,9 @@ impl Service {
             match change {
                 TableChange::Removed(key) => {
                     let id = key.preimage();
-                    self.topic_table.write().remove_node(id);
+                    if let Some(table) = &self.topic_table {
+                        table.write().remove_node(id);
+                    }
                     for reg in self.topics.registrations.values_mut() {
                         reg.table.remove_node(id, now);
                         // The attempt chosen for the next request is gone with it.
@@ -645,7 +649,7 @@ impl Service {
 
     /// When the topic system has to run next.
     pub(super) fn topic_next_wakeup(&self) -> Option<Instant> {
-        let expiry = self.topic_table.read().next_expiry();
+        let expiry = self.topic_table.as_ref()?.read().next_expiry();
         let registrations = self.topics.registrations.values().map(TopicReg::wakeup);
         let searches = self.topics.searches.values().map(TopicSearch::wakeup);
         registrations
@@ -658,7 +662,9 @@ impl Service {
     /// Runs what is due: ad expiry, registration attempts, search passes.
     pub(super) fn topic_tick(&mut self) {
         let now = Instant::now();
-        self.topic_table.write().expire(now);
+        if let Some(table) = &self.topic_table {
+            table.write().expire(now);
+        }
         let topics: Vec<TopicId> = self.topics.registrations.keys().copied().collect();
         for topic in topics {
             self.registration_step(topic, now);
@@ -901,8 +907,7 @@ impl Service {
                 );
                 search.active_bucket = pass.active_bucket();
                 search.asked_filter = search.pass.take().map(Search::into_asked_filter);
-                search.gap =
-                    search.pass_gap(search.pass_results, self.config.topic.search_pass_backoff);
+                search.gap = search.pass_gap(search.pass_results);
                 continue;
             }
 
@@ -981,15 +986,15 @@ fn wait_time_ms(d: Duration) -> u64 {
 }
 
 fn pack_node_records(nodes: Vec<Enr>) -> Vec<Vec<Enr>> {
-    nodes
-        .chunks(NODES_RESPONSE_ITEM_LIMIT)
-        .map(<[Enr]>::to_vec)
-        .collect()
+    nodes.chunks(ENRS_PER_PACKET).map(<[Enr]>::to_vec).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{super::test::build_non_handler_service, *};
+    use super::{
+        super::test::{build_non_handler_service, set_topic_config},
+        *,
+    };
     use crate::{
         kbucket::{ConnectionDirection, ConnectionState, NodeStatus},
         rpc::Request,
@@ -1016,6 +1021,16 @@ mod tests {
         record(Ipv4Addr::LOCALHOST, port, true)
     }
 
+    /// A registrar in the farthest bucket from `TOPIC`.
+    fn far_registrar(port: u16) -> Enr {
+        loop {
+            let enr = registrar(port);
+            if crate::topic::log_dist(&TOPIC, &enr.node_id()) == 256 {
+                return enr;
+            }
+        }
+    }
+
     fn add_to_table(service: &Service, enr: &Enr) {
         let result = service.kbuckets.write().insert_or_update(
             &enr.node_id().into(),
@@ -1028,15 +1043,8 @@ mod tests {
         assert!(matches!(result, kbucket::InsertResult::Inserted));
     }
 
-    /// The configuration of the default search.
-    fn default_search() -> TopicConfig {
-        TopicConfig {
-            search_yield_floor: 0,
-            ..Default::default()
-        }
-    }
-
-    /// A service without a handler, with the given nodes in the routing table.
+    /// A service without a handler, with topic discovery enabled and the given nodes in
+    /// the routing table.
     fn service(config: TopicConfig, table: &[Enr]) -> (Service, UnboundedReceiver<HandlerIn>) {
         let key = CombinedKey::generate_secp256k1();
         let enr = record(Ipv4Addr::LOCALHOST, 12100, true);
@@ -1046,7 +1054,11 @@ mod tests {
             false,
         );
         service.ip_mode = crate::IpMode::Ip4;
-        service.config.topic = config;
+        let config = TopicConfig {
+            enabled: true,
+            ..config
+        };
+        set_topic_config(&mut service, config);
         for enr in table {
             add_to_table(&service, enr);
         }
@@ -1322,7 +1334,7 @@ mod tests {
         assert!(ticket.is_empty());
         assert_eq!(enr, service.local_enr.read().clone());
         // The labels of the registration buckets, as the Go table lists them.
-        assert_eq!(buckets, (247..=256).rev().collect::<Vec<u64>>());
+        assert_eq!(buckets, (239..=256).rev().collect::<Vec<u64>>());
         // One request at a time.
         assert!(next_request(&mut handler).is_none());
         assert!(service.topic_next_wakeup().is_none());
@@ -1453,8 +1465,22 @@ mod tests {
         let (mut service, mut handler) = service(TopicConfig::default(), &nodes);
         let now = Instant::now();
         for enr in &nodes {
-            assert!(service.topic_table.write().add(enr, TOPIC, now));
-            assert!(service.topic_table.write().add(enr, [4u8; 32], now));
+            assert!(
+                service
+                    .topic_table
+                    .as_ref()
+                    .unwrap()
+                    .write()
+                    .add(enr, TOPIC, now)
+            );
+            assert!(
+                service
+                    .topic_table
+                    .as_ref()
+                    .unwrap()
+                    .write()
+                    .add(enr, [4u8; 32], now)
+            );
         }
         service.register_topic(TOPIC);
         let (in_flight, _) = next_request(&mut handler).unwrap();
@@ -1468,8 +1494,19 @@ mod tests {
         }
         service.topic_table_changes();
 
-        assert_eq!(service.topic_table.read().occupancy().0, 0);
-        assert!(service.topic_table.read().nodes(&TOPIC, now).is_empty());
+        assert_eq!(
+            service.topic_table.as_ref().unwrap().read().occupancy().0,
+            0
+        );
+        assert!(
+            service
+                .topic_table
+                .as_ref()
+                .unwrap()
+                .read()
+                .nodes(&TOPIC, now)
+                .is_empty()
+        );
         let reg = &service.topics.registrations[&TOPIC];
         assert!(reg.table.attempt(&parked.node_id()).is_none());
         assert!(reg.table.attempt(&in_flight.node_id()).is_some());
@@ -1497,14 +1534,15 @@ mod tests {
         asked
     }
 
-    // The default search asks every registrar once per pass, returns each advertiser
-    // once, and ends when it has the wanted number.
+    // A pass asks every registrar of the farthest bucket once, the next pass asks one of
+    // them again, each advertiser is returned once, and the search ends when it has the
+    // wanted number.
     #[tokio::test]
     async fn search_passes() {
-        let registrars: Vec<Enr> = (0..6).map(|i| registrar(12101 + i)).collect();
+        let registrars: Vec<Enr> = (0..6).map(|i| far_registrar(12101 + i)).collect();
         let advertisers: Vec<Enr> = (0..3).map(|i| registrar(12201 + i)).collect();
         let not_capable = record(Ipv4Addr::LOCALHOST, 12210, false);
-        let (mut service, mut handler) = service(default_search(), &registrars);
+        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
         let (events_tx, mut events) = mpsc::channel(10);
         service.event_stream = Some(events_tx);
 
@@ -1540,7 +1578,8 @@ mod tests {
         service.search_step(id, wakeup - Duration::from_millis(1));
         assert!(next_request(&mut handler).is_none());
 
-        // The second pass brings one new advertiser with the known ones.
+        // The second pass asks a spare registrar, which brings one new advertiser with
+        // the known ones.
         service.search_step(id, wakeup);
         let (contact, request) = next_request(&mut handler).unwrap();
         let ads = vec![advertisers[1].clone(), advertisers[2].clone()];
@@ -1562,7 +1601,7 @@ mod tests {
     async fn search_aux_nodes_and_failures() {
         let registrars: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
         let aux = registrar(12110);
-        let (mut service, mut handler) = service(default_search(), &registrars);
+        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
         let (tx, mut rx) = oneshot::channel();
         service.start_topic_search(TOPIC, 1, tx);
 
@@ -1572,7 +1611,7 @@ mod tests {
         assert!(matches!(
             request.body,
             RequestBody::TopicQuery { ref buckets, .. }
-                if buckets == &(247..=256).rev().collect::<Vec<u64>>()
+                if buckets == &[256, 255]
         ));
         respond(
             &mut service,
@@ -1602,33 +1641,31 @@ mod tests {
         assert!(service.active_requests.is_empty());
     }
 
-    // The adaptive search keeps the active bucket and the asked nodes from pass to
-    // pass: a node is not asked again, except one spare node per pass.
+    // The search keeps the active bucket and the asked nodes from pass to pass: a node
+    // is not asked again, except one spare node per pass.
     #[tokio::test]
     async fn adaptive_search_passes() {
         let registrars: Vec<Enr> = (0..8).map(|i| registrar(12101 + i)).collect();
         let advertiser = registrar(12201);
-        let config = TopicConfig {
-            search_yield_floor: 4,
-            search_pass_backoff: None,
-            ..Default::default()
-        };
-        let (mut service, mut handler) = service(config, &registrars);
+        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
         let (tx, mut rx) = oneshot::channel();
         service.start_topic_search(TOPIC, 1, tx);
         let id = *service.topics.searches.keys().next().unwrap();
+        // The empty passes back off; the search must outlive them.
+        service.topics.searches.get_mut(&id).unwrap().deadline =
+            Instant::now() + Duration::from_secs(3600);
 
-        // The buckets around the active one come first in the request.
+        // Only the buckets around the active one are requested.
         let (contact, request) = next_request(&mut handler).unwrap();
         assert!(matches!(
             request.body,
-            RequestBody::TopicQuery { ref buckets, .. } if buckets[..2] == [256, 255]
+            RequestBody::TopicQuery { ref buckets, .. }
+                if !buckets.is_empty() && buckets.iter().all(|d| *d >= 255)
         ));
         respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
         let mut asked = vec![contact.node_id()];
 
         // Empty answers move the search closer until the pass ends.
-        let mut now = Instant::now();
         while asked.len() < registrars.len() {
             let more = answer_queries(&mut service, &mut handler, |_| vec![topic_nodes(vec![])]);
             for id in &more {
@@ -1645,15 +1682,15 @@ mod tests {
                     .is_some_and(|f| f.len() == asked.len())
             );
             if asked.len() < registrars.len() {
-                now += LOOP_MIN_TIME;
-                service.search_step(id, now);
+                let next_pass = service.topic_next_wakeup().unwrap();
+                service.search_step(id, next_pass);
             }
         }
         let active_bucket = service.topics.searches[&id].active_bucket;
 
         // All nodes are asked: the next pass asks one of them again, and no second.
-        now += LOOP_MIN_TIME;
-        service.search_step(id, now);
+        let next_pass = service.topic_next_wakeup().unwrap();
+        service.search_step(id, next_pass);
         let search = &service.topics.searches[&id];
         assert_eq!(
             search.pass.as_ref().map(Search::active_bucket),
@@ -1676,7 +1713,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_search_ends() {
         let registrars: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
-        let (mut service, mut handler) = service(default_search(), &registrars);
+        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
         let (tx, rx) = oneshot::channel();
         service.start_topic_search(TOPIC, 1, tx);
         let (contact, request) = next_request(&mut handler).unwrap();
@@ -1691,23 +1728,18 @@ mod tests {
     #[test]
     fn search_pass_gap() {
         let registrars: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
-        let (mut service, mut handler) = service(default_search(), &registrars);
+        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
         let (tx, _rx) = oneshot::channel();
         service.start_topic_search(TOPIC, 1, tx);
         let id = *service.topics.searches.keys().next().unwrap();
         let _ = next_request(&mut handler);
         let search = service.topics.searches.get_mut(&id).unwrap();
 
-        let backoff = Some(Duration::from_secs(9));
-        for want in [4, 8, 9, 9] {
-            assert_eq!(search.pass_gap(0, backoff), Duration::from_secs(want));
+        for want in [4, 8, 16, 32, 60, 60] {
+            assert_eq!(search.pass_gap(0), Duration::from_secs(want));
         }
-        assert_eq!(search.pass_gap(3, backoff), LOOP_MIN_TIME);
-        assert_eq!(search.pass_gap(0, backoff), Duration::from_secs(4));
-        search.idle_passes = 0;
-        for _ in 0..3 {
-            assert_eq!(search.pass_gap(0, None), LOOP_MIN_TIME);
-        }
+        assert_eq!(search.pass_gap(3), SEARCH_PASS_GAP);
+        assert_eq!(search.pass_gap(0), Duration::from_secs(4));
     }
 
     // An empty pass delays the next one by the back-off gap; a pass with results does
@@ -1716,11 +1748,7 @@ mod tests {
     async fn search_pass_backoff() {
         let registrars: Vec<Enr> = (0..1).map(|i| registrar(12101 + i)).collect();
         let advertiser = registrar(12201);
-        let config = TopicConfig {
-            search_pass_backoff: Some(Duration::from_secs(30)),
-            ..default_search()
-        };
-        let (mut service, mut handler) = service(config, &registrars);
+        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
         let (tx, _rx) = oneshot::channel();
         let start = Instant::now();
         service.start_topic_search(TOPIC, 2, tx);
