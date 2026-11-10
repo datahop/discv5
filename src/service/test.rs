@@ -834,14 +834,11 @@ mod topic {
         // A record that does not belong to the sender is rejected.
         let (other, _) = capable_enr(12333);
         service.handle_rpc_request(node_address.clone(), regtopic(other.clone()));
-        assert!(
-            !service
-                .topic_table
-                .as_ref()
-                .unwrap()
-                .read()
-                .is_registered(&other.node_id(), &topic)
-        );
+        assert!(!service.topic_table.as_ref().unwrap().read().is_registered(
+            &other.node_id(),
+            &topic,
+            Instant::now()
+        ));
         assert_eq!(
             service.topic_table.as_ref().unwrap().read().occupancy().0,
             0
@@ -860,25 +857,19 @@ mod topic {
             Some(elsewhere.clone()),
         );
         service.handle_rpc_request(bad_contact.node_address(), regtopic(elsewhere.clone()));
-        assert!(
-            !service
-                .topic_table
-                .as_ref()
-                .unwrap()
-                .read()
-                .is_registered(&elsewhere.node_id(), &topic)
-        );
+        assert!(!service.topic_table.as_ref().unwrap().read().is_registered(
+            &elsewhere.node_id(),
+            &topic,
+            Instant::now()
+        ));
 
         // An empty cache admits at once.
         service.handle_rpc_request(node_address.clone(), regtopic(adv.clone()));
-        assert!(
-            service
-                .topic_table
-                .as_ref()
-                .unwrap()
-                .read()
-                .is_registered(&adv.node_id(), &topic)
-        );
+        assert!(service.topic_table.as_ref().unwrap().read().is_registered(
+            &adv.node_id(),
+            &topic,
+            Instant::now()
+        ));
         assert_eq!(
             service.topic_table.as_ref().unwrap().read().occupancy().0,
             1
@@ -912,12 +903,12 @@ mod topic {
                 },
             },
         );
-        let found = service
-            .topic_table
-            .as_ref()
-            .unwrap()
-            .read()
-            .random_nodes(&topic, 16, |_| true);
+        let found = service.topic_table.as_ref().unwrap().read().random_nodes(
+            &topic,
+            16,
+            Instant::now(),
+            |_| true,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].node_id(), adv.node_id());
     }

@@ -28,14 +28,15 @@ impl IpTree {
         }
     }
 
-    /// Adds an address and returns its similarity score.
-    pub(super) fn insert(&mut self, ip: &[u8]) -> f64 {
+    /// Adds an address. Returns its similarity score and the number of levels below
+    /// the root that were incremented, which `remove` must be given.
+    pub(super) fn insert(&mut self, ip: &[u8]) -> (f64, u8) {
         debug_assert_eq!(ip.len() * 8, self.bits as usize);
         let root_counter = self.root.counter as f64;
         self.root.counter += 1;
         let mut node = &mut self.root;
         let mut sum = 0usize;
-        let mut effective_depth = 0u32;
+        let mut effective_depth = 0u8;
         for depth in 0..self.bits {
             // Beyond this depth the tree has no statistical power to flag a prefix as
             // overloaded.
@@ -56,7 +57,7 @@ impl IpTree {
             n.counter += 1;
             node = n;
         }
-        self.compute_score(sum, effective_depth)
+        (self.compute_score(sum, effective_depth), effective_depth)
     }
 
     /// Returns the score that inserting `ip` would produce, and the depth of the
@@ -68,7 +69,7 @@ impl IpTree {
         let mut node = &self.root;
         let mut lpm_depth = 0usize;
         let mut sum = 0usize;
-        let mut effective_depth = 0u32;
+        let mut effective_depth = 0u8;
         let mut hit_missing = false;
         for depth in 0..self.bits {
             let balanced = root_counter / 2f64.powi(depth as i32 + 1);
@@ -141,13 +142,15 @@ impl IpTree {
         node.bound.bump(value, now);
     }
 
-    /// Removes an address. The branch is freed, together with the bounds stored on it,
-    /// once no address is left under it.
-    pub(super) fn remove(&mut self, ip: &[u8]) {
+    /// Removes an address inserted with `levels` levels: the effective depth changes
+    /// with the tree size, so only the levels that insert incremented are decremented.
+    /// A branch is freed, together with the bounds stored on it, once its counter
+    /// reaches zero.
+    pub(super) fn remove(&mut self, ip: &[u8], levels: u8) {
         debug_assert_eq!(ip.len() * 8, self.bits as usize);
         self.root.counter = self.root.counter.saturating_sub(1);
         let mut node = &mut self.root;
-        for depth in 0..self.bits {
+        for depth in 0..levels.min(self.bits) {
             let child = if ip_bit(ip, depth) {
                 &mut node.left
             } else {
@@ -195,7 +198,7 @@ impl IpTree {
         node.bound.remaining(now)
     }
 
-    fn compute_score(&self, sum: usize, effective_depth: u32) -> f64 {
+    fn compute_score(&self, sum: usize, effective_depth: u8) -> f64 {
         if self.root.counter == 0 || effective_depth == 0 {
             return 0.0;
         }
@@ -210,7 +213,11 @@ fn ip_bit(ip: &[u8], i: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use rand_core::{Rng, SeedableRng};
+    use std::{
+        collections::HashMap,
+        net::{Ipv4Addr, Ipv6Addr},
+    };
 
     // Expected scores taken from the Go implementation's test table.
     const IPV4_OPS: &[(&str, f64)] = &[
@@ -247,7 +254,7 @@ mod tests {
     fn insert_ipv4() {
         let mut tree = IpTree::new(32);
         for (i, (ip, want)) in IPV4_OPS.iter().enumerate() {
-            let score = tree.insert(&v4(ip));
+            let (score, _) = tree.insert(&v4(ip));
             assert!(almost_eq(score, *want), "{ip}: score {score}, want {want}");
             assert_eq!(tree.count(), i + 1);
         }
@@ -257,7 +264,7 @@ mod tests {
     fn insert_ipv6() {
         let mut tree = IpTree::new(128);
         for (i, (ip, want)) in IPV6_OPS.iter().enumerate() {
-            let score = tree.insert(&v6(ip));
+            let (score, _) = tree.insert(&v6(ip));
             assert!(almost_eq(score, *want), "{ip}: score {score}, want {want}");
             assert_eq!(tree.count(), i + 1);
         }
@@ -271,7 +278,7 @@ mod tests {
                 let ip: [u8; 16] = rand::random();
                 let ip = &ip[..bits as usize / 8];
                 let (before, _) = tree.score_node(ip);
-                let inserted = tree.insert(ip);
+                let (inserted, _) = tree.insert(ip);
                 assert_eq!(before, inserted, "score() != insert() for {ip:?}");
             }
         }
@@ -280,12 +287,13 @@ mod tests {
     #[test]
     fn remove_ipv4() {
         let mut tree = IpTree::new(32);
-        for (ip, _) in IPV4_OPS {
-            tree.insert(&v4(ip));
-        }
+        let levels: Vec<u8> = IPV4_OPS
+            .iter()
+            .map(|(ip, _)| tree.insert(&v4(ip)).1)
+            .collect();
         for i in (0..IPV4_OPS.len()).rev() {
             let (ip, want) = IPV4_OPS[i];
-            tree.remove(&v4(ip));
+            tree.remove(&v4(ip), levels[i]);
             let (score, _) = tree.score_node(&v4(ip));
             assert!(almost_eq(score, want), "{ip}: score {score}, want {want}");
             assert_eq!(tree.count(), i);
@@ -293,13 +301,155 @@ mod tests {
         assert!(tree.is_empty_tree());
     }
 
+    /// Every vertex counter equals the number of entries under its prefix whose insert
+    /// reached its level, and no other vertex exists.
+    fn check_counts(tree: &IpTree, entries: &[(Vec<u8>, u8)]) {
+        let mut want: HashMap<Vec<bool>, usize> = HashMap::new();
+        for (ip, levels) in entries {
+            for k in 1..=*levels {
+                let prefix = (0..k).map(|d| ip_bit(ip, d)).collect();
+                *want.entry(prefix).or_default() += 1;
+            }
+        }
+        let mut have = HashMap::new();
+        fn walk(n: &Node, prefix: &mut Vec<bool>, have: &mut HashMap<Vec<bool>, usize>) {
+            for (bit, child) in [(true, &n.left), (false, &n.right)] {
+                if let Some(c) = child {
+                    prefix.push(bit);
+                    have.insert(prefix.clone(), c.counter);
+                    walk(c, prefix, have);
+                    prefix.pop();
+                }
+            }
+        }
+        walk(&tree.root, &mut Vec::new(), &mut have);
+        assert_eq!(tree.count(), entries.len());
+        assert_eq!(have, want);
+    }
+
+    #[test]
+    fn iptree_remove_to_inserted_depth() {
+        // An address inserted while the tree was shallow leaves the deeper levels,
+        // incremented by later inserts, untouched on removal.
+        let mut tree = IpTree::new(32);
+        let mut entries = Vec::new();
+        let mut add = |tree: &mut IpTree, ip: [u8; 4]| {
+            let levels = tree.insert(&ip).1;
+            entries.push((ip.to_vec(), levels));
+            levels
+        };
+        for i in 1..=4 {
+            add(&mut tree, [200, 0, 0, i]);
+        }
+        let a = add(&mut tree, [10, 0, 0, 1]);
+        for i in 1..=60 {
+            add(&mut tree, [200, 0, 1, i]);
+        }
+        let b = add(&mut tree, [10, 0, 0, 2]);
+        assert!(b > a, "setup: B levels {b} not deeper than A levels {a}");
+        tree.remove(&[10, 0, 0, 1], a);
+        entries.remove(4);
+        check_counts(&tree, &entries);
+
+        // Counters stay exact under random churn and the tree ends empty.
+        for bits in [32u8, 128] {
+            let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(1);
+            let mut tree = IpTree::new(bits);
+            let mut entries: Vec<(Vec<u8>, u8)> = Vec::new();
+            let random_ip = |rng: &mut rand_xorshift::XorShiftRng| {
+                let mut ip = vec![0u8; bits as usize / 8];
+                rng.fill_bytes(&mut ip);
+                // A few clustered prefixes, so insert depths vary within a branch.
+                ip[0] %= 4;
+                if rng.next_u32() % 2 == 0 {
+                    ip[1] = 0;
+                }
+                ip
+            };
+            for _ in 0..3000 {
+                let insert_prob = if entries.len() > 300 { 40 } else { 60 };
+                if entries.is_empty() || rng.next_u32() % 100 < insert_prob {
+                    let ip = random_ip(&mut rng);
+                    let levels = tree.insert(&ip).1;
+                    entries.push((ip, levels));
+                } else {
+                    let j = rng.next_u32() as usize % entries.len();
+                    let (ip, levels) = entries.remove(j);
+                    tree.remove(&ip, levels);
+                }
+                check_counts(&tree, &entries);
+            }
+            while !entries.is_empty() {
+                let j = rng.next_u32() as usize % entries.len();
+                let (ip, levels) = entries.remove(j);
+                tree.remove(&ip, levels);
+                check_counts(&tree, &entries);
+            }
+            assert!(tree.is_empty_tree());
+        }
+    }
+
+    #[test]
+    fn iptree_score_over_d() {
+        // Eight inserts of one address reach levels 0,0,1,1,2,2,2,2: vertex /1 holds 6,
+        // /2 holds 4, /3 does not exist. With N = 8, D = 3 (k = 1, 2, 3).
+        let mut tree = IpTree::new(32);
+        for _ in 0..8 {
+            tree.insert(&[1, 0, 0, 1]);
+        }
+        // /1: 6 > 4, /2: 4 > 2, /3: missing.
+        assert!(almost_eq(tree.score_node(&[1, 0, 0, 1]).0, 2.0 / 3.0));
+        // /1: 6 > 4, /2 (01) missing.
+        assert!(almost_eq(tree.score_node(&[64, 0, 0, 1]).0, 1.0 / 3.0));
+        // /1 (1) missing.
+        assert_eq!(tree.score_node(&[128, 0, 0, 1]).0, 0.0);
+
+        // Against the definition, for clustered random trees.
+        let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(2);
+        let mut tree = IpTree::new(32);
+        for _ in 0..500 {
+            let mut ip = [0u8; 4];
+            rng.fill_bytes(&mut ip);
+            ip[0] %= 2;
+            let n = tree.count();
+            let (score, _) = tree.score_node(&ip);
+            let mut d = 0;
+            let mut points = 0;
+            let mut node = Some(&tree.root);
+            for k in 1..=32u32 {
+                if 2usize.pow(k) > n {
+                    break;
+                }
+                d += 1;
+                node = node.and_then(|v| {
+                    if ip_bit(&ip, k as u8 - 1) {
+                        v.left.as_deref()
+                    } else {
+                        v.right.as_deref()
+                    }
+                });
+                let c_k = node.map_or(0, |v| v.counter);
+                if c_k as f64 > n as f64 / 2f64.powi(k as i32) {
+                    points += 1;
+                }
+            }
+            let want = if d == 0 {
+                0.0
+            } else {
+                points as f64 / d as f64
+            };
+            assert!(almost_eq(score, want), "score {score}, want {want}");
+            tree.insert(&ip);
+        }
+    }
+
     #[test]
     fn bounds_on_path() {
         let now = Instant::now();
         let mut tree = IpTree::new(32);
-        for i in 1..=60u8 {
-            tree.insert(&[203, 0, 113, i]);
-        }
+        let levels: Vec<u8> = (1..=60u8)
+            .map(|i| tree.insert(&[203, 0, 113, i]).1)
+            .collect();
         let target = [203u8, 0, 113, 200];
         let (score, depth) = tree.score_node(&target);
         assert!(score > 0.0);
@@ -313,8 +463,8 @@ mod tests {
         // An address under a different prefix does not see the floor.
         assert_eq!(tree.path_floor(&[8, 8, 8, 8], now), Duration::ZERO);
         // Freeing the branch drops the bound.
-        for i in 1..=60u8 {
-            tree.remove(&[203, 0, 113, i]);
+        for (i, levels) in (1..=60u8).zip(levels) {
+            tree.remove(&[203, 0, 113, i], levels);
         }
         assert!(tree.is_empty_tree());
         assert_eq!(tree.path_floor(&target, now), Duration::ZERO);

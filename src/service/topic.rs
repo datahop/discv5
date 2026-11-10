@@ -308,13 +308,15 @@ impl Service {
     }
 
     /// Serves TOPICQUERY: auxiliary routing nodes in NODES messages, then registered
-    /// advertisers in TOPICNODES messages. At least one message is always sent.
+    /// advertisers in TOPICNODES messages. At least one message is always sent. Ads
+    /// expired at `now` are removed first.
     pub(super) fn handle_topic_query(
         &mut self,
         node_address: NodeAddress,
         id: RequestId,
         topic: TopicId,
         buckets: Vec<u64>,
+        now: Instant,
     ) {
         let Some(table) = &self.topic_table else {
             return;
@@ -323,9 +325,13 @@ impl Service {
         let aux_responses =
             pack_node_records(self.collect_topic_aux_nodes(&topic, &buckets, src_ip));
 
-        let topic_nodes = table.read().random_nodes(&topic, F_RETURN, |enr| {
-            preferred_ip(enr).is_some_and(|ip| check_relay_addr(src_ip, ip).is_ok())
-        });
+        let topic_nodes = {
+            let mut table = table.write();
+            table.expire(now);
+            table.random_nodes(&topic, F_RETURN, now, |enr| {
+                preferred_ip(enr).is_some_and(|ip| check_relay_addr(src_ip, ip).is_ok())
+            })
+        };
         let topic_responses = pack_node_records(topic_nodes);
 
         let total = (aux_responses.len() + topic_responses.len()) as u64;
@@ -1057,7 +1063,7 @@ fn regtopic_credit(ticket: &Ticket, timing: TicketTiming, now: Instant) -> (Dura
 
 /// Wait time in whole milliseconds, rounded up.
 fn wait_time_ms(d: Duration) -> u64 {
-    (d.as_secs_f64() * 1000.0).ceil() as u64
+    u64::try_from(d.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
 }
 
 fn pack_node_records(nodes: Vec<Enr>) -> Vec<Vec<Enr>> {
@@ -2019,7 +2025,7 @@ mod tests {
 
         /// The wait a new attempt of `adv` is quoted now.
         fn fresh_wait(&self, adv: &Advertiser) -> u64 {
-            wait_time_ms(self.table().read().wait_time(&adv.enr, &TOPIC, self.now))
+            wait_time_ms(self.table().write().wait_time(&adv.enr, &TOPIC, self.now))
         }
     }
 
@@ -2355,6 +2361,45 @@ mod tests {
         }
     }
 
+    // TOPICQUERY removes the ads expired at its time before answering.
+    #[tokio::test]
+    async fn topic_query_expires_ads_first() {
+        let mut reg = Registrar::new();
+        let from = advertiser(Ipv4Addr::new(10, 0, 1, 1)).address;
+        let query = |reg: &mut Registrar| {
+            let now = reg.now;
+            reg.service.handle_topic_query(
+                from.clone(),
+                RequestId(vec![8]),
+                TOPIC,
+                Vec::new(),
+                now,
+            );
+            let mut found = 0;
+            while let Ok(HandlerIn::Response(_, response)) = reg.handler.try_recv() {
+                if let ResponseBody::TopicNodes { nodes, .. } = response.body {
+                    found += nodes.len();
+                }
+            }
+            found
+        };
+        assert_eq!(query(&mut reg), 1);
+        let lifetime = reg.table().read().ad_lifetime();
+        reg.now += lifetime;
+        assert_eq!(query(&mut reg), 0);
+        assert_eq!(reg.table().read().occupancy().0, 0);
+    }
+
+    #[test]
+    fn wait_time_ms_rounds_up() {
+        assert_eq!(wait_time_ms(Duration::ZERO), 0);
+        assert_eq!(wait_time_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(wait_time_ms(Duration::from_millis(1)), 1);
+        assert_eq!(wait_time_ms(Duration::from_nanos(1_000_001)), 2);
+        assert_eq!(wait_time_ms(Duration::from_secs(86_400)), 86_400_000);
+        assert_eq!(wait_time_ms(Duration::MAX), u64::MAX);
+    }
+
     // Ads expired at the time of a REGTOPIC are removed before it is served: the
     // advertiser of an expired ad is not answered from the old entry, and an expired ad
     // frees its slot in a full cache.
@@ -2387,7 +2432,7 @@ mod tests {
         assert!(
             reg.table()
                 .read()
-                .is_registered(&adv.address.node_id, &TOPIC)
+                .is_registered(&adv.address.node_id, &TOPIC, reg.now)
         );
         assert_eq!(reg.table().read().occupancy(), (1, 1));
     }

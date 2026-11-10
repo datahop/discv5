@@ -800,7 +800,7 @@ impl Service {
                     .topic
                     .topicquery_recv
                     .fetch_add(1, Ordering::Relaxed);
-                self.handle_topic_query(node_address, id, topic, buckets);
+                self.handle_topic_query(node_address, id, topic, buckets, Instant::now());
             }
         }
     }
