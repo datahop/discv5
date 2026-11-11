@@ -165,20 +165,6 @@ impl RequestBody {
     }
 }
 
-#[cfg(feature = "topic-discovery")]
-impl Message {
-    /// REGTOPIC, REGCONFIRMATION, TOPICQUERY and TOPICNODES.
-    pub fn is_topic_message(&self) -> bool {
-        match self {
-            Message::Request(request) => request.body.is_topic_request(),
-            Message::Response(response) => matches!(
-                response.body,
-                ResponseBody::RegConfirmation { .. } | ResponseBody::TopicNodes { .. }
-            ),
-        }
-    }
-}
-
 impl Request {
     pub fn msg_type(&self) -> u8 {
         match self.body {

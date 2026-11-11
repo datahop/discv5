@@ -669,16 +669,14 @@ async fn test_connectivity_metrics_updated_on_incoming_connections_ipv6() {
 }
 
 /// Sets the topic configuration of a service built without one, with the registrar
-/// state and the routing-table change log it implies.
+/// state and the routing-table change log `Discv5` sets up.
 #[cfg(feature = "topic-discovery")]
 pub(crate) fn set_topic_config(service: &mut Service, config: crate::topic::TopicConfig) {
-    service.kbuckets.write().track_changes(config.enabled);
-    service.topic_table = config
-        .enabled
-        .then(|| Arc::new(RwLock::new(crate::topic::TopicTable::new(config.clone()))));
-    service.ticket_sealer = config
-        .enabled
-        .then(|| crate::topic::TicketSealer::new(std::time::Instant::now()));
+    service.kbuckets.write().track_changes(true);
+    service.topic_table = Some(Arc::new(RwLock::new(crate::topic::TopicTable::new(
+        config.clone(),
+    ))));
+    service.ticket_sealer = Some(crate::topic::TicketSealer::new(std::time::Instant::now()));
     service.config.topic = config;
 }
 
@@ -711,11 +709,7 @@ mod topic {
             false,
         )
         .await;
-        let config = crate::topic::TopicConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        set_topic_config(&mut service, config);
+        set_topic_config(&mut service, Default::default());
         for enr in table {
             let key = kbucket::Key::from(enr.node_id());
             let _ = service.kbuckets.write().insert_or_update(

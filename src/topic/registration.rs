@@ -2,9 +2,11 @@
 //! an ad on, bucketed by their distance to the topic hash, and the attempt queue.
 
 use super::{
-    TopicConfig, TopicId, TopicNode, bucket_index,
+    TopicConfig, TopicId, TopicNode,
+    askedset::AskedSet,
+    bucket_index,
     netutil::{DistinctNetSet, is_lan, same_net},
-    params::REG_TABLE_DEPTH,
+    params::{ASKED_FAILED_TTL, OVERLOADED_TTL, REG_TABLE_DEPTH, W_MIN},
 };
 use crate::Enr;
 use enr::NodeId;
@@ -107,6 +109,12 @@ pub struct Registration<N: TopicNode = Enr> {
     /// Attempts in state `Waiting` or `Registered`, by `next_time`.
     queue: BTreeMap<(Instant, u64), NodeId>,
     next_seq: u64,
+    /// Registrars whose request failed.
+    failed: AskedSet,
+    /// Registrars that quoted more than the attempt budget.
+    overloaded: AskedSet,
+    /// The bucket of the last started request. `update` scans from the next one.
+    rr_bucket: usize,
 }
 
 impl<N: TopicNode> Registration<N> {
@@ -126,6 +134,9 @@ impl<N: TopicNode> Registration<N> {
             buckets,
             queue: BTreeMap::new(),
             next_seq: 0,
+            failed: AskedSet::new(ASKED_FAILED_TTL),
+            overloaded: AskedSet::new(OVERLOADED_TTL),
+            rr_bucket: REG_TABLE_DEPTH - 1,
         }
     }
 
@@ -172,7 +183,7 @@ impl<N: TopicNode> Registration<N> {
 
         for n in nodes {
             let id = n.node_id();
-            if id == self.local_id {
+            if id == self.local_id || self.failed.has(&id, now) || self.overloaded.has(&id, now) {
                 continue;
             }
             let bi = self.bucket_index(&id);
@@ -180,8 +191,9 @@ impl<N: TopicNode> Registration<N> {
             let b = &mut self.buckets[bi];
 
             if let Some(attempt) = b.att.get_mut(&id) {
-                // Already scheduled: update the record if newer.
-                if attempt.node.seq() >= n.seq() {
+                // Already scheduled: update the record if newer, unless a request to it
+                // is in flight.
+                if attempt.slot == Slot::InFlight || attempt.node.seq() >= n.seq() {
                     continue;
                 }
                 let old_ip = attempt.node.ip();
@@ -259,27 +271,45 @@ impl<N: TopicNode> Registration<N> {
     }
 
     /// Processes the attempt queue: drops the attempts whose ad expired and returns the
-    /// registrar of the next due attempt in state `Waiting`. The attempt stays at the
-    /// head of the queue until `start_request`.
+    /// registrar of the next due attempt in state `Waiting`. Buckets with a due attempt
+    /// take turns, from the one after the bucket of the last started request; within a
+    /// bucket, a ticket holder goes first, then the attempt due first. The attempt stays
+    /// queued until `start_request`.
     pub fn update(&mut self, now: Instant) -> Option<NodeId> {
-        while let Some((&(time, _), &id)) = self.queue.first_key_value() {
-            if time > now {
-                break;
-            }
+        let expired: Vec<NodeId> = self
+            .queue
+            .range(..=(now, u64::MAX))
+            .map(|(_, id)| *id)
+            .filter(|id| {
+                self.attempt(id)
+                    .is_some_and(|a| a.state == RegAttemptState::Registered)
+            })
+            .collect();
+        for id in expired {
             let bi = self.bucket_index(&id);
-            match self.buckets[bi].att.get(&id).map(|a| a.state) {
-                Some(RegAttemptState::Waiting) => return Some(id),
-                Some(RegAttemptState::Registered) => {
-                    self.remove_attempt(bi, &id, "expired");
-                    self.refill_attempts(bi, now);
-                }
-                Some(RegAttemptState::Standby) | None => {
-                    debug_assert!(false, "bad attempt in the registration queue");
-                    self.queue.pop_first();
-                }
+            self.remove_attempt(bi, &id, "expired");
+            self.refill_attempts(bi, now);
+        }
+
+        // Per bucket: the due attempt and whether it holds a ticket. The queue is in due
+        // order, so the first ticket holder or else the first attempt wins.
+        let mut best: [Option<(NodeId, bool)>; REG_TABLE_DEPTH] = [None; REG_TABLE_DEPTH];
+        for id in self.queue.range(..=(now, u64::MAX)).map(|(_, id)| id) {
+            let bi = self.bucket_index(id);
+            let Some(att) = self.buckets[bi].att.get(id) else {
+                continue;
+            };
+            if att.state != RegAttemptState::Waiting {
+                continue;
+            }
+            let ticket = !att.ticket.is_empty();
+            if best[bi].is_none_or(|(_, held)| ticket && !held) {
+                best[bi] = Some((*id, ticket));
             }
         }
-        None
+        (1..=REG_TABLE_DEPTH)
+            .find_map(|i| best[(self.rr_bucket + i) % REG_TABLE_DEPTH])
+            .map(|(id, _)| id)
     }
 
     /// Must be called when a request is sent for the attempt. Returns false, and
@@ -298,36 +328,45 @@ impl<N: TopicNode> Registration<N> {
         self.queue.remove(&(att.next_time, seq));
         att.slot = Slot::InFlight;
         att.req_count += 1;
+        self.rr_bucket = bi;
         true
     }
 
-    /// Must be called when the registrar answers with a ticket and a waiting time.
+    /// Must be called when the registrar answers with a ticket and a waiting time. A
+    /// wait below `W_MIN` is raised to it and counts so toward the budget; returns
+    /// whether that happened. A single or total wait above the budget abandons the
+    /// attempt and keeps the registrar out as overloaded.
     pub fn handle_ticket_response(
         &mut self,
         id: &NodeId,
         ticket: Vec<u8>,
         wait_time: Duration,
         now: Instant,
-    ) {
+    ) -> bool {
         let Some(bi) = self.in_flight(id) else {
-            return;
+            return false;
         };
-        // One quote above the whole budget of the attempt.
-        if wait_time > self.config.reg_attempt_timeout {
-            self.remove_attempt(bi, id, "wtime-above-budget");
-            return;
-        }
-        let timeout = self.config.reg_attempt_timeout;
+        let clamped = wait_time < W_MIN;
+        let wait_time = wait_time.max(W_MIN);
+        let budget = self.config.reg_attempt_timeout;
         let Some(att) = self.buckets[bi].att.get_mut(id) else {
-            return;
+            return clamped;
         };
-        att.total_wait_time += wait_time;
-        if att.total_wait_time > timeout {
-            self.remove_attempt(bi, id, "wtime-too-high");
-            return;
+        let reason = if wait_time > budget {
+            Some("wtime-above-budget")
+        } else {
+            att.total_wait_time += wait_time;
+            (att.total_wait_time > budget).then_some("wtime-too-high")
+        };
+        if let Some(reason) = reason {
+            self.overloaded.add(*id, now);
+            self.remove_attempt(bi, id, reason);
+            self.refill_attempts(bi, now);
+            return clamped;
         }
         att.ticket = ticket;
         self.enqueue(bi, id, now + wait_time);
+        clamped
     }
 
     /// Must be called when the registrar confirms the registration.
@@ -343,11 +382,13 @@ impl<N: TopicNode> Registration<N> {
         self.refill_attempts(bi, now);
     }
 
-    /// Must be called when a request fails.
+    /// Must be called when a request fails: a timeout before the confirmation or a
+    /// rejection. The registrar is kept out as failed.
     pub fn handle_error_response(&mut self, id: &NodeId, now: Instant) {
         let Some(bi) = self.in_flight(id) else {
             return;
         };
+        self.failed.add(*id, now);
         self.remove_attempt(bi, id, "error");
         self.refill_attempts(bi, now);
     }
@@ -427,8 +468,11 @@ impl<N: TopicNode> Registration<N> {
 
 #[cfg(test)]
 mod tests {
-    use super::{super::test_util::*, *};
-    use std::net::Ipv4Addr;
+    use super::{
+        super::{params::MAX_WAIT_TIME, test_util::*},
+        *,
+    };
+    use std::{collections::HashMap, net::Ipv4Addr};
 
     fn registration(config: TopicConfig) -> Registration<TestNode> {
         Registration::new(TOPIC1, NodeId::new(&[0xff; 32]), config)
@@ -444,6 +488,18 @@ mod tests {
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         Ipv4Addr::new(a, b, c, d).into()
+    }
+
+    /// Checks that `next_update_time` is the earliest time of the queued attempts.
+    fn check_next_update(r: &Registration<TestNode>) {
+        let want = r
+            .buckets
+            .iter()
+            .flat_map(|b| b.att.values())
+            .filter(|a| matches!(a.slot, Slot::Queued(_)))
+            .map(|a| a.next_time)
+            .min();
+        assert_eq!(r.next_update_time(), want);
     }
 
     // Basic assignment of nodes into registration buckets.
@@ -792,6 +848,323 @@ mod tests {
             now,
         );
         assert!(r.attempt(&node[0].id).is_none());
+        assert!(r.overloaded.has(&node[0].id, now));
+    }
+
+    // Dropping an attempt for an over-budget quote promotes a standby registrar and
+    // keeps the dropped one out as overloaded, not as failed.
+    #[test]
+    fn over_budget_promotes_standby() {
+        let cases = [
+            ("single-quote", 23 * 60, 0),
+            ("cumulative", 10 * 60, 20 * 60),
+        ];
+        for (name, quote, spent) in cases {
+            let now = Instant::now();
+            let mut config = test_config();
+            config.ad_lifetime = Duration::from_secs(15 * 60);
+            config.reg_attempt_timeout = Duration::from_secs(22 * 60 + 30);
+            config.reg_bucket_size = 1;
+            let mut r = registration(config);
+            let nodes = nodes_at_distance(&TOPIC1, 30, 2);
+            r.add_nodes(None, nodes, now);
+            let att = r.update(now).expect("no request scheduled");
+            let bi = r.bucket_index(&att);
+            assert_eq!(r.buckets[bi].count, [1, 1, 0], "{name}");
+            assert!(r.start_request(&att));
+            r.buckets[bi].att.get_mut(&att).unwrap().total_wait_time = Duration::from_secs(spent);
+            r.handle_ticket_response(&att, b"t".to_vec(), Duration::from_secs(quote), now);
+
+            assert!(r.attempt(&att).is_none(), "{name}: attempt kept");
+            assert_eq!(r.buckets[bi].count, [0, 1, 0], "{name}");
+            assert!(r.next_update_time().is_some(), "{name}: nothing scheduled");
+            let next = r.update(now).expect("standby registrar not scheduled");
+            assert_ne!(next, att, "{name}");
+            assert!(!r.failed.has(&att, now), "{name}: held as failed");
+            assert!(
+                r.overloaded.has(&att, now),
+                "{name}: not held as overloaded"
+            );
+        }
+    }
+
+    // Two registrars that quote over budget and return each other are each asked once
+    // per overloaded TTL.
+    #[test]
+    fn overloaded_ring() {
+        let now = Instant::now();
+        let mut r = registration(test_config());
+        let a = node_at_distance(&TOPIC1, 30, int_ip(1));
+        let b = node_at_distance(&TOPIC1, 40, int_ip(2));
+        let other = HashMap::from([(a.id, b.clone()), (b.id, a.clone())]);
+        let mut asked: HashMap<NodeId, usize> = HashMap::new();
+
+        r.add_nodes(None, [a.clone()], now);
+        for _ in 0..1000 {
+            let Some(id) = r.update(now) else {
+                break;
+            };
+            assert!(r.start_request(&id));
+            *asked.entry(id).or_default() += 1;
+            r.add_nodes(Some(&id), [other[&id].clone()], now);
+            r.handle_ticket_response(&id, b"t".to_vec(), MAX_WAIT_TIME, now);
+        }
+        assert_eq!(asked.get(&a.id), Some(&1));
+        assert_eq!(asked.get(&b.id), Some(&1));
+        assert!(r.next_update_time().is_none_or(|t| t > now));
+        assert!(!r.failed.has(&a.id, now) && !r.failed.has(&b.id, now));
+
+        let now = now + OVERLOADED_TTL;
+        r.add_nodes(None, [a.clone()], now);
+        assert_eq!(r.update(now), Some(a.id), "not re-added after the TTL");
+    }
+
+    // A quote below `W_MIN` is raised to it and charged to the budget, so zero quotes
+    // end the attempt once the budget is spent.
+    #[test]
+    fn ticket_response_below_floor() {
+        let mut now = Instant::now();
+        let mut config = test_config();
+        config.reg_attempt_timeout = 5 * W_MIN;
+        let mut r = registration(config);
+        let node = nodes_at_distance(&TOPIC1, 30, 1);
+        r.add_nodes(None, node.clone(), now);
+        for i in 1..=5u32 {
+            let att = r.update(now).expect("no attempt due");
+            assert!(r.start_request(&att));
+            assert!(
+                r.handle_ticket_response(&att, b"t".to_vec(), W_MIN - Duration::from_nanos(1), now),
+                "round {i}: not clamped"
+            );
+            let attempt = r.attempt(&att).expect("attempt removed");
+            assert_eq!(attempt.next_time, now + W_MIN, "round {i}");
+            assert_eq!(attempt.total_wait_time(), i * W_MIN, "round {i}");
+            assert!(r.update(now).is_none(), "round {i}: due before the floor");
+            now += W_MIN;
+        }
+        let att = r.update(now).unwrap();
+        assert!(r.start_request(&att));
+        r.handle_ticket_response(&att, b"t".to_vec(), Duration::ZERO, now);
+        assert!(r.attempt(&att).is_none(), "kept past the budget");
+        assert!(!r.failed.has(&att, now));
+
+        let at = nodes_at_distance(&TOPIC1, 40, 1);
+        r.add_nodes(None, at.clone(), now);
+        let att = r.update(now).unwrap();
+        assert!(r.start_request(&att));
+        assert!(!r.handle_ticket_response(&att, b"t".to_vec(), W_MIN, now));
+        assert_eq!(r.attempt(&att).unwrap().next_time, now + W_MIN);
+    }
+
+    // A failed registrar is not admitted again until the failed TTL has passed.
+    #[test]
+    fn failed_excluded() {
+        let start = Instant::now();
+        let mut r = registration(test_config());
+        let node = nodes_at_distance(&TOPIC1, 30, 1);
+        r.add_nodes(None, node.clone(), start);
+        let att = r.update(start).expect("no request scheduled");
+        assert!(r.start_request(&att));
+        r.handle_error_response(&att, start);
+        assert_eq!(r.node_count(), 0);
+
+        for now in [start, start + ASKED_FAILED_TTL - Duration::from_secs(1)] {
+            r.add_nodes(None, node.clone(), now);
+            assert_eq!(r.node_count(), 0, "failed node re-admitted");
+            assert!(r.update(now).is_none());
+        }
+
+        let now = start + ASKED_FAILED_TTL;
+        r.add_nodes(None, node.clone(), now);
+        assert_eq!(r.update(now), Some(node[0].id));
+        assert_eq!(r.attempt(&att).unwrap().state, RegAttemptState::Waiting);
+    }
+
+    // Within a bucket a due ticket holder goes before due first contacts, which follow
+    // in due order.
+    #[test]
+    fn update_prefers_tickets() {
+        let start = Instant::now();
+        let mut r = registration(test_config());
+        let holder = nodes_at_distance(&TOPIC1, 250, 1).remove(0);
+        r.add_nodes(None, [holder.clone()], start);
+        assert_eq!(r.update(start), Some(holder.id));
+        assert!(r.start_request(&holder.id));
+        r.handle_ticket_response(
+            &holder.id,
+            b"ticket".to_vec(),
+            Duration::from_secs(1),
+            start,
+        );
+        check_next_update(&r);
+
+        let contacts = nodes_at_distance_from(&TOPIC1, 250, 4, 10);
+        for (i, n) in contacts.iter().enumerate() {
+            r.add_nodes(
+                None,
+                [n.clone()],
+                start + Duration::from_millis(10 * i as u64),
+            );
+        }
+        check_next_update(&r);
+
+        let now = start + Duration::from_secs(1);
+        let want = std::iter::once(holder.id).chain(contacts.iter().map(|n| n.id));
+        for (i, id) in want.enumerate() {
+            assert_eq!(r.update(now), Some(id), "update #{i}");
+            assert!(r.start_request(&id));
+            check_next_update(&r);
+        }
+        assert!(r.update(now).is_none());
+    }
+
+    // Buckets with a due attempt take turns, starting with the farthest.
+    #[test]
+    fn update_round_robin() {
+        let now = Instant::now();
+        let mut r = registration(test_config());
+        for (dist, start) in [(200, 1), (253, 10), (256, 20)] {
+            r.add_nodes(None, nodes_at_distance_from(&TOPIC1, dist, 2, start), now);
+        }
+        let mut order = Vec::new();
+        while let Some(id) = r.update(now) {
+            assert!(r.start_request(&id));
+            order.push(r.bucket_index(&id));
+        }
+        assert_eq!(order, [0, 3, 17, 0, 3, 17]);
+    }
+
+    // A retry in one bucket does not wait behind ten retries in another.
+    #[test]
+    fn update_bucket_fairness() {
+        let start = Instant::now();
+        let mut r = registration(test_config());
+        let hog = nodes_at_distance_from(&TOPIC1, 250, 10, 10);
+        let other = nodes_at_distance_from(&TOPIC1, 249, 1, 30).remove(0);
+        r.add_nodes(None, hog, start);
+        r.add_nodes(None, [other.clone()], start);
+
+        let mut started = Vec::new();
+        while let Some(id) = r.update(start) {
+            assert!(r.start_request(&id));
+            started.push(id);
+            check_next_update(&r);
+        }
+        assert_eq!(started.len(), 11);
+        for id in &started {
+            let mut wait = Duration::from_secs(1);
+            if *id == other.id {
+                wait += Duration::from_millis(1);
+            }
+            r.handle_ticket_response(id, b"ticket".to_vec(), wait, start);
+            check_next_update(&r);
+        }
+
+        let now = start + Duration::from_millis(1001);
+        let mut seen = Vec::new();
+        while let Some(id) = r.update(now) {
+            assert!(r.start_request(&id));
+            check_next_update(&r);
+            assert!(!seen.contains(&id), "attempt returned twice");
+            seen.push(id);
+        }
+        assert_eq!(seen.len(), 11);
+        let pos = seen.iter().position(|id| *id == other.id).unwrap();
+        assert!(
+            pos < 2,
+            "retry in the other bucket returned at position {pos}"
+        );
+    }
+
+    // A bucket whose registrars quote zero waits cannot keep a first contact in another
+    // bucket waiting.
+    #[test]
+    fn update_hostile_bucket() {
+        let start = Instant::now();
+        let mut r = registration(test_config());
+        let hostile = nodes_at_distance_from(&TOPIC1, 250, 11, 10);
+        r.add_nodes(None, hostile.clone(), start);
+        let now = start + Duration::from_millis(1);
+        let first = nodes_at_distance_from(&TOPIC1, 249, 1, 30).remove(0);
+        r.add_nodes(None, [first.clone()], now);
+
+        let mut step = None;
+        for i in 1..=40 {
+            let Some(id) = r.update(now) else {
+                break;
+            };
+            assert!(r.start_request(&id));
+            if id == first.id {
+                step = Some(i);
+                continue;
+            }
+            r.handle_ticket_response(&id, b"t".to_vec(), Duration::ZERO, now);
+        }
+        assert!(
+            step.is_some_and(|s| s <= 2),
+            "first contact returned at step {step:?}"
+        );
+        let hb = &r.buckets[r.bucket_index(&hostile[0].id)];
+        assert_eq!(hb.att.len(), hostile.len());
+        for att in hb.att.values() {
+            if att.state == RegAttemptState::Waiting {
+                assert_eq!(att.next_time, now + W_MIN);
+            }
+        }
+        for n in &hostile {
+            assert!(
+                !r.failed.has(&n.id, now),
+                "hostile registrar held as failed"
+            );
+        }
+    }
+
+    // A newer record of an attempt with a request in flight is not taken, even one that
+    // would move it into a full /24.
+    #[test]
+    fn add_nodes_keeps_in_flight() {
+        let now = Instant::now();
+        let mut r = registration(test_config());
+        let nodes = vec![
+            node_at_distance(&TOPIC1, 200, ip(3, 0, 2, 1)),
+            node_at_distance(&TOPIC1, 200, ip(4, 0, 2, 1)),
+        ];
+        r.add_nodes(None, nodes.clone(), now);
+        let att = r.update(now).expect("no attempt scheduled");
+        assert!(r.start_request(&att));
+
+        let prev = nodes.iter().find(|n| n.id == att).unwrap().clone();
+        let other = nodes.iter().find(|n| n.id != att).unwrap();
+        let update = TestNode {
+            id: prev.id,
+            seq: prev.seq + 1,
+            ip: other.ip,
+        };
+        r.add_nodes(None, [update], now);
+        assert_eq!(r.attempt(&att).map(|a| &a.node), Some(&prev));
+
+        r.handle_error_response(&att, now);
+        assert!(r.attempt(&att).is_none());
+    }
+
+    // An expired registration leaves the bucket and a standby registrar takes its slot.
+    // Nothing is sent to the registrar before the ad expires.
+    #[test]
+    fn expiry_refills() {
+        let now = Instant::now();
+        let mut config = test_config();
+        config.reg_bucket_size = 1;
+        let mut r = registration(config.clone());
+        r.add_nodes(None, nodes_at_distance(&TOPIC1, 30, 2), now);
+        let first = r.update(now).unwrap();
+        assert!(r.start_request(&first));
+        r.handle_registered(&first, config.ad_lifetime, now);
+        assert!(r.update(now).is_none(), "request before the ad expired");
+
+        let now = now + config.ad_lifetime;
+        let second = r.update(now).expect("standby not promoted on expiry");
+        assert_ne!(second, first);
+        assert!(r.attempt(&first).is_none());
     }
 
     // A response for an attempt that is not in flight changes nothing.

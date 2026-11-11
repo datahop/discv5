@@ -246,8 +246,8 @@ pub(crate) struct Service {
     /// contactable or not. This decides if we should update our ENR or set it to None, if we are
     /// not contactable.
     connectivity_state: ConnectivityState,
-    /// The ad cache of the topic discovery registrar. `None` when topic discovery is
-    /// disabled.
+    /// The ad cache of the topic discovery registrar. `Discv5` always passes one; tests
+    /// may build a service without.
     #[cfg(feature = "topic-discovery")]
     topic_table: Option<Arc<RwLock<TopicTable>>>,
     /// Seals the tickets handed out by the registrar, with the ad cache.
@@ -404,9 +404,7 @@ impl Service {
     async fn start(&mut self) {
         loop {
             #[cfg(feature = "topic-discovery")]
-            if self.config.topic.enabled {
-                self.topic_table_changes();
-            }
+            self.topic_table_changes();
             let topic_wakeup = self.topic_wakeup();
             tokio::select! {
                 _ = &mut self.exit => {
@@ -1811,7 +1809,6 @@ impl Service {
         #[cfg(feature = "topic-discovery")]
         {
             self.topic_next_wakeup()
-                .filter(|_| self.config.topic.enabled)
         }
         #[cfg(not(feature = "topic-discovery"))]
         {

@@ -235,9 +235,6 @@ pub struct Handler {
     socket: Socket,
     /// Exit channel to shutdown the handler.
     exit: oneshot::Receiver<()>,
-    /// Whether topic discovery messages are processed.
-    #[cfg(feature = "topic-discovery")]
-    topic_enabled: bool,
 }
 
 type HandlerReturn = (
@@ -334,8 +331,6 @@ impl Handler {
                     listen_sockets,
                     socket,
                     exit,
-                    #[cfg(feature = "topic-discovery")]
-                    topic_enabled: config.topic.enabled,
                 };
                 debug!("Handler Starting");
                 handler.start().await;
@@ -1104,26 +1099,18 @@ impl Handler {
             let message = match session.decrypt_message(message_nonce, message, authenticated_data)
             {
                 Ok(m) => match Message::decode(&m) {
-                    // Disabled, topic messages are dropped as messages of an unknown type.
-                    #[cfg(feature = "topic-discovery")]
-                    Ok(p) if !self.topic_enabled && p.is_topic_message() => {
-                        warn!(%node_address, "Failed to decode message: topic discovery is disabled");
-                        return;
-                    }
                     Ok(p) => p,
                     #[cfg(feature = "topic-discovery")]
-                    Err(e) => match Self::decode_topic_response(
-                        self.topic_enabled,
-                        &self.active_requests,
-                        &node_address,
-                        &m,
-                    ) {
-                        Some(p) => p,
-                        None => {
-                            warn!(error = ?e, %node_address, "Failed to decode message");
-                            return;
+                    Err(e) => {
+                        match Self::decode_topic_response(&self.active_requests, &node_address, &m)
+                        {
+                            Some(p) => p,
+                            None => {
+                                warn!(error = ?e, %node_address, "Failed to decode message");
+                                return;
+                            }
                         }
-                    },
+                    }
                     #[cfg(not(feature = "topic-discovery"))]
                     Err(e) => {
                         warn!(error = ?e, %node_address, "Failed to decode message");
@@ -1248,14 +1235,10 @@ impl Handler {
     /// that fail verification dropped. Other messages keep the strict decoding.
     #[cfg(feature = "topic-discovery")]
     fn decode_topic_response(
-        topic_enabled: bool,
         active_requests: &ActiveRequests,
         node_address: &NodeAddress,
         data: &[u8],
     ) -> Option<Message> {
-        if !topic_enabled {
-            return None;
-        }
         let (message, skipped) = Message::decode_lenient(data).ok()?;
         let Message::Response(response) = &message else {
             return None;
@@ -1279,6 +1262,25 @@ impl Handler {
     /// Handles a response to a request. Re-inserts the request call if the response is a multiple
     /// Nodes response.
     async fn handle_response(&mut self, node_address: NodeAddress, response: Response) {
+        // A topic response with the id of another kind of request leaves that request
+        // pending.
+        #[cfg(feature = "topic-discovery")]
+        if matches!(
+            response.body,
+            ResponseBody::RegConfirmation { .. } | ResponseBody::TopicNodes { .. }
+        ) && self
+            .active_requests
+            .get(&node_address)
+            .is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    !call.is_topic_request() && RequestId::from(call.id()) == response.id
+                })
+            })
+        {
+            warn!(%node_address, response = %response.body, "Topic response to a non-topic request. Ignoring response");
+            return;
+        }
+
         // Find a matching request, if any
         if let Some(mut request_call) = self
             .active_requests

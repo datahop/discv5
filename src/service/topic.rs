@@ -1151,8 +1151,8 @@ mod tests {
         assert!(matches!(result, kbucket::InsertResult::Inserted));
     }
 
-    /// A service without a handler, with topic discovery enabled and the given nodes in
-    /// the routing table.
+    /// A service without a handler, with the topic state and the given nodes in the
+    /// routing table.
     fn service(config: TopicConfig, table: &[Enr]) -> (Service, UnboundedReceiver<HandlerIn>) {
         let key = CombinedKey::generate_secp256k1();
         let enr = record(Ipv4Addr::LOCALHOST, 12100, true);
@@ -1162,10 +1162,6 @@ mod tests {
             false,
         );
         service.ip_mode = crate::IpMode::Ip4;
-        let config = TopicConfig {
-            enabled: true,
-            ..config
-        };
         set_topic_config(&mut service, config);
         for enr in table {
             add_to_table(&service, enr);
@@ -1661,9 +1657,11 @@ mod tests {
         assert_eq!(attempt.state, RegAttemptState::Registered);
         assert!(attempt.next_time <= Instant::now() + config.ad_lifetime);
 
+        // The 100 ms quote is waited as `W_MIN`.
         assert!(next_request(&mut handler).is_none());
         let wakeup = service.topic_next_wakeup().unwrap();
-        assert!(wakeup <= Instant::now() + Duration::from_millis(100));
+        assert!(wakeup > Instant::now() + Duration::from_millis(100));
+        assert!(wakeup <= Instant::now() + crate::topic::params::W_MIN);
         tokio::time::sleep_until(wakeup.into()).await;
         service.topic_tick();
         let (contact, request) = next_request(&mut handler).unwrap();

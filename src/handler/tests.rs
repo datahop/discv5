@@ -81,8 +81,6 @@ async fn build_handler(
         listen_sockets,
         socket,
         exit,
-        #[cfg(feature = "topic-discovery")]
-        topic_enabled: config.topic.enabled,
     };
     (exit_sender, handler_send, handler_recv, handler)
 }
@@ -1090,19 +1088,17 @@ async fn test_send_pending_request() {
     }
 }
 
-// Disabled, topic messages are dropped before they are matched to a request: a
-// TOPICNODES or REGCONFIRMATION carrying the id of a pending FINDNODE leaves it pending,
-// and the NODES that follows completes it.
+// A TOPICNODES or REGCONFIRMATION carrying the id of a pending FINDNODE is dropped and
+// leaves it pending, and the NODES that follows completes it.
 #[cfg(feature = "topic-discovery")]
 #[tokio::test]
-async fn topic_responses_dropped_when_disabled() {
+async fn topic_response_to_findnode_ignored() {
     init();
     let ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
     let node = |port: u16| {
         let key = CombinedKey::generate_secp256k1();
         let enr = Enr::builder().ip4(ip).udp4(port).build(&key).unwrap();
         let config = ConfigBuilder::new(ListenConfig::Ipv4 { ip, port }).build();
-        assert!(!config.topic.enabled);
         (enr, key, config)
     };
     let (requester_enr, requester_key, requester_config) = node(12340);
@@ -1193,7 +1189,7 @@ async fn topic_responses_dropped_when_disabled() {
 #[cfg(feature = "topic-discovery")]
 mod topic {
     use super::*;
-    use crate::topic::{TopicConfig, params::RESP_TIMEOUT};
+    use crate::topic::params::RESP_TIMEOUT;
     use std::time::Instant;
 
     fn topic_node(port: u16, request_timeout: Duration, retries: u8) -> (Enr, CombinedKey, Config) {
@@ -1203,10 +1199,6 @@ mod topic {
         let config = ConfigBuilder::new(ListenConfig::Ipv4 { ip, port })
             .request_timeout(request_timeout)
             .request_retries(retries)
-            .topic_config(TopicConfig {
-                enabled: true,
-                ..Default::default()
-            })
             .build();
         (enr, key, config)
     }
@@ -1415,12 +1407,7 @@ mod topic {
     ) -> oneshot::Sender<()> {
         let ip = Ipv4Addr::LOCALHOST;
         let port = enr.udp4().unwrap();
-        let config = ConfigBuilder::new(ListenConfig::Ipv4 { ip, port })
-            .topic_config(TopicConfig {
-                enabled: true,
-                ..Default::default()
-            })
-            .build();
+        let config = ConfigBuilder::new(ListenConfig::Ipv4 { ip, port }).build();
         let key = CombinedKey::secp256k1_from_bytes(&mut key.encode()).unwrap();
         let (exit, send, mut recv) = Handler::spawn(arc_rw!(enr.clone()), arc_rw!(key), config)
             .await
@@ -1685,7 +1672,7 @@ mod topic {
         let (message, good) = nodes_with_bad_record(&id);
         assert!(Message::decode(&message).is_err());
 
-        let decoded = Handler::decode_topic_response(true, &active, &address, &message);
+        let decoded = Handler::decode_topic_response(&active, &address, &message);
         let Some(Message::Response(response)) = decoded else {
             panic!("not decoded: {decoded:?}");
         };
@@ -1697,7 +1684,6 @@ mod topic {
                 nodes: vec![good],
             }
         );
-        assert!(Handler::decode_topic_response(false, &active, &address, &message).is_none());
     }
 
     // The same packet answering a FINDNODE is dropped whole, as without topic discovery.
@@ -1706,9 +1692,9 @@ mod topic {
         let (active, address) = active_requests(&create_node());
         let (message, _) = nodes_with_bad_record(&RequestId(vec![2]));
         assert!(Message::decode(&message).is_err());
-        assert!(Handler::decode_topic_response(true, &active, &address, &message).is_none());
+        assert!(Handler::decode_topic_response(&active, &address, &message).is_none());
         // An id that matches no request is dropped too.
         let (message, _) = nodes_with_bad_record(&RequestId(vec![3]));
-        assert!(Handler::decode_topic_response(true, &active, &address, &message).is_none());
+        assert!(Handler::decode_topic_response(&active, &address, &message).is_none());
     }
 }

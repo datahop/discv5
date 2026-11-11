@@ -61,9 +61,6 @@ struct Args {
     /// Search the topic for this many advertisers, again and again.
     #[clap(long)]
     search: Option<usize>,
-    /// Run plain discv5: no `td` entry, topic requests are not answered.
-    #[clap(long, conflicts_with_all = ["register", "search"])]
-    no_topic_discovery: bool,
     /// Ad lifetime in seconds.
     #[clap(long, default_value_t = 900)]
     ad_lifetime: u64,
@@ -148,7 +145,6 @@ async fn main() {
         .unwrap();
 
     let mut topic_config = TopicConfig {
-        enabled: !args.no_topic_discovery,
         ad_lifetime: Duration::from_secs(args.ad_lifetime),
         ..Default::default()
     };
@@ -347,7 +343,6 @@ fn status_json(
     for t in report_topics {
         let ads: Vec<[u8; 32]> = discv5
             .local_topic_nodes(*t)
-            .unwrap_or_default()
             .iter()
             .map(|n| n.node_id().raw())
             .collect();

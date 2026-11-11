@@ -4,9 +4,6 @@ use std::time::Duration;
 /// Configuration of the topic discovery subsystem. Defaults are the spec's parameters.
 #[derive(Debug, Clone)]
 pub struct TopicConfig {
-    /// Runs topic discovery: the `td` ENR entry, the registrar and the topic API.
-    /// Default: false.
-    pub enabled: bool,
     /// How long an admitted advertisement stays in the ad cache. Default: `E`.
     pub ad_lifetime: Duration,
     /// Capacity of the ad cache across all topics. Default: `C`.
@@ -25,7 +22,6 @@ pub struct TopicConfig {
 impl Default for TopicConfig {
     fn default() -> Self {
         TopicConfig {
-            enabled: false,
             ad_lifetime: params::E,
             ad_cache_size: params::C,
             reg_bucket_size: params::K_REGISTER,

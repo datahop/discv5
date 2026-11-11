@@ -12,6 +12,7 @@ use crate::Enr;
 use enr::NodeId;
 use std::{net::IpAddr, time::Duration};
 
+mod askedset;
 mod bound;
 mod config;
 mod iptree;
@@ -217,7 +218,6 @@ pub(crate) mod test_util {
     /// The defaults with a small ad cache, as the Go tests use.
     pub(crate) fn test_config() -> TopicConfig {
         TopicConfig {
-            enabled: true,
             ad_cache_size: 20,
             ..Default::default()
         }
