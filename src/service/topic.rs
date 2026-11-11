@@ -38,6 +38,9 @@ use tracing::{debug, trace, warn};
 /// routing table, so the loops do not run hot on an empty table.
 const LOOP_MIN_TIME: Duration = Duration::from_secs(2);
 
+/// The REGTOPIC requests one registration keeps in flight.
+const REG_SENDERS: usize = 4;
+
 /// Records with a port up to this one are not accepted from a response.
 const LOW_PORT: u16 = 1024;
 
@@ -66,13 +69,6 @@ struct TopicResponse {
     advertisers_seen: HashSet<NodeId>,
 }
 
-/// A REGTOPIC to send: the attempt as it was when the registration chose it.
-struct RegJob {
-    node: Enr,
-    ticket: Vec<u8>,
-    buckets: Vec<u64>,
-}
-
 /// The registration loop of one topic.
 struct TopicReg {
     id: u64,
@@ -81,21 +77,19 @@ struct TopicReg {
     seeded_at: Option<Instant>,
     /// The table is seeded and holds nodes.
     running: bool,
-    /// Chosen for the next request. No other attempt is chosen while it waits.
-    next: Option<RegJob>,
-    /// The registrar of the request in flight. One request is sent at a time.
-    in_flight: Option<NodeId>,
+    /// The registrars with a REGTOPIC in flight, at most `REG_SENDERS`.
+    in_flight: HashSet<NodeId>,
 }
 
 impl TopicReg {
     fn wakeup(&self) -> Option<Instant> {
-        if !self.running {
+        if !self.running || self.table.node_count() == 0 {
             return self.seeded_at.map(|t| t + LOOP_MIN_TIME);
         }
-        match self.next {
-            Some(_) => None,
-            None => self.table.next_update_time(),
+        if self.in_flight.len() >= REG_SENDERS {
+            return None;
         }
+        self.table.next_update_time()
     }
 }
 
@@ -657,14 +651,6 @@ impl Service {
                     }
                     for reg in self.topics.registrations.values_mut() {
                         reg.table.remove_node(id, now);
-                        // The attempt chosen for the next request is gone with it.
-                        if reg
-                            .next
-                            .as_ref()
-                            .is_some_and(|job| job.node.node_id() == *id)
-                        {
-                            reg.next = None;
-                        }
                     }
                 }
                 TableChange::Inserted(key) => {
@@ -731,8 +717,7 @@ impl Service {
                 table: Registration::new(topic, local_id, self.config.topic.clone()),
                 seeded_at: None,
                 running: false,
-                next: None,
-                in_flight: None,
+                in_flight: HashSet::new(),
             },
         );
         self.registration_step(topic, Instant::now());
@@ -767,44 +752,41 @@ impl Service {
                 continue;
             }
 
-            if reg.next.is_none() && reg.table.next_update_time().is_some_and(|t| t <= now) {
-                let Some(id) = reg.table.update(now) else {
-                    continue;
-                };
-                reg.next = reg.table.attempt(&id).map(|attempt| RegJob {
-                    node: attempt.node.clone(),
-                    ticket: attempt.ticket.clone(),
-                    buckets: reg.table.buckets_with_free_space(),
-                });
-            }
-
-            if reg.in_flight.is_none()
-                && let Some(job) = reg.next.take()
+            if reg.in_flight.len() >= REG_SENDERS
+                || reg.table.next_update_time().is_none_or(|t| t > now)
             {
-                let id = job.node.node_id();
-                if !reg.table.start_request(&id) {
-                    continue;
-                }
-                let request_body = RequestBody::RegTopic {
-                    topic,
-                    ticket: job.ticket,
-                    enr: self.local_enr.read().clone().into(),
-                    buckets: job.buckets,
-                };
-                let callback = CallbackResponse::TopicRegistration(topic, reg.id);
-                if self.send_topic_request(job.node, request_body, callback) {
-                    reg.in_flight = Some(id);
-                } else {
-                    reg.table.handle_error_response(&id, now);
-                }
-                continue;
+                break;
             }
-            break;
+            let Some(id) = reg.table.update(now) else {
+                continue;
+            };
+            let Some((node, ticket)) = reg
+                .table
+                .attempt(&id)
+                .map(|attempt| (attempt.node.clone(), attempt.ticket.clone()))
+            else {
+                break;
+            };
+            if !reg.table.start_request(&id) {
+                break;
+            }
+            let request_body = RequestBody::RegTopic {
+                topic,
+                ticket,
+                enr: self.local_enr.read().clone().into(),
+                buckets: reg.table.buckets_with_free_space(),
+            };
+            let callback = CallbackResponse::TopicRegistration(topic, reg.id);
+            if self.send_topic_request(node, request_body, callback) {
+                reg.in_flight.insert(id);
+            } else {
+                reg.table.handle_error_response(&id, now);
+            }
         }
         self.topics.registrations.insert(topic, reg);
     }
 
-    /// The outcome of the REGTOPIC in flight of a registration.
+    /// The outcome of a REGTOPIC in flight of a registration.
     fn registration_response(
         &mut self,
         topic: TopicId,
@@ -817,10 +799,9 @@ impl Service {
         let Some(reg) = self.topics.registrations.get_mut(&topic) else {
             return;
         };
-        if reg.id != id || reg.in_flight != Some(from) {
+        if reg.id != id || !reg.in_flight.remove(&from) {
             return;
         }
-        reg.in_flight = None;
 
         let aux: Vec<Enr> = capable(aux).collect();
         if !aux.is_empty() {
@@ -1601,7 +1582,7 @@ mod tests {
         assert_eq!(enr.enr.as_deref(), Some(&*service.local_enr.read()));
         // The labels of the registration buckets, as the Go table lists them.
         assert_eq!(buckets, (239..=256).rev().collect::<Vec<u64>>());
-        // One request at a time.
+        // The only registrar is in flight: nothing else is due.
         assert!(next_request(&mut handler).is_none());
         assert!(service.topic_next_wakeup().is_none());
 
@@ -1670,21 +1651,23 @@ mod tests {
             matches!(request.body, RequestBody::RegTopic { ref ticket, .. } if ticket == &vec![7; 90])
         );
 
-        // A node enters the routing table while the request is in flight.
+        // A node enters the routing table while the request is in flight. It is asked
+        // at once, without waiting for the answer of the first registrar.
         let late = registrar(12104);
         add_to_table(&service, &late);
         add_to_table(&service, &record(Ipv4Addr::LOCALHOST, 12105, false));
         service.topic_table_changes();
         assert_eq!(service.topics.registrations[&TOPIC].table.node_count(), 3);
         service.topic_tick();
-        assert!(next_request(&mut handler).is_none());
+        let (late_contact, late_request) = next_request(&mut handler).unwrap();
+        assert_eq!(late_contact.node_id(), late.node_id());
 
-        // The first registrar does not answer: its attempt ends, the next one starts.
+        // The first registrar does not answer: its attempt ends.
         service.rpc_failure(request.id, RequestError::Timeout);
         let reg = &service.topics.registrations[&TOPIC];
         assert!(reg.table.attempt(&first.node_id()).is_none());
-        let (contact, request) = next_request(&mut handler).unwrap();
-        assert_eq!(contact.node_id(), late.node_id());
+        assert!(next_request(&mut handler).is_none());
+        let (contact, request) = (late_contact, late_request);
 
         // A stopped registration ignores the answer.
         service.stop_topic_registration(TOPIC);
@@ -1726,10 +1709,10 @@ mod tests {
     }
 
     // A node that leaves the routing table loses its ads and its parked registration
-    // attempts. An attempt with a request in flight stays.
+    // attempts. An attempt with a request in flight stays and takes its answer.
     #[tokio::test]
     async fn routing_table_removal_evicts() {
-        let nodes: Vec<Enr> = (0..3).map(|i| registrar(12101 + i)).collect();
+        let nodes: Vec<Enr> = (0..6).map(|i| registrar(12101 + i)).collect();
         let (mut service, mut handler) = service(TopicConfig::default(), &nodes);
         let now = Instant::now();
         for enr in &nodes {
@@ -1751,11 +1734,9 @@ mod tests {
             );
         }
         service.register_topic(TOPIC);
-        let (in_flight, _) = next_request(&mut handler).unwrap();
-        let parked = nodes
-            .iter()
-            .find(|enr| enr.node_id() != in_flight.node_id())
-            .unwrap();
+        let sent = all_requests(&mut handler);
+        assert_eq!(sent.len(), REG_SENDERS);
+        let in_flight: HashSet<NodeId> = sent.iter().map(|(c, _)| c.node_id()).collect();
 
         for enr in &nodes {
             assert!(service.kbuckets.write().remove(&enr.node_id().into()));
@@ -1776,10 +1757,204 @@ mod tests {
                 .is_empty()
         );
         let reg = &service.topics.registrations[&TOPIC];
-        assert!(reg.table.attempt(&parked.node_id()).is_none());
-        assert!(reg.table.attempt(&in_flight.node_id()).is_some());
-        assert_eq!(reg.table.node_count(), 1);
-        assert!(reg.next.is_none());
+        for enr in &nodes {
+            let id = enr.node_id();
+            assert_eq!(reg.table.attempt(&id).is_some(), in_flight.contains(&id));
+        }
+        assert_eq!(reg.table.node_count(), REG_SENDERS);
+
+        let (contact, request) = &sent[0];
+        respond(
+            &mut service,
+            contact,
+            &request.id,
+            confirmation(1, vec![], 60_000),
+        );
+        let reg = &service.topics.registrations[&TOPIC];
+        let attempt = reg.table.attempt(&contact.node_id()).unwrap();
+        assert_eq!(attempt.state, RegAttemptState::Registered);
+        assert!(next_request(&mut handler).is_none());
+    }
+
+    // A table emptied by routing table removals is read again after the pause.
+    #[tokio::test]
+    async fn emptied_table_read_again() {
+        let nodes: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
+        let (mut service, mut handler) = service(TopicConfig::default(), &nodes);
+        service.topic_table_changes();
+        service.register_topic(TOPIC);
+        let sent = all_requests(&mut handler);
+        assert_eq!(sent.len(), 2);
+        for (contact, request) in &sent {
+            respond(
+                &mut service,
+                contact,
+                &request.id,
+                confirmation(1, vec![], 60_000),
+            );
+        }
+        assert!(service.topics.registrations[&TOPIC].in_flight.is_empty());
+
+        for enr in &nodes {
+            assert!(service.kbuckets.write().remove(&enr.node_id().into()));
+        }
+        service.topic_table_changes();
+        assert_eq!(service.topics.registrations[&TOPIC].table.node_count(), 0);
+        let wakeup = service.topic_next_wakeup().expect("no re-read scheduled");
+        assert!(wakeup > Instant::now());
+
+        for enr in &nodes {
+            add_to_table(&service, enr);
+        }
+        service.registration_step(TOPIC, wakeup - Duration::from_millis(1));
+        assert!(next_request(&mut handler).is_none());
+        service.registration_step(TOPIC, wakeup);
+        let asked: HashSet<NodeId> = all_requests(&mut handler)
+            .iter()
+            .map(|(c, _)| c.node_id())
+            .collect();
+        assert_eq!(asked, nodes.iter().map(Enr::node_id).collect());
+    }
+
+    /// All topic requests the service handed to the handler.
+    fn all_requests(handler: &mut UnboundedReceiver<HandlerIn>) -> Vec<(NodeContact, Request)> {
+        std::iter::from_fn(|| next_request(handler)).collect()
+    }
+
+    // Up to four REGTOPIC are in flight. With four out nothing is sent, even with due
+    // attempts; an answer frees a slot for the next one at once.
+    #[tokio::test]
+    async fn four_regtopics_in_flight() {
+        let nodes: Vec<Enr> = (0..6).map(|i| registrar(12101 + i)).collect();
+        let (mut service, mut handler) = service(TopicConfig::default(), &nodes);
+        service.register_topic(TOPIC);
+        let sent = all_requests(&mut handler);
+        assert_eq!(sent.len(), REG_SENDERS);
+        let reg = &service.topics.registrations[&TOPIC];
+        assert_eq!(reg.in_flight.len(), REG_SENDERS);
+        assert!(
+            reg.table
+                .next_update_time()
+                .is_some_and(|t| t <= Instant::now())
+        );
+        assert!(service.topic_next_wakeup().is_none());
+        service.topic_tick();
+        assert!(next_request(&mut handler).is_none());
+
+        let (contact, request) = &sent[0];
+        respond(
+            &mut service,
+            contact,
+            &request.id,
+            confirmation(1, vec![1], 60_000),
+        );
+        let (next, _) = next_request(&mut handler).unwrap();
+        assert!(sent.iter().all(|(c, _)| c.node_id() != next.node_id()));
+        assert!(next_request(&mut handler).is_none());
+        let reg = &service.topics.registrations[&TOPIC];
+        assert_eq!(reg.in_flight.len(), REG_SENDERS);
+        assert!(!reg.in_flight.contains(&contact.node_id()));
+    }
+
+    // A due ticket retry goes out on time while another registrar has not answered.
+    #[tokio::test]
+    async fn ticket_retry_on_time_with_slow_registrar() {
+        let nodes: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
+        let (mut service, mut handler) = service(TopicConfig::default(), &nodes);
+        service.register_topic(TOPIC);
+        let sent = all_requests(&mut handler);
+        assert_eq!(sent.len(), 2);
+        let (slow, _) = &sent[0];
+        let (fast, request) = &sent[1];
+
+        respond(
+            &mut service,
+            fast,
+            &request.id,
+            confirmation(1, vec![7; 90], 3000),
+        );
+        assert!(next_request(&mut handler).is_none());
+        let due = service.topic_next_wakeup().expect("no retry scheduled");
+        assert!(due > Instant::now() + Duration::from_secs(2));
+        service.registration_step(TOPIC, due - Duration::from_millis(1));
+        assert!(next_request(&mut handler).is_none());
+
+        service.registration_step(TOPIC, due);
+        let (contact, retry) = next_request(&mut handler).unwrap();
+        assert_eq!(contact.node_id(), fast.node_id());
+        assert!(
+            matches!(retry.body, RequestBody::RegTopic { ref ticket, .. } if ticket == &vec![7; 90])
+        );
+        assert!(
+            service.topics.registrations[&TOPIC]
+                .in_flight
+                .contains(&slow.node_id())
+        );
+    }
+
+    // A rejection puts the registrar in the failed set, without a registration event or
+    // a liveness failure. Reseeding from the routing table skips it.
+    #[tokio::test]
+    async fn rejection_goes_to_failed_set() {
+        let target = registrar(12101);
+        let (mut service, mut handler) =
+            service(TopicConfig::default(), std::slice::from_ref(&target));
+        service.topic_table_changes();
+        let (events_tx, mut events) = mpsc::channel(10);
+        service.event_stream = Some(events_tx);
+
+        service.register_topic(TOPIC);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(
+            &mut service,
+            &contact,
+            &request.id,
+            confirmation(1, vec![], 0),
+        );
+        assert!(events.try_recv().is_err());
+        assert!(connected(&service, &target));
+        let reg = &service.topics.registrations[&TOPIC];
+        assert!(reg.table.attempt(&target.node_id()).is_none());
+        assert!(reg.in_flight.is_empty());
+
+        let wakeup = service.topic_next_wakeup().unwrap();
+        service.registration_step(TOPIC, wakeup);
+        assert!(next_request(&mut handler).is_none());
+        let reg = &service.topics.registrations[&TOPIC];
+        assert_eq!(reg.table.node_count(), 0);
+    }
+
+    // A timeout after a REGCONFIRMATION that admits the ad, with the announced NODES
+    // missing, keeps the registration.
+    #[tokio::test]
+    async fn post_confirmation_timeout_keeps_registration() {
+        let target = registrar(12101);
+        let config = TopicConfig::default();
+        let (mut service, mut handler) = service(config.clone(), std::slice::from_ref(&target));
+        service.topic_table_changes();
+        let (events_tx, mut events) = mpsc::channel(10);
+        service.event_stream = Some(events_tx);
+
+        service.register_topic(TOPIC);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(
+            &mut service,
+            &contact,
+            &request.id,
+            confirmation(2, vec![], config.ad_lifetime.as_millis() as u64),
+        );
+        assert!(events.try_recv().is_err());
+        service.rpc_failure(request.id, RequestError::Timeout);
+
+        let Some(Event::TopicRegistered { topic, registrar }) = events.try_recv().ok() else {
+            panic!("no registration event");
+        };
+        assert_eq!((topic, registrar), (TOPIC, target.node_id()));
+        assert!(connected(&service, &target));
+        let reg = &service.topics.registrations[&TOPIC];
+        let attempt = reg.table.attempt(&target.node_id()).unwrap();
+        assert_eq!(attempt.state, RegAttemptState::Registered);
+        assert!(reg.in_flight.is_empty());
     }
 
     /// Answers the queries of a search until it stops to send them. Returns the nodes

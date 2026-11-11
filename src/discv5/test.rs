@@ -836,8 +836,16 @@ mod topic {
 
     /// Starts `n` nodes that all have each other in the routing table.
     async fn build_topic_nodes(n: usize, base_port: u16, topic: TopicConfig) -> Vec<Discv5> {
+        start_topic_nodes(base_port..base_port + n as u16, topic).await
+    }
+
+    /// Starts nodes on `ports` that all have each other in the routing table.
+    async fn start_topic_nodes(
+        ports: impl IntoIterator<Item = u16>,
+        topic: TopicConfig,
+    ) -> Vec<Discv5> {
         let mut nodes = Vec::new();
-        for port in base_port..base_port + n as u16 {
+        for port in ports {
             let enr_key = CombinedKey::generate_secp256k1();
             let listen_config = ListenConfig::Ipv4 {
                 ip: Ipv4Addr::LOCALHOST,
@@ -1024,6 +1032,65 @@ mod topic {
         assert!(started.elapsed() < Duration::from_secs(6));
 
         assert!(nodes[0].topic_search(TOPIC, 0).await.unwrap().is_empty());
+    }
+
+    /// UDP ports from the system's ephemeral range that are free now.
+    fn ephemeral_ports(n: usize) -> Vec<u16> {
+        let sockets: Vec<std::net::UdpSocket> = (0..n)
+            .map(|_| std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .collect();
+        sockets
+            .iter()
+            .map(|socket| socket.local_addr().unwrap().port())
+            .collect()
+    }
+
+    // The registrar holds another ad of the topic in a small cache and quotes a wait:
+    // the advertiser gets a ticket and registers with it when the wait is over.
+    #[tokio::test]
+    async fn register_with_ticket_round_trip() {
+        init();
+        let config = TopicConfig {
+            ad_lifetime: Duration::from_secs(10),
+            // One ad of ten: the next one of the topic waits 0.05 / 0.9^10 of the
+            // lifetime, about 1.4 s.
+            ad_cache_size: 10,
+            ..Default::default()
+        };
+        let nodes = start_topic_nodes(ephemeral_ports(2), config).await;
+        let (registrar, advertiser) = (&nodes[0], &nodes[1]);
+        let other = local_enr(12345, &CombinedKey::generate_secp256k1());
+        assert!(
+            registrar
+                .topic_table
+                .write()
+                .add(&other, TOPIC, std::time::Instant::now())
+        );
+
+        let mut events = advertiser.event_stream().await.unwrap();
+        let started = std::time::Instant::now();
+        advertiser.register_topic(TOPIC).unwrap();
+        let registered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::TopicRegistered { topic, registrar } = events.recv().await.unwrap() {
+                    return (topic, registrar);
+                }
+            }
+        })
+        .await
+        .expect("no registration event");
+        assert_eq!(registered, (TOPIC, registrar.local_enr().node_id()));
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "admitted without a ticket"
+        );
+        let advertiser_id = advertiser.local_enr().node_id();
+        assert!(
+            registrar
+                .local_topic_nodes(TOPIC)
+                .iter()
+                .any(|enr| enr.node_id() == advertiser_id)
+        );
     }
 
     // A registrar drops the ads of a node that leaves its routing table.
