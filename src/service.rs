@@ -56,7 +56,7 @@ use tracing::{debug, error, info, trace, warn};
 #[cfg(feature = "topic-discovery")]
 use crate::{
     metrics::METRICS,
-    topic::{RegConfirmation, TopicId, TopicQueryResult, TopicTable},
+    topic::{RegTopicResult, TopicId, TopicQueryResult, TopicTable},
 };
 #[cfg(feature = "topic-discovery")]
 use std::sync::atomic::Ordering;
@@ -185,7 +185,7 @@ pub(crate) enum ServiceRequest {
         TopicId,
         Vec<u8>,
         Vec<u64>,
-        oneshot::Sender<Result<RegConfirmation, RequestError>>,
+        oneshot::Sender<Result<RegTopicResult, RequestError>>,
     ),
     /// Send a TOPICQUERY request to the designated peer and wait for the response.
     #[cfg(feature = "topic-discovery")]
@@ -293,7 +293,7 @@ pub(crate) enum CallbackResponse {
     Pong(oneshot::Sender<Result<Pong, RequestError>>),
     /// A response to a REGTOPIC request of the user.
     #[cfg(feature = "topic-discovery")]
-    RegConfirmation(oneshot::Sender<Result<RegConfirmation, RequestError>>),
+    RegConfirmation(oneshot::Sender<Result<RegTopicResult, RequestError>>),
     /// A response to a TOPICQUERY request of the user.
     #[cfg(feature = "topic-discovery")]
     TopicNodes(oneshot::Sender<Result<TopicQueryResult, RequestError>>),
@@ -477,6 +477,10 @@ impl Service {
                         HandlerOut::Response(node_address, response) => {
                                 self.handle_rpc_response(node_address, *response);
                             }
+                        #[cfg(feature = "topic-discovery")]
+                        HandlerOut::TopicResponse(node_address, response, last) => {
+                            self.handle_topic_response(node_address, *response, last);
+                        }
                         HandlerOut::WhoAreYou(whoareyou_ref) => {
                             // check what our latest known ENR is for this node.
                             if let Some(known_enr) = self.find_enr(&whoareyou_ref.0.node_id) {
@@ -810,6 +814,16 @@ impl Service {
         // verify we know of the rpc_id
         let id = response.id.clone();
 
+        // The handler reports topic responses separately, with their end.
+        #[cfg(feature = "topic-discovery")]
+        if self
+            .active_requests
+            .get(&id)
+            .is_some_and(|request| request.request_body.is_topic_request())
+        {
+            return self.handle_topic_response(node_address, response, true);
+        }
+
         let Some(mut active_request) = self.active_requests.remove(&id) else {
             warn!(%id, "Received an RPC response which doesn't match a request");
             return;
@@ -839,20 +853,10 @@ impl Service {
                 %node_address,
                 "Node gave an incorrect response type. Ignoring response"
             );
-            // The handler has dropped the request, so no timeout follows.
-            #[cfg(feature = "topic-discovery")]
-            if active_request.request_body.is_topic_request() {
-                self.topic_request_failed(id, active_request, RequestError::InvalidRemotePacket);
-            }
             return;
         }
 
         let node_id = node_address.node_id;
-
-        #[cfg(feature = "topic-discovery")]
-        if active_request.request_body.is_topic_request() {
-            return self.handle_topic_response(node_address, id, active_request, response.body);
-        }
 
         match response.body {
             ResponseBody::Nodes { total, mut nodes } => {

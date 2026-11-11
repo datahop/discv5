@@ -43,6 +43,7 @@ pub(crate) struct TopicCounters {
     pub ticket_replayed: AtomicUsize,
     pub ticket_invalid: AtomicUsize,
     pub ticket_foreign: AtomicUsize,
+    pub invalid_records: AtomicUsize,
 }
 
 #[cfg(feature = "topic-discovery")]
@@ -63,6 +64,7 @@ impl TopicCounters {
             ticket_replayed: self.ticket_replayed.load(Ordering::Relaxed),
             ticket_invalid: self.ticket_invalid.load(Ordering::Relaxed),
             ticket_foreign: self.ticket_foreign.load(Ordering::Relaxed),
+            invalid_records: self.invalid_records.load(Ordering::Relaxed),
         }
     }
 }
@@ -93,6 +95,8 @@ pub struct TopicMetrics {
     pub ticket_invalid: usize,
     /// Tickets presented by a node they were not issued to.
     pub ticket_foreign: usize,
+    /// Records dropped from topic responses for failing verification.
+    pub invalid_records: usize,
 }
 
 impl Default for InternalMetrics {

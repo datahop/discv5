@@ -361,7 +361,7 @@ mod tests {
                 rng.fill_bytes(&mut ip);
                 // A few clustered prefixes, so insert depths vary within a branch.
                 ip[0] %= 4;
-                if rng.next_u32() % 2 == 0 {
+                if rng.next_u32().is_multiple_of(2) {
                     ip[1] = 0;
                 }
                 ip

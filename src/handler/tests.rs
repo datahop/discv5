@@ -1189,3 +1189,526 @@ async fn topic_responses_dropped_when_disabled() {
         _ = sleep(Duration::from_secs(2)) => panic!("Test timed out"),
     }
 }
+
+#[cfg(feature = "topic-discovery")]
+mod topic {
+    use super::*;
+    use crate::topic::{TopicConfig, params::RESP_TIMEOUT};
+    use std::time::Instant;
+
+    fn topic_node(port: u16, request_timeout: Duration, retries: u8) -> (Enr, CombinedKey, Config) {
+        let ip = Ipv4Addr::LOCALHOST;
+        let key = CombinedKey::generate_secp256k1();
+        let enr = Enr::builder().ip4(ip).udp4(port).build(&key).unwrap();
+        let config = ConfigBuilder::new(ListenConfig::Ipv4 { ip, port })
+            .request_timeout(request_timeout)
+            .request_retries(retries)
+            .topic_config(TopicConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .build();
+        (enr, key, config)
+    }
+
+    fn topic_query(id: u8) -> Request {
+        Request {
+            id: RequestId(vec![id]),
+            body: RequestBody::TopicQuery {
+                topic: [5; 32],
+                buckets: vec![],
+            },
+        }
+    }
+
+    /// Spawns a requester and a responder handler. The responder answers each request
+    /// with `answer`, which may sleep between packets, and counts the requests.
+    async fn pair<F, Fut>(
+        ports: (u16, u16),
+        request_timeout: Duration,
+        retries: u8,
+        answer: F,
+    ) -> (
+        Vec<oneshot::Sender<()>>,
+        Enr,
+        mpsc::UnboundedSender<HandlerIn>,
+        mpsc::Receiver<HandlerOut>,
+        Arc<RwLock<usize>>,
+    )
+    where
+        F: Fn(mpsc::UnboundedSender<HandlerIn>, NodeAddress, Request) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let (req_enr, req_key, req_config) = topic_node(ports.0, request_timeout, retries);
+        let (resp_enr, resp_key, resp_config) = topic_node(ports.1, request_timeout, retries);
+        let (exit_req, req_send, req_recv) =
+            Handler::spawn(arc_rw!(req_enr.clone()), arc_rw!(req_key), req_config)
+                .await
+                .unwrap();
+        let (exit_resp, resp_send, mut resp_recv) =
+            Handler::spawn(arc_rw!(resp_enr.clone()), arc_rw!(resp_key), resp_config)
+                .await
+                .unwrap();
+        let requests = Arc::new(RwLock::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            while let Some(message) = resp_recv.recv().await {
+                match message {
+                    HandlerOut::WhoAreYou(wru_ref) => {
+                        let _ =
+                            resp_send.send(HandlerIn::WhoAreYou(wru_ref, Some(req_enr.clone())));
+                    }
+                    HandlerOut::Request(address, request) => {
+                        *counter.write() += 1;
+                        answer(resp_send.clone(), address, *request).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (
+            vec![exit_req, exit_resp],
+            resp_enr,
+            req_send,
+            req_recv,
+            requests,
+        )
+    }
+
+    fn respond(
+        send: &mpsc::UnboundedSender<HandlerIn>,
+        address: &NodeAddress,
+        id: &RequestId,
+        total: u64,
+    ) {
+        let response = Response {
+            id: id.clone(),
+            body: ResponseBody::TopicNodes {
+                total,
+                nodes: vec![],
+            },
+        };
+        let _ = send.send(HandlerIn::Response(address.clone(), Box::new(response)));
+    }
+
+    // The timeout of a topic request is RESP_TIMEOUT per packet: packets 300 ms apart
+    // keep a request alive longer than RESP_TIMEOUT, and a gap of RESP_TIMEOUT ends one,
+    // although the configured request timeout is 10 s.
+    #[tokio::test]
+    async fn resp_timeout_restarts_per_packet() {
+        init();
+        let (_exits, responder, requester, mut events, _) = pair(
+            (12350, 12351),
+            Duration::from_secs(10),
+            1,
+            |send, address, request| async move {
+                if request.id == RequestId(vec![1]) {
+                    for _ in 0..4 {
+                        respond(&send, &address, &request.id, 4);
+                        sleep(Duration::from_millis(300)).await;
+                    }
+                } else {
+                    respond(&send, &address, &request.id, 3);
+                }
+            },
+        )
+        .await;
+
+        let started = Instant::now();
+        let _ = requester.send(HandlerIn::Request(
+            responder.clone().into(),
+            Box::new(topic_query(1)),
+        ));
+        let mut ends = Vec::new();
+        while ends.len() < 4 {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+                Ok(Some(HandlerOut::TopicResponse(_, _, last))) => ends.push(last),
+                Ok(Some(HandlerOut::RequestFailed(_, error))) => {
+                    panic!("request failed: {error:?}")
+                }
+                Ok(Some(_)) => {}
+                _ => panic!("no response"),
+            }
+        }
+        assert_eq!(ends, vec![false, false, false, true]);
+        assert!(started.elapsed() > RESP_TIMEOUT);
+
+        let _ = requester.send(HandlerIn::Request(
+            responder.into(),
+            Box::new(topic_query(2)),
+        ));
+        let mut first = None;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+                Ok(Some(HandlerOut::TopicResponse(_, _, last))) => {
+                    assert!(!last);
+                    first = Some(Instant::now());
+                }
+                Ok(Some(HandlerOut::RequestFailed(id, error))) => {
+                    assert_eq!((id, error), (RequestId(vec![2]), RequestError::Timeout));
+                    let gap = first.expect("a packet before the timeout").elapsed();
+                    assert!(gap >= RESP_TIMEOUT - Duration::from_millis(100), "{gap:?}");
+                    assert!(gap < Duration::from_secs(3), "{gap:?}");
+                    return;
+                }
+                Ok(Some(_)) => {}
+                _ => panic!("no timeout"),
+            }
+        }
+    }
+
+    // A topic request is never resent: with a 200 ms request timeout and 3 retries, an
+    // unanswered TOPICQUERY reaches the responder once and fails after RESP_TIMEOUT.
+    #[tokio::test]
+    async fn topic_request_not_retransmitted() {
+        init();
+        let (_exits, responder, requester, mut events, requests) = pair(
+            (12352, 12353),
+            Duration::from_millis(200),
+            3,
+            |_, _, _| async {},
+        )
+        .await;
+
+        let started = Instant::now();
+        let _ = requester.send(HandlerIn::Request(
+            responder.into(),
+            Box::new(topic_query(1)),
+        ));
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+                Ok(Some(HandlerOut::RequestFailed(id, error))) => {
+                    assert_eq!((id, error), (RequestId(vec![1]), RequestError::Timeout));
+                    break;
+                }
+                Ok(Some(_)) => {}
+                _ => panic!("no timeout"),
+            }
+        }
+        assert!(started.elapsed() >= RESP_TIMEOUT - Duration::from_millis(100));
+        sleep(Duration::from_millis(800)).await;
+        assert_eq!(*requests.read(), 1);
+    }
+
+    fn regtopic(id: u8) -> Request {
+        Request {
+            id: RequestId(vec![id]),
+            body: RequestBody::RegTopic {
+                topic: [5; 32],
+                ticket: vec![],
+                enr: create_node().into(),
+                buckets: vec![],
+            },
+        }
+    }
+
+    /// A responder that answers PING with PONG and REGTOPIC with a REGCONFIRMATION
+    /// announcing `total` packets, or not at all for `None`, and counts the REGTOPICs it
+    /// decodes. Spawning it again
+    /// with the same key and port gives a node that has lost its sessions.
+    async fn replay_responder(
+        enr: &Enr,
+        key: &CombinedKey,
+        requester: &Enr,
+        total: Option<u64>,
+        regtopics: Arc<RwLock<usize>>,
+    ) -> oneshot::Sender<()> {
+        let ip = Ipv4Addr::LOCALHOST;
+        let port = enr.udp4().unwrap();
+        let config = ConfigBuilder::new(ListenConfig::Ipv4 { ip, port })
+            .topic_config(TopicConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .build();
+        let key = CombinedKey::secp256k1_from_bytes(&mut key.encode()).unwrap();
+        let (exit, send, mut recv) = Handler::spawn(arc_rw!(enr.clone()), arc_rw!(key), config)
+            .await
+            .unwrap();
+        let requester = requester.clone();
+        tokio::spawn(async move {
+            while let Some(message) = recv.recv().await {
+                match message {
+                    HandlerOut::WhoAreYou(wru_ref) => {
+                        let _ = send.send(HandlerIn::WhoAreYou(wru_ref, Some(requester.clone())));
+                    }
+                    HandlerOut::Request(address, request) => {
+                        let body = match request.body {
+                            RequestBody::RegTopic { .. } => {
+                                *regtopics.write() += 1;
+                                let Some(total) = total else {
+                                    continue;
+                                };
+                                ResponseBody::RegConfirmation {
+                                    total,
+                                    ticket: vec![],
+                                    wait_time: 1000,
+                                }
+                            }
+                            _ => ResponseBody::Pong {
+                                enr_seq: 1,
+                                ip: ip.into(),
+                                port: NonZeroU16::new(requester.udp4().unwrap()).unwrap(),
+                            },
+                        };
+                        let response = Response {
+                            id: request.id,
+                            body,
+                        };
+                        let _ = send.send(HandlerIn::Response(address, Box::new(response)));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        exit
+    }
+
+    async fn next_event(events: &mut mpsc::Receiver<HandlerOut>) -> HandlerOut {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+                Ok(Some(HandlerOut::Established(..))) => {}
+                Ok(Some(event)) => return event,
+                _ => panic!("no event"),
+            }
+        }
+    }
+
+    // The session is re-established after the REGCONFIRMATION of a REGTOPIC arrived: the
+    // peer decoded the request, so the replay skips it, and it times out as usual.
+    #[tokio::test]
+    async fn replay_skips_answered_topic_request() {
+        init();
+        let (req_enr, req_key, req_config) = topic_node(12354, Duration::from_secs(10), 1);
+        let (resp_enr, resp_key, _) = topic_node(12355, Duration::from_secs(10), 1);
+        let (_exit_req, requester, mut events) =
+            Handler::spawn(arc_rw!(req_enr.clone()), arc_rw!(req_key), req_config)
+                .await
+                .unwrap();
+        let regtopics = Arc::new(RwLock::new(0));
+        let exit =
+            replay_responder(&resp_enr, &resp_key, &req_enr, Some(2), regtopics.clone()).await;
+
+        let _ = requester.send(HandlerIn::Request(
+            resp_enr.clone().into(),
+            Box::new(regtopic(1)),
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            HandlerOut::TopicResponse(_, _, false)
+        ));
+        let _ = exit.send(());
+        sleep(Duration::from_millis(50)).await;
+        let _exit =
+            replay_responder(&resp_enr, &resp_key, &req_enr, Some(2), regtopics.clone()).await;
+
+        let ping = Request {
+            id: RequestId(vec![2]),
+            body: RequestBody::Ping { enr_seq: 1 },
+        };
+        let _ = requester.send(HandlerIn::Request(resp_enr.into(), Box::new(ping)));
+        match next_event(&mut events).await {
+            HandlerOut::Response(_, response) => assert_eq!(response.id, RequestId(vec![2])),
+            event => panic!("expected the PONG first, got {event:?}"),
+        }
+        match next_event(&mut events).await {
+            HandlerOut::RequestFailed(id, error) => {
+                assert_eq!((id, error), (RequestId(vec![1]), RequestError::Timeout))
+            }
+            event => panic!("expected the REGTOPIC timeout, got {event:?}"),
+        }
+        assert_eq!(*regtopics.read(), 1);
+    }
+
+    async fn requester(
+        port: u16,
+    ) -> (
+        oneshot::Sender<()>,
+        Enr,
+        mpsc::UnboundedSender<HandlerIn>,
+        mpsc::Receiver<HandlerOut>,
+    ) {
+        let (enr, key, config) = topic_node(port, Duration::from_secs(10), 1);
+        let (exit, send, events) = Handler::spawn(arc_rw!(enr.clone()), arc_rw!(key), config)
+            .await
+            .unwrap();
+        (exit, enr, send, events)
+    }
+
+    fn ping(id: u8) -> Request {
+        Request {
+            id: RequestId(vec![id]),
+            body: RequestBody::Ping { enr_seq: 1 },
+        }
+    }
+
+    // The session is re-established before any answer to a REGTOPIC that the responder
+    // could not decrypt: the replay does not send it, and it times out.
+    #[tokio::test]
+    async fn replay_skips_unanswered_topic_request() {
+        init();
+        let (_exit_req, req_enr, requester, mut events) = requester(12356).await;
+        let (resp_enr, resp_key, _) = topic_node(12357, Duration::from_secs(10), 1);
+        let regtopics = Arc::new(RwLock::new(0));
+        let exit =
+            replay_responder(&resp_enr, &resp_key, &req_enr, Some(1), regtopics.clone()).await;
+
+        let _ = requester.send(HandlerIn::Request(
+            resp_enr.clone().into(),
+            Box::new(ping(1)),
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            HandlerOut::Response(..)
+        ));
+        let _ = exit.send(());
+        sleep(Duration::from_millis(50)).await;
+        let _exit =
+            replay_responder(&resp_enr, &resp_key, &req_enr, Some(1), regtopics.clone()).await;
+
+        // Both go out under the old session; the PING is sent again in the handshake.
+        let _ = requester.send(HandlerIn::Request(
+            resp_enr.clone().into(),
+            Box::new(ping(2)),
+        ));
+        let _ = requester.send(HandlerIn::Request(resp_enr.into(), Box::new(regtopic(3))));
+        match next_event(&mut events).await {
+            HandlerOut::Response(_, response) => assert_eq!(response.id, RequestId(vec![2])),
+            event => panic!("expected the PONG first, got {event:?}"),
+        }
+        match next_event(&mut events).await {
+            HandlerOut::RequestFailed(id, error) => {
+                assert_eq!((id, error), (RequestId(vec![3]), RequestError::Timeout))
+            }
+            event => panic!("expected the REGTOPIC timeout, got {event:?}"),
+        }
+        assert_eq!(*regtopics.read(), 0);
+    }
+
+    // The responder decodes a REGTOPIC and its answer is lost, then the session is
+    // re-established: the REGTOPIC is not sent again, so its ticket is not presented twice.
+    #[tokio::test]
+    async fn decoded_unanswered_topic_request_not_replayed() {
+        init();
+        let (_exit_req, req_enr, requester, mut events) = requester(12358).await;
+        let (resp_enr, resp_key, _) = topic_node(12359, Duration::from_secs(10), 1);
+        let regtopics = Arc::new(RwLock::new(0));
+        let exit = replay_responder(&resp_enr, &resp_key, &req_enr, None, regtopics.clone()).await;
+
+        let _ = requester.send(HandlerIn::Request(
+            resp_enr.clone().into(),
+            Box::new(regtopic(1)),
+        ));
+        let decoded = Instant::now();
+        while *regtopics.read() == 0 {
+            assert!(
+                decoded.elapsed() < Duration::from_secs(2),
+                "REGTOPIC not decoded"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+        let _ = exit.send(());
+        sleep(Duration::from_millis(50)).await;
+        let _exit =
+            replay_responder(&resp_enr, &resp_key, &req_enr, Some(1), regtopics.clone()).await;
+
+        let _ = requester.send(HandlerIn::Request(resp_enr.into(), Box::new(ping(2))));
+        match next_event(&mut events).await {
+            HandlerOut::Response(_, response) => assert_eq!(response.id, RequestId(vec![2])),
+            event => panic!("expected the PONG first, got {event:?}"),
+        }
+        match next_event(&mut events).await {
+            HandlerOut::RequestFailed(id, error) => {
+                assert_eq!((id, error), (RequestId(vec![1]), RequestError::Timeout))
+            }
+            event => panic!("expected the REGTOPIC timeout, got {event:?}"),
+        }
+        assert_eq!(*regtopics.read(), 1);
+    }
+
+    /// A NODES message for request `id` with two records, the second with a broken
+    /// signature.
+    fn nodes_with_bad_record(id: &RequestId) -> (Vec<u8>, Enr) {
+        let good = create_node();
+        let bad = create_node();
+        let message = Message::Response(Response {
+            id: id.clone(),
+            body: ResponseBody::Nodes {
+                total: 1,
+                nodes: vec![good.clone(), bad.clone()],
+            },
+        })
+        .encode();
+        let rlp = crate::rpc::RegTopicEnr::from(bad).rlp;
+        let at = message
+            .windows(rlp.len())
+            .position(|w| w == rlp.as_slice())
+            .unwrap();
+        let mut message = message;
+        // The signature follows the record's list header and its own header.
+        message[at + 4] ^= 0xff;
+        (message, good)
+    }
+
+    fn active_requests(node: &Enr) -> (ActiveRequests, NodeAddress) {
+        let mut active = ActiveRequests::new(Duration::from_secs(5));
+        let contact: NodeContact = node.clone().into();
+        let address = contact.node_address();
+        for (id, body) in [
+            (1u8, topic_query(1).body),
+            (
+                2,
+                RequestBody::FindNode {
+                    distances: vec![256],
+                },
+            ),
+        ] {
+            let packet = Packet::new_random(&node.node_id(), ProtocolIdentity::default());
+            let call = RequestCall::new(
+                contact.clone(),
+                packet,
+                HandlerReqId::External(RequestId(vec![id])),
+                body,
+                false,
+            );
+            active.insert(address.clone(), call);
+        }
+        (active, address)
+    }
+
+    // A record that fails verification in a NODES answering a topic request is dropped,
+    // and the rest of the packet is kept.
+    #[tokio::test]
+    async fn invalid_record_dropped_not_packet() {
+        let (active, address) = active_requests(&create_node());
+        let id = RequestId(vec![1]);
+        let (message, good) = nodes_with_bad_record(&id);
+        assert!(Message::decode(&message).is_err());
+
+        let decoded = Handler::decode_topic_response(true, &active, &address, &message);
+        let Some(Message::Response(response)) = decoded else {
+            panic!("not decoded: {decoded:?}");
+        };
+        assert_eq!(response.id, id);
+        assert_eq!(
+            response.body,
+            ResponseBody::Nodes {
+                total: 1,
+                nodes: vec![good],
+            }
+        );
+        assert!(Handler::decode_topic_response(false, &active, &address, &message).is_none());
+    }
+
+    // The same packet answering a FINDNODE is dropped whole, as without topic discovery.
+    #[tokio::test]
+    async fn findnode_strictness_unchanged() {
+        let (active, address) = active_requests(&create_node());
+        let (message, _) = nodes_with_bad_record(&RequestId(vec![2]));
+        assert!(Message::decode(&message).is_err());
+        assert!(Handler::decode_topic_response(true, &active, &address, &message).is_none());
+        // An id that matches no request is dropped too.
+        let (message, _) = nodes_with_bad_record(&RequestId(vec![3]));
+        assert!(Handler::decode_topic_response(true, &active, &address, &message).is_none());
+    }
+}

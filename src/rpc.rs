@@ -453,7 +453,7 @@ impl RegTopicEnr {
     /// Decodes a record that is well-formed as in go-ethereum's `enr.Record`: at most
     /// 300 bytes, a list of signature, sequence number and strictly sorted key/value
     /// pairs. Anything else is a decoding error.
-    fn decode(payload: &mut &[u8]) -> Result<Self, DecoderError> {
+    pub(crate) fn decode(payload: &mut &[u8]) -> Result<Self, DecoderError> {
         const MAX_ENR_SIZE: usize = 300;
         let mut rest = *payload;
         let header = Header::decode(&mut rest)?;
@@ -510,8 +510,12 @@ fn decode_wait_time(payload: &mut &[u8]) -> Result<u64, DecoderError> {
     Ok(u64::MAX)
 }
 
-/// Decodes an RLP list of records.
-fn decode_enr_list(payload: &mut &[u8]) -> Result<Vec<Enr<CombinedKey>>, DecoderError> {
+/// Decodes an RLP list of records. With `skipped`, a well-formed record that fails
+/// verification is dropped and counted instead of failing the list.
+fn decode_enr_list(
+    payload: &mut &[u8],
+    skipped: Option<&mut usize>,
+) -> Result<Vec<Enr<CombinedKey>>, DecoderError> {
     let header = Header::decode(payload)?;
     if !header.list {
         return Err(DecoderError::Custom("Invalid format of header"));
@@ -523,8 +527,23 @@ fn decode_enr_list(payload: &mut &[u8]) -> Result<Vec<Enr<CombinedKey>>, Decoder
     }
     let (mut items, rest) = payload.split_at(header.payload_length);
     let mut nodes = Vec::new();
-    while !items.is_empty() {
-        nodes.push(decode_enr(&mut items)?);
+    match skipped {
+        None => {
+            while !items.is_empty() {
+                nodes.push(decode_enr(&mut items)?);
+            }
+        }
+        #[cfg(feature = "topic-discovery")]
+        Some(skipped) => {
+            while !items.is_empty() {
+                match RegTopicEnr::decode(&mut items)?.enr {
+                    Some(enr) => nodes.push(*enr),
+                    None => *skipped += 1,
+                }
+            }
+        }
+        #[cfg(not(feature = "topic-discovery"))]
+        Some(_) => unreachable!("records are only skipped with topic discovery"),
     }
     *payload = rest;
     Ok(nodes)
@@ -649,6 +668,19 @@ impl Message {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, DecoderError> {
+        Self::decode_counting(data, None)
+    }
+
+    /// Decodes like `decode`, but drops the records of NODES and TOPICNODES that fail
+    /// verification instead of the whole message, and returns their number.
+    #[cfg(feature = "topic-discovery")]
+    pub fn decode_lenient(data: &[u8]) -> Result<(Self, usize), DecoderError> {
+        let mut skipped = 0;
+        let message = Self::decode_counting(data, Some(&mut skipped))?;
+        Ok((message, skipped))
+    }
+
+    fn decode_counting(data: &[u8], skipped: Option<&mut usize>) -> Result<Self, DecoderError> {
         if data.len() < 3 {
             return Err(DecoderError::InputTooShort);
         }
@@ -750,7 +782,7 @@ impl Message {
             4 => {
                 // NodesResponse
                 let total = u64::decode(payload)?;
-                let nodes = decode_enr_list(payload)?;
+                let nodes = decode_enr_list(payload, skipped)?;
                 if !payload.is_empty() {
                     return Err(DecoderError::Custom("Payload should be empty"));
                 }
@@ -845,9 +877,13 @@ impl Message {
             10 => {
                 // TOPICNODES: [request-id, total, [ENR, ...]]
                 let total = u64::from(u8::decode(payload)?);
-                let nodes = decode_enr_list(payload)?;
-                if nodes.len() > MAX_TOPIC_NODES {
+                let mut dropped = 0;
+                let nodes = decode_enr_list(payload, skipped.is_some().then_some(&mut dropped))?;
+                if nodes.len() + dropped > MAX_TOPIC_NODES {
                     return Err(DecoderError::Custom("Too many nodes in TOPICNODES"));
+                }
+                if let Some(skipped) = skipped {
+                    *skipped += dropped;
                 }
                 if !payload.is_empty() {
                     return Err(DecoderError::Custom("Payload should be empty"));

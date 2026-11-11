@@ -3,8 +3,57 @@ use crate::{
     packet::Packet,
     rpc::{Request, RequestBody},
 };
+#[cfg(feature = "topic-discovery")]
+use crate::{
+    rpc::ResponseBody,
+    topic::params::{QUERY_RESP_LIMIT, REG_RESP_LIMIT, RESP_TIMEOUT},
+};
+use std::time::Duration;
 
 use super::HandlerReqId;
+
+/// Counts the response packets of a REGTOPIC or TOPICQUERY to tell when the request is
+/// over, as in the spec's "Response Splitting".
+#[cfg(feature = "topic-discovery")]
+#[derive(Debug, Default, Clone)]
+pub(crate) struct TopicRespCount {
+    /// The `total` of the first packet of a kind that answers the request.
+    total: Option<u64>,
+    /// Packets of a kind that answers the request.
+    received: u64,
+    /// Packets of any kind.
+    packets: u64,
+    confirmed: bool,
+}
+
+#[cfg(feature = "topic-discovery")]
+impl TopicRespCount {
+    /// Counts one packet. Returns true when no further packet is awaited: the capped
+    /// `total` has arrived, with the REGCONFIRMATION for a REGTOPIC, or the packet cap
+    /// is reached.
+    pub(crate) fn count(&mut self, request: &RequestBody, response: &ResponseBody) -> bool {
+        let (limit, regtopic) = match request {
+            RequestBody::RegTopic { .. } => (REG_RESP_LIMIT as u64, true),
+            _ => (QUERY_RESP_LIMIT as u64, false),
+        };
+        self.packets += 1;
+        let answers = match response {
+            ResponseBody::Nodes { .. } => true,
+            ResponseBody::RegConfirmation { .. } => regtopic,
+            ResponseBody::TopicNodes { .. } => !regtopic,
+            _ => false,
+        };
+        if answers {
+            self.total.get_or_insert(response.total().unwrap_or(1));
+            self.received += 1;
+            self.confirmed |= matches!(response, ResponseBody::RegConfirmation { .. });
+        }
+        let complete = self
+            .total
+            .is_some_and(|total| self.received >= total.min(limit));
+        (complete && (self.confirmed || !regtopic)) || self.packets >= limit
+    }
+}
 
 /// A request to a node that we are waiting for a response.
 #[derive(Debug)]
@@ -26,6 +75,9 @@ pub(super) struct RequestCall {
     /// Signifies if we are initiating the session with a random packet. This is only used to
     /// determine the connection direction of the session.
     initiating_session: bool,
+    /// The packets received so far for a topic request.
+    #[cfg(feature = "topic-discovery")]
+    topic_responses: Option<TopicRespCount>,
 }
 
 impl RequestCall {
@@ -40,11 +92,13 @@ impl RequestCall {
             contact,
             packet,
             request_id,
-            request,
             handshake_sent: false,
             retries: 1,
             remaining_responses: None,
             initiating_session,
+            #[cfg(feature = "topic-discovery")]
+            topic_responses: request.is_topic_request().then(TopicRespCount::default),
+            request,
         }
     }
 
@@ -113,6 +167,30 @@ impl RequestCall {
     /// Updates the underlying packet for the call.
     pub fn update_packet(&mut self, packet: Packet) {
         self.packet = packet;
+    }
+
+    /// The response timeout when it is not the configured one: `RESP_TIMEOUT` per
+    /// packet for topic requests.
+    pub fn response_timeout(&self) -> Option<Duration> {
+        #[cfg(feature = "topic-discovery")]
+        if self.topic_responses.is_some() {
+            return Some(RESP_TIMEOUT);
+        }
+        None
+    }
+
+    /// REGTOPIC and TOPICQUERY are never resent.
+    #[cfg(feature = "topic-discovery")]
+    pub fn is_topic_request(&self) -> bool {
+        self.topic_responses.is_some()
+    }
+
+    /// Counts a response packet of a topic request. `None` for other requests, else
+    /// whether the request is over.
+    #[cfg(feature = "topic-discovery")]
+    pub fn count_topic_response(&mut self, response: &ResponseBody) -> Option<bool> {
+        let count = self.topic_responses.as_mut()?;
+        Some(count.count(&self.request, response))
     }
 
     /// Gets a mutable reference to the remaining repsonses.

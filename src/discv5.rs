@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 #[cfg(feature = "topic-discovery")]
-use crate::topic::{RegConfirmation, TopicId, TopicQueryResult, TopicTable};
+use crate::topic::{RegTopicResult, TopicId, TopicQueryResult, TopicTable};
 #[cfg(feature = "libp2p")]
 use multiaddr::Multiaddr;
 
@@ -796,7 +796,7 @@ impl Discv5 {
         topic: TopicId,
         ticket: Vec<u8>,
         distances: Vec<u64>,
-    ) -> impl Future<Output = Result<RegConfirmation, RequestError>> + 'static + use<> {
+    ) -> impl Future<Output = Result<RegTopicResult, RequestError>> + 'static + use<> {
         let (callback_send, callback_recv) = oneshot::channel();
         let channel = self.topic_enabled().and_then(|_| self.clone_channel());
 

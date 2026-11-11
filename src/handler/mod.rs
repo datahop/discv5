@@ -68,6 +68,8 @@ use crate::metrics::METRICS;
 use crate::{lru_time_cache::LruTimeCache, socket::ListenConfig};
 use active_requests::ActiveRequests;
 use request_call::RequestCall;
+#[cfg(all(test, feature = "topic-discovery"))]
+pub(crate) use request_call::TopicRespCount;
 use session::Session;
 
 // The time interval to check banned peer timeouts and unban peers when the timeout has elapsed (in
@@ -121,6 +123,11 @@ pub enum HandlerOut {
 
     /// A Response has been received from a node on the network.
     Response(NodeAddress, Box<Response>),
+
+    /// A response packet of a REGTOPIC or TOPICQUERY, of any kind. `true` when the
+    /// handler awaits no further packet for the request.
+    #[cfg(feature = "topic-discovery")]
+    TopicResponse(NodeAddress, Box<Response>, bool),
 
     /// An unknown source has requested information from us. Return the reference with the known
     /// ENR of this node (if known). See the `HandlerIn::WhoAreYou` variant.
@@ -472,6 +479,10 @@ impl Handler {
         node_address: NodeAddress,
         mut request_call: RequestCall,
     ) {
+        #[cfg(feature = "topic-discovery")]
+        if request_call.is_topic_request() {
+            return self.topic_request_timeout(node_address, request_call).await;
+        }
         if request_call.retries() >= self.request_retries {
             trace!(%node_address, "Request timed out");
             // Remove the request from the awaiting packet_filter
@@ -490,6 +501,32 @@ impl Handler {
                 .await;
             request_call.increment_retries();
             self.active_requests.insert(node_address, request_call);
+        }
+    }
+
+    /// A topic request timed out. It is never resent. With a session, only this request
+    /// fails, so a registrar that confirmed and then went silent does not fail the other
+    /// requests to it.
+    #[cfg(feature = "topic-discovery")]
+    async fn topic_request_timeout(
+        &mut self,
+        node_address: NodeAddress,
+        request_call: RequestCall,
+    ) {
+        trace!(%node_address, "Topic request timed out");
+        self.remove_expected_response(node_address.socket_addr);
+        if self.sessions.get(&node_address).is_none() {
+            return self
+                .fail_request(request_call, RequestError::Timeout, false)
+                .await;
+        }
+        if let HandlerReqId::External(id) = request_call.id()
+            && let Err(e) = self
+                .service_send
+                .send(HandlerOut::RequestFailed(id.clone(), RequestError::Timeout))
+                .await
+        {
+            warn!(error = %e, "Failed to inform request failure")
         }
     }
 
@@ -1017,6 +1054,13 @@ impl Handler {
                     }
                 })
             {
+                // Topic requests are never resent: the peer may have decoded one even
+                // without answering. Unanswered, it times out.
+                #[cfg(feature = "topic-discovery")]
+                if request_call.is_topic_request() {
+                    trace!(id = ?request_call.id(), "Not replaying a topic request");
+                    continue;
+                }
                 if let Ok(new_packet) = session.encrypt_message(
                     self.node_id,
                     &request_call.encode(),
@@ -1067,6 +1111,20 @@ impl Handler {
                         return;
                     }
                     Ok(p) => p,
+                    #[cfg(feature = "topic-discovery")]
+                    Err(e) => match Self::decode_topic_response(
+                        self.topic_enabled,
+                        &self.active_requests,
+                        &node_address,
+                        &m,
+                    ) {
+                        Some(p) => p,
+                        None => {
+                            warn!(error = ?e, %node_address, "Failed to decode message");
+                            return;
+                        }
+                    },
+                    #[cfg(not(feature = "topic-discovery"))]
                     Err(e) => {
                         warn!(error = ?e, %node_address, "Failed to decode message");
                         return;
@@ -1186,6 +1244,38 @@ impl Handler {
         }
     }
 
+    /// Decodes a NODES or TOPICNODES answering an active topic request with the records
+    /// that fail verification dropped. Other messages keep the strict decoding.
+    #[cfg(feature = "topic-discovery")]
+    fn decode_topic_response(
+        topic_enabled: bool,
+        active_requests: &ActiveRequests,
+        node_address: &NodeAddress,
+        data: &[u8],
+    ) -> Option<Message> {
+        if !topic_enabled {
+            return None;
+        }
+        let (message, skipped) = Message::decode_lenient(data).ok()?;
+        let Message::Response(response) = &message else {
+            return None;
+        };
+        let topic_request = active_requests.get(node_address).is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|call| call.is_topic_request() && RequestId::from(call.id()) == response.id)
+        });
+        if !topic_request {
+            return None;
+        }
+        debug!(%node_address, skipped, "Dropped invalid records from topic response");
+        METRICS
+            .topic
+            .invalid_records
+            .fetch_add(skipped, Ordering::Relaxed);
+        Some(message)
+    }
+
     /// Handles a response to a request. Re-inserts the request call if the response is a multiple
     /// Nodes response.
     async fn handle_response(&mut self, node_address: NodeAddress, response: Response) {
@@ -1194,6 +1284,29 @@ impl Handler {
             .active_requests
             .remove_request(&node_address, &response.id)
         {
+            // A topic request takes packets of any kind up to its cap, and the timeout
+            // restarts with each.
+            #[cfg(feature = "topic-discovery")]
+            if let Some(last) = request_call.count_topic_response(&response.body) {
+                if last {
+                    self.remove_expected_response(node_address.socket_addr);
+                } else {
+                    self.active_requests
+                        .insert(node_address.clone(), request_call);
+                }
+                if let Err(e) = self
+                    .service_send
+                    .send(HandlerOut::TopicResponse(
+                        node_address,
+                        Box::new(response),
+                        last,
+                    ))
+                    .await
+                {
+                    warn!(error = %e, "Failed to inform of response")
+                }
+                return;
+            }
             // The response matches a request
             // Check to see if this is a multi-message response (NODES and the topic
             // discovery responses), in which case we may require to wait for extra responses

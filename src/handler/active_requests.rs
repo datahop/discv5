@@ -24,12 +24,20 @@ impl ActiveRequests {
     /// Insert a new request into the active requests mapping.
     pub fn insert(&mut self, node_address: NodeAddress, request_call: RequestCall) {
         let nonce = *request_call.packet().message_nonce();
+        let timeout = request_call.response_timeout();
         self.active_requests_mapping
             .entry(node_address.clone())
             .or_default()
             .push(request_call);
-        self.active_requests_nonce_mapping
-            .insert(nonce, node_address);
+        match timeout {
+            Some(timeout) => {
+                self.active_requests_nonce_mapping
+                    .insert_at(nonce, node_address, timeout)
+            }
+            None => self
+                .active_requests_nonce_mapping
+                .insert(nonce, node_address),
+        }
     }
 
     /// Update the underlying packet for the request via message nonce.

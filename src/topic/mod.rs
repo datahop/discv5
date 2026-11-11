@@ -39,16 +39,33 @@ pub fn topic_id(service: &str) -> TopicId {
     Sha256::digest(service.as_bytes()).into()
 }
 
+/// The outcome of one REGTOPIC, from its REGCONFIRMATION.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegConfirmation {
+    /// The registrar stores the advertisement for `lifetime`, as announced.
+    Admitted { lifetime: Duration },
+    /// Not admitted yet: retry with `ticket` after `wait`.
+    Ticket { ticket: Vec<u8>, wait: Duration },
+    /// The registrar rejected the request.
+    Rejected,
+}
+
+impl RegConfirmation {
+    /// Reads the `ticket` and `wait-time` of a REGCONFIRMATION.
+    pub fn from_wire(ticket: Vec<u8>, wait_time_ms: u64) -> Self {
+        let wait = Duration::from_millis(wait_time_ms);
+        match (ticket.is_empty(), wait_time_ms) {
+            (false, _) => RegConfirmation::Ticket { ticket, wait },
+            (true, 0) => RegConfirmation::Rejected,
+            (true, _) => RegConfirmation::Admitted { lifetime: wait },
+        }
+    }
+}
+
 /// The answer of a registrar to one REGTOPIC request.
 #[derive(Debug, Clone)]
-pub struct RegConfirmation {
-    /// The registrar stores the advertisement.
-    pub admitted: bool,
-    /// The ticket to send with the next attempt. Empty when admitted.
-    pub ticket: Vec<u8>,
-    /// How long to wait before the next attempt, or the advertisement lifetime when
-    /// admitted.
-    pub wait_time: Duration,
+pub struct RegTopicResult {
+    pub confirmation: RegConfirmation,
     /// Registrars near the topic that the registrar knows.
     pub aux: Vec<Enr>,
 }
@@ -60,6 +77,9 @@ pub struct TopicQueryResult {
     pub advertisers: Vec<Enr>,
     /// Registrars near the topic that the registrar knows.
     pub aux: Vec<Enr>,
+    /// All announced packets arrived, up to `QUERY_RESP_LIMIT`. A partial response
+    /// ended early: at the packet cap, a timeout or an error after a valid record.
+    pub complete: bool,
 }
 
 /// What the registration and search tables need to know about a node.

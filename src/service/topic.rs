@@ -11,8 +11,8 @@ use crate::{
     node_info::{NodeAddress, NodeContact},
     rpc::{RegTopicEnr, RequestBody, RequestId, Response, ResponseBody},
     topic::{
-        RegConfirmation, Registration, Search, SearchFilter, Ticket, TicketTiming, TopicId,
-        TopicQueryResult,
+        RegConfirmation, RegTopicResult, Registration, Search, SearchFilter, Ticket, TicketTiming,
+        TopicId, TopicQueryResult,
         netutil::{
             check_regtopic_record_ip, check_relay_addr, preferred_ip, preferred_udp_port, unmap,
         },
@@ -152,18 +152,16 @@ impl TopicSearch {
     fn apply_response(
         pass: &mut Search,
         from: &Enr,
-        response: TopicResponse,
-        failed: bool,
+        result: Result<TopicQueryResult, RequestError>,
         now: Instant,
     ) {
-        if failed && response.aux.is_empty() && response.advertisers.is_empty() {
+        let Ok(result) = result else {
             pass.handle_error_response(&from.node_id());
             return;
-        }
-        // Nodes that arrived before an error count: the registrar is kept.
+        };
         let from_id = from.node_id();
-        pass.add_nodes(Some(&from_id), capable(response.aux), now);
-        pass.add_query_results(from, capable(response.advertisers), now);
+        pass.add_nodes(Some(&from_id), capable(result.aux), now);
+        pass.add_query_results(from, capable(result.advertisers), now);
     }
 }
 
@@ -442,7 +440,7 @@ impl Service {
         topic: TopicId,
         ticket: Vec<u8>,
         buckets: Vec<u64>,
-        callback: oneshot::Sender<Result<RegConfirmation, RequestError>>,
+        callback: oneshot::Sender<Result<RegTopicResult, RequestError>>,
     ) {
         let request_body = RequestBody::RegTopic {
             topic,
@@ -494,83 +492,86 @@ impl Service {
         true
     }
 
-    /// Collects one message of the response to a topic request. The request is over
-    /// when the announced number of messages, capped, has arrived and, for REGTOPIC, the
-    /// REGCONFIRMATION is among them.
+    /// Collects one packet of the response to a topic request. The handler counts the
+    /// packets and tells when the request is over (`last`). Packets of a kind that does
+    /// not answer the request are counted there and ignored here.
     pub(super) fn handle_topic_response(
         &mut self,
         node_address: NodeAddress,
-        id: RequestId,
-        active_request: ActiveRequest,
-        body: ResponseBody,
+        response: Response,
+        last: bool,
     ) {
-        let is_regtopic = matches!(active_request.request_body, RequestBody::RegTopic { .. });
-        // The cap on the messages and on the records of each kind.
-        let limit = if is_regtopic {
-            REG_RESP_LIMIT
-        } else {
-            QUERY_RESP_LIMIT
+        let id = response.id.clone();
+        let Some(active_request) = self.active_requests.remove(&id) else {
+            warn!(%id, "Received an RPC response which doesn't match a request");
+            return;
+        };
+        if active_request.contact.node_address() != node_address {
+            warn!(%node_address, "Topic response from an unexpected address");
+            self.active_requests.insert(id, active_request);
+            return;
+        }
+        let aux_limit = match active_request.request_body {
+            RequestBody::RegTopic { .. } => REG_RESP_LIMIT,
+            _ => QUERY_RESP_LIMIT,
         };
         let sender = node_address.socket_addr.ip();
-        let mut response = self.topics.responses.remove(&id).unwrap_or_default();
+        let mut collected = self.topics.responses.remove(&id).unwrap_or_default();
 
-        let total = body.total().unwrap_or(1);
-        let announced = *response.announced.get_or_insert(total);
-        response.received += 1;
-        // The handler forwards no further message after the announced number, or after
-        // a message that announces a single one.
-        let last_message = total <= 1 || response.received >= announced;
-        match body {
-            ResponseBody::RegConfirmation {
-                ticket, wait_time, ..
-            } => {
-                METRICS
-                    .topic
-                    .regconfirmation_recv
-                    .fetch_add(1, Ordering::Relaxed);
-                response.confirmation = Some((ticket, wait_time));
-            }
-            ResponseBody::Nodes { nodes, .. } => {
-                for enr in nodes {
-                    if response.aux.len() >= limit {
-                        break;
-                    }
-                    if verify_response_node(sender, &enr, &mut response.aux_seen) {
-                        response.aux.push(enr);
+        let answers = response.match_request(&active_request.request_body);
+        let body = response.body;
+        if answers {
+            collected.announced.get_or_insert(body.total().unwrap_or(1));
+            collected.received += 1;
+            match body {
+                ResponseBody::RegConfirmation {
+                    ticket, wait_time, ..
+                } => {
+                    METRICS
+                        .topic
+                        .regconfirmation_recv
+                        .fetch_add(1, Ordering::Relaxed);
+                    collected.confirmation = Some((ticket, wait_time));
+                }
+                ResponseBody::Nodes { nodes, .. } => {
+                    for enr in nodes {
+                        if collected.aux.len() >= aux_limit {
+                            break;
+                        }
+                        if verify_response_node(sender, &enr, &mut collected.aux_seen) {
+                            collected.aux.push(enr);
+                        }
                     }
                 }
-            }
-            ResponseBody::TopicNodes { nodes, .. } => {
-                METRICS
-                    .topic
-                    .topicnodes_recv
-                    .fetch_add(1, Ordering::Relaxed);
-                for enr in nodes {
-                    if response.advertisers.len() >= limit {
-                        break;
-                    }
-                    if verify_response_node(sender, &enr, &mut response.advertisers_seen) {
-                        response.advertisers.push(enr);
+                ResponseBody::TopicNodes { nodes, .. } => {
+                    METRICS
+                        .topic
+                        .topicnodes_recv
+                        .fetch_add(1, Ordering::Relaxed);
+                    for enr in nodes {
+                        if collected.advertisers.len() >= F_RETURN {
+                            break;
+                        }
+                        if verify_response_node(sender, &enr, &mut collected.advertisers_seen) {
+                            collected.advertisers.push(enr);
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
+        } else {
+            debug!(%node_address, response = %body, "Wrong kind of response to a topic request");
         }
 
-        let confirmed = !is_regtopic || response.confirmation.is_some();
-        if confirmed && response.received >= announced.min(limit as u64) {
-            self.topic_request_done(active_request, response, None);
-        } else if last_message {
-            let error = RequestError::InvalidRemotePacket;
-            self.topic_request_done(active_request, response, Some(error));
+        if last {
+            self.topic_request_done(active_request, collected, None);
         } else {
-            self.topics.responses.insert(id.clone(), response);
+            self.topics.responses.insert(id.clone(), collected);
             self.active_requests.insert(id, active_request);
         }
     }
 
-    /// A topic request failed. The messages that arrived before go to the requester
-    /// with the error.
+    /// A topic request failed. The packets that arrived before count.
     pub(super) fn topic_request_failed(
         &mut self,
         id: RequestId,
@@ -588,47 +589,37 @@ impl Service {
         error: Option<RequestError>,
     ) {
         let from = active_request.contact.node_id();
+        // Only a timeout before the REGCONFIRMATION, or before any valid record of a
+        // TOPICQUERY, is a liveness failure. A rejection is an answer.
+        let answered = match active_request.request_body {
+            RequestBody::RegTopic { .. } => response.confirmation.is_some(),
+            _ => !response.aux.is_empty() || !response.advertisers.is_empty(),
+        };
+        if matches!(error, Some(RequestError::Timeout)) && !answered {
+            self.connection_updated(from, ConnectionStatus::Disconnected);
+        }
         match active_request.callback {
             Some(CallbackResponse::RegConfirmation(callback)) => {
-                let result = match (error, response.confirmation) {
-                    (Some(error), _) => Err(error),
-                    (None, Some((ticket, wait_time))) => Ok(RegConfirmation {
-                        admitted: ticket.is_empty(),
-                        ticket,
-                        wait_time: Duration::from_millis(wait_time),
+                let result =
+                    reg_outcome(response.confirmation, error).map(|confirmation| RegTopicResult {
+                        confirmation,
                         aux: response.aux,
-                    }),
-                    (None, None) => Err(RequestError::InvalidRemotePacket),
-                };
+                    });
                 if callback.send(result).is_err() {
                     debug!("Couldn't send the REGTOPIC response to the user");
                 }
             }
             Some(CallbackResponse::TopicNodes(callback)) => {
-                let result = match error {
-                    Some(error) => Err(error),
-                    None => Ok(TopicQueryResult {
-                        advertisers: response.advertisers,
-                        aux: response.aux,
-                    }),
-                };
-                if callback.send(result).is_err() {
+                if callback.send(query_outcome(response, error)).is_err() {
                     debug!("Couldn't send the TOPICQUERY response to the user");
                 }
             }
             Some(CallbackResponse::TopicRegistration(topic, id)) => {
-                if error.is_some() {
-                    self.connection_updated(from, ConnectionStatus::Disconnected);
-                }
-                self.registration_response(topic, id, from, response, error);
+                let result = reg_outcome(response.confirmation, error);
+                self.registration_response(topic, id, from, response.aux, result);
             }
             Some(CallbackResponse::TopicSearch(id)) => {
-                // A registrar that sent nodes before the error counts as responsive.
-                let silent = response.aux.is_empty() && response.advertisers.is_empty();
-                if error.is_some() && silent {
-                    self.connection_updated(from, ConnectionStatus::Disconnected);
-                }
-                self.search_response(id, from, response, error);
+                self.search_response(id, from, query_outcome(response, error));
             }
             _ => {}
         }
@@ -819,8 +810,8 @@ impl Service {
         topic: TopicId,
         id: u64,
         from: NodeId,
-        response: TopicResponse,
-        error: Option<RequestError>,
+        aux: Vec<Enr>,
+        result: Result<RegConfirmation, RequestError>,
     ) {
         let now = Instant::now();
         let Some(reg) = self.topics.registrations.get_mut(&topic) else {
@@ -831,25 +822,26 @@ impl Service {
         }
         reg.in_flight = None;
 
-        let aux: Vec<Enr> = capable(response.aux).collect();
+        let aux: Vec<Enr> = capable(aux).collect();
         if !aux.is_empty() {
             reg.table.add_nodes(Some(&from), aux, now);
         }
         let mut registered = false;
-        match (error, response.confirmation) {
-            (None, Some((ticket, wait_time))) => {
-                let wait_time = Duration::from_millis(wait_time);
-                if ticket.is_empty() {
-                    debug!(%from, topic = %hex::encode(topic), lifetime_ms = wait_time.as_millis(), "Topic registration admitted");
-                    reg.table.handle_registered(&from, wait_time, now);
-                    registered = true;
-                } else {
-                    debug!(%from, topic = %hex::encode(topic), wait_ms = wait_time.as_millis(), "Topic registration ticket");
-                    reg.table
-                        .handle_ticket_response(&from, ticket, wait_time, now);
-                }
+        match result {
+            Ok(RegConfirmation::Admitted { lifetime }) => {
+                debug!(%from, topic = %hex::encode(topic), lifetime_ms = lifetime.as_millis(), "Topic registration admitted");
+                reg.table.handle_registered(&from, lifetime, now);
+                registered = true;
             }
-            (error, _) => {
+            Ok(RegConfirmation::Ticket { ticket, wait }) => {
+                debug!(%from, topic = %hex::encode(topic), wait_ms = wait.as_millis(), "Topic registration ticket");
+                reg.table.handle_ticket_response(&from, ticket, wait, now);
+            }
+            Ok(RegConfirmation::Rejected) => {
+                debug!(%from, topic = %hex::encode(topic), "Topic registration rejected");
+                reg.table.handle_error_response(&from, now);
+            }
+            Err(error) => {
                 debug!(%from, ?error, "Topic registration failed");
                 reg.table.handle_error_response(&from, now);
             }
@@ -999,8 +991,7 @@ impl Service {
         &mut self,
         id: u64,
         from: NodeId,
-        response: TopicResponse,
-        error: Option<RequestError>,
+        result: Result<TopicQueryResult, RequestError>,
     ) {
         let now = Instant::now();
         let Some(search) = self.topics.searches.get_mut(&id) else {
@@ -1009,13 +1000,48 @@ impl Service {
         let Some(from) = search.in_flight.take_if(|node| node.node_id() == from) else {
             return;
         };
-        if let Some(error) = &error {
+        if let Err(error) = &result {
             debug!(from = %from.node_id(), ?error, "TOPICQUERY failed");
         }
         if let Some(pass) = &mut search.pass {
-            TopicSearch::apply_response(pass, &from, response, error.is_some(), now);
+            TopicSearch::apply_response(pass, &from, result, now);
         }
         self.search_step(id, now);
+    }
+}
+
+/// The outcome of a REGTOPIC: the REGCONFIRMATION, also when a timeout followed it.
+/// Without it, the request failed; at the packet cap that is not a timeout.
+fn reg_outcome(
+    confirmation: Option<(Vec<u8>, u64)>,
+    error: Option<RequestError>,
+) -> Result<RegConfirmation, RequestError> {
+    match (confirmation, error) {
+        (Some((ticket, wait_time)), None | Some(RequestError::Timeout)) => {
+            Ok(RegConfirmation::from_wire(ticket, wait_time))
+        }
+        (_, Some(error)) => Err(error),
+        (None, None) => Err(RequestError::InvalidRemotePacket),
+    }
+}
+
+/// The outcome of a TOPICQUERY. A response that ended before the capped `total`, at
+/// the packet cap or with an error after a valid record, is partial.
+fn query_outcome(
+    response: TopicResponse,
+    error: Option<RequestError>,
+) -> Result<TopicQueryResult, RequestError> {
+    let records = !response.aux.is_empty() || !response.advertisers.is_empty();
+    match error {
+        Some(error) if !records => Err(error),
+        _ => Ok(TopicQueryResult {
+            complete: error.is_none()
+                && response
+                    .announced
+                    .is_some_and(|total| response.received >= total.min(QUERY_RESP_LIMIT as u64)),
+            advertisers: response.advertisers,
+            aux: response.aux,
+        }),
     }
 }
 
@@ -1077,6 +1103,7 @@ mod tests {
         *,
     };
     use crate::{
+        handler::TopicRespCount,
         kbucket::{ConnectionDirection, ConnectionState, NodeStatus},
         rpc::Request,
         topic::{RegAttemptState, TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION, TopicConfig},
@@ -1158,13 +1185,32 @@ mod tests {
         None
     }
 
+    thread_local! {
+        /// The handler's packet counts of the requests answered through `respond`.
+        static COUNTS: std::cell::RefCell<HashMap<RequestId, TopicRespCount>> =
+            Default::default();
+    }
+
+    /// Delivers a response packet as the handler does, with the handler's end of the
+    /// request.
     fn respond(service: &mut Service, contact: &NodeContact, id: &RequestId, body: ResponseBody) {
-        service.handle_rpc_response(
+        let last = match service.active_requests.get(id) {
+            Some(request) => COUNTS.with(|counts| {
+                counts
+                    .borrow_mut()
+                    .entry(id.clone())
+                    .or_default()
+                    .count(&request.request_body, &body)
+            }),
+            None => true,
+        };
+        service.handle_topic_response(
             contact.node_address(),
             Response {
                 id: id.clone(),
                 body,
             },
+            last,
         );
     }
 
@@ -1233,9 +1279,13 @@ mod tests {
         respond(&mut service, &contact, &request.id, nodes(last));
 
         let confirmation = rx.try_recv().unwrap().unwrap();
-        assert!(!confirmation.admitted);
-        assert_eq!(confirmation.ticket, vec![1, 2]);
-        assert_eq!(confirmation.wait_time, Duration::from_millis(1500));
+        assert_eq!(
+            confirmation.confirmation,
+            RegConfirmation::Ticket {
+                ticket: vec![1, 2],
+                wait: Duration::from_millis(1500)
+            }
+        );
         assert_eq!(ids(&confirmation.aux), ids(&[a, b, wan, lan, c]));
         assert!(service.active_requests.is_empty());
         assert!(service.topics.responses.is_empty());
@@ -1272,7 +1322,12 @@ mod tests {
             );
         }
         let confirmation = rx.try_recv().unwrap().unwrap();
-        assert!(confirmation.admitted);
+        assert_eq!(
+            confirmation.confirmation,
+            RegConfirmation::Admitted {
+                lifetime: Duration::from_millis(5)
+            }
+        );
         assert_eq!(confirmation.aux.len(), 8);
 
         // TOPICQUERY: 16 messages, 16 records of each kind.
@@ -1292,6 +1347,7 @@ mod tests {
         let result = rx.try_recv().unwrap().unwrap();
         assert_eq!(result.aux.len(), 16);
         assert_eq!(result.advertisers.len(), 16);
+        assert!(result.complete);
     }
 
     // A single empty TOPICNODES ends a TOPICQUERY; a failure goes to the user.
@@ -1306,11 +1362,13 @@ mod tests {
         respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
         let result = rx.try_recv().unwrap().unwrap();
         assert!(result.advertisers.is_empty() && result.aux.is_empty());
+        assert!(result.complete);
 
+        // A timeout before any valid record fails the query.
         let (tx, mut rx) = oneshot::channel();
         service.request_topic_query(target.into(), TOPIC, vec![], tx);
         let (contact, request) = next_request(&mut handler).unwrap();
-        let nodes = vec![registrar(12102)];
+        let nodes = vec![record(Ipv4Addr::LOCALHOST, 1024, true)];
         respond(
             &mut service,
             &contact,
@@ -1322,10 +1380,25 @@ mod tests {
         assert!(service.topics.responses.is_empty());
     }
 
-    // A response that the handler has finished and that is not complete, or of the
-    // wrong kind, fails the request.
+    fn confirmation(total: u64, ticket: Vec<u8>, wait_time: u64) -> ResponseBody {
+        ResponseBody::RegConfirmation {
+            total,
+            ticket,
+            wait_time,
+        }
+    }
+
+    fn aux_nodes(total: u64, port: u16) -> ResponseBody {
+        ResponseBody::Nodes {
+            total,
+            nodes: vec![registrar(port)],
+        }
+    }
+
+    // A timeout after the REGCONFIRMATION keeps it and the ENRs that arrived; a timeout
+    // before it fails the attempt.
     #[tokio::test]
-    async fn incomplete_response_fails() {
+    async fn confirmation_kept_when_nodes_missing() {
         let target = registrar(12101);
         let (mut service, mut handler) = service(TopicConfig::default(), &[]);
         let mut request = |service: &mut Service| {
@@ -1334,57 +1407,173 @@ mod tests {
             let (contact, request) = next_request(&mut handler).unwrap();
             (contact, request.id, rx)
         };
-        let invalid = Err(RequestError::InvalidRemotePacket);
 
-        // The only message is not the REGCONFIRMATION.
         let (contact, id, mut rx) = request(&mut service);
-        let nodes = vec![registrar(12102)];
-        respond(
-            &mut service,
-            &contact,
-            &id,
-            ResponseBody::Nodes { total: 1, nodes },
+        respond(&mut service, &contact, &id, aux_nodes(3, 12102));
+        respond(&mut service, &contact, &id, confirmation(3, vec![4], 2000));
+        assert!(rx.try_recv().is_err());
+        service.rpc_failure(id, RequestError::Timeout);
+        let result = rx.try_recv().unwrap().unwrap();
+        assert_eq!(
+            result.confirmation,
+            RegConfirmation::Ticket {
+                ticket: vec![4],
+                wait: Duration::from_secs(2)
+            }
         );
-        assert_eq!(rx.try_recv().unwrap().map(|_| ()), invalid);
+        assert_eq!(result.aux.len(), 1);
 
-        // All announced messages arrived, without the REGCONFIRMATION.
         let (contact, id, mut rx) = request(&mut service);
-        for _ in 0..2 {
-            assert!(rx.try_recv().is_err());
-            let nodes = vec![registrar(12102)];
-            respond(
-                &mut service,
-                &contact,
-                &id,
-                ResponseBody::Nodes { total: 2, nodes },
-            );
-        }
-        assert_eq!(rx.try_recv().unwrap().map(|_| ()), invalid);
-
-        // A later message announces a single one.
-        let (contact, id, mut rx) = request(&mut service);
-        let nodes = vec![registrar(12102)];
-        respond(
-            &mut service,
-            &contact,
-            &id,
-            ResponseBody::Nodes { total: 3, nodes },
-        );
-        let confirmation = ResponseBody::RegConfirmation {
-            total: 1,
-            ticket: vec![],
-            wait_time: 1,
-        };
-        respond(&mut service, &contact, &id, confirmation);
-        assert_eq!(rx.try_recv().unwrap().map(|_| ()), invalid);
-
-        // The wrong kind of message.
-        let (contact, id, mut rx) = request(&mut service);
-        respond(&mut service, &contact, &id, topic_nodes(vec![]));
-        assert_eq!(rx.try_recv().unwrap().map(|_| ()), invalid);
+        respond(&mut service, &contact, &id, aux_nodes(1, 12102));
+        assert!(rx.try_recv().is_err());
+        service.rpc_failure(id, RequestError::Timeout);
+        assert_eq!(rx.try_recv().unwrap().unwrap_err(), RequestError::Timeout);
 
         assert!(service.active_requests.is_empty());
         assert!(service.topics.responses.is_empty());
+    }
+
+    // The advertiser keeps waiting for the REGCONFIRMATION after the announced packets
+    // arrived, and gives up after REG_RESP_LIMIT packets of any kind without it.
+    #[tokio::test]
+    async fn reg_resp_limit_without_confirmation_fails() {
+        let target = registrar(12101);
+        let (mut service, mut handler) = service(TopicConfig::default(), &[]);
+        let (tx, mut rx) = oneshot::channel();
+        service.request_regtopic(target.into(), TOPIC, vec![], vec![], tx);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        for i in 0..REG_RESP_LIMIT as u16 {
+            assert!(rx.try_recv().is_err());
+            let body = if i % 2 == 0 {
+                aux_nodes(2, 12102 + i)
+            } else {
+                // The wrong kind counts toward the cap and is not fatal.
+                topic_nodes(vec![])
+            };
+            respond(&mut service, &contact, &request.id, body);
+        }
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err(),
+            RequestError::InvalidRemotePacket
+        );
+        assert!(service.active_requests.is_empty());
+        assert!(service.topics.responses.is_empty());
+    }
+
+    // The `total` of the first packet applies; later ones are ignored, both above and
+    // below it.
+    #[tokio::test]
+    async fn first_total_wins() {
+        let target = registrar(12101);
+        let (mut service, mut handler) = service(TopicConfig::default(), &[]);
+        let (tx, mut rx) = oneshot::channel();
+        service.request_regtopic(target.clone().into(), TOPIC, vec![], vec![], tx);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(&mut service, &contact, &request.id, aux_nodes(3, 12102));
+        respond(
+            &mut service,
+            &contact,
+            &request.id,
+            confirmation(1, vec![], 5),
+        );
+        assert!(rx.try_recv().is_err());
+        respond(&mut service, &contact, &request.id, aux_nodes(7, 12103));
+        let result = rx.try_recv().unwrap().unwrap();
+        assert!(matches!(
+            result.confirmation,
+            RegConfirmation::Admitted { .. }
+        ));
+        assert_eq!(result.aux.len(), 2);
+
+        let (tx, mut rx) = oneshot::channel();
+        service.request_topic_query(target.into(), TOPIC, vec![], tx);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        let body = ResponseBody::TopicNodes {
+            total: 2,
+            nodes: vec![registrar(12104)],
+        };
+        respond(&mut service, &contact, &request.id, body);
+        respond(&mut service, &contact, &request.id, aux_nodes(9, 12105));
+        let result = rx.try_recv().unwrap().unwrap();
+        assert!(result.complete);
+        assert_eq!((result.advertisers.len(), result.aux.len()), (1, 1));
+    }
+
+    // A TOPICQUERY ends after QUERY_RESP_LIMIT packets of any kind; short of the capped
+    // `total` the response is partial. A timeout after a valid record is partial too.
+    #[tokio::test]
+    async fn query_partial_response() {
+        let target = registrar(12101);
+        let (mut service, mut handler) = service(TopicConfig::default(), &[]);
+        let (tx, mut rx) = oneshot::channel();
+        service.request_topic_query(target.clone().into(), TOPIC, vec![], tx);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        for i in 0..QUERY_RESP_LIMIT as u16 {
+            assert!(rx.try_recv().is_err());
+            let body = if i < 4 {
+                ResponseBody::TopicNodes {
+                    total: 40,
+                    nodes: vec![registrar(13000 + i)],
+                }
+            } else {
+                confirmation(1, vec![], 1)
+            };
+            respond(&mut service, &contact, &request.id, body);
+        }
+        let result = rx.try_recv().unwrap().unwrap();
+        assert!(!result.complete);
+        assert_eq!(result.advertisers.len(), 4);
+
+        let (tx, mut rx) = oneshot::channel();
+        service.request_topic_query(target.into(), TOPIC, vec![], tx);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(&mut service, &contact, &request.id, aux_nodes(3, 12102));
+        service.rpc_failure(request.id, RequestError::Timeout);
+        let result = rx.try_recv().unwrap().unwrap();
+        assert!(!result.complete);
+        assert_eq!((result.advertisers.len(), result.aux.len()), (0, 1));
+        assert!(service.topics.responses.is_empty());
+    }
+
+    fn connected(service: &Service, enr: &Enr) -> bool {
+        let key = kbucket::Key::from(enr.node_id());
+        match service.kbuckets.write().entry(&key) {
+            kbucket::Entry::Present(_, status) => status.is_connected(),
+            _ => panic!("not in the table"),
+        }
+    }
+
+    // A rejection, a ticket and a partial answer are answers; only a timeout before the
+    // REGCONFIRMATION, or before any valid record of a TOPICQUERY, marks the node
+    // disconnected.
+    #[tokio::test]
+    async fn rejection_is_not_liveness_failure() {
+        let target = registrar(12101);
+        let (mut service, mut handler) =
+            service(TopicConfig::default(), std::slice::from_ref(&target));
+        let mut regtopic = |service: &mut Service| {
+            let (tx, rx) = oneshot::channel();
+            service.request_regtopic(target.clone().into(), TOPIC, vec![], vec![], tx);
+            let (contact, request) = next_request(&mut handler).unwrap();
+            (contact, request.id, rx)
+        };
+
+        let (contact, id, mut rx) = regtopic(&mut service);
+        respond(&mut service, &contact, &id, confirmation(1, vec![], 0));
+        let result = rx.try_recv().unwrap().unwrap();
+        assert_eq!(result.confirmation, RegConfirmation::Rejected);
+        assert!(connected(&service, &target));
+
+        let (contact, id, mut rx) = regtopic(&mut service);
+        respond(&mut service, &contact, &id, confirmation(2, vec![1], 1000));
+        service.rpc_failure(id, RequestError::Timeout);
+        assert!(rx.try_recv().unwrap().is_ok());
+        assert!(connected(&service, &target));
+
+        let (_, id, mut rx) = regtopic(&mut service);
+        service.rpc_failure(id, RequestError::Timeout);
+        assert!(rx.try_recv().unwrap().is_err());
+        assert!(!connected(&service, &target));
     }
 
     // The registration walk: ticket, wait, second request with the ticket, admission.

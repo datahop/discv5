@@ -827,7 +827,7 @@ async fn test_bucket_limits() {
 mod topic {
     use super::*;
     use crate::topic::{
-        TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION, TopicConfig, TopicId,
+        RegConfirmation, TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION, TopicConfig, TopicId,
         supports_topic_discovery,
     };
     use std::time::Duration;
@@ -1046,7 +1046,10 @@ mod topic {
             .send_regtopic(registrar, TOPIC, vec![], vec![])
             .await
             .unwrap();
-        assert!(confirmation.admitted);
+        assert!(matches!(
+            confirmation.confirmation,
+            RegConfirmation::Admitted { .. }
+        ));
         assert_eq!(nodes[1].local_topic_nodes(TOPIC).unwrap().len(), 1);
 
         assert!(nodes[1].remove_node(&advertiser));
@@ -1077,9 +1080,12 @@ mod topic {
             )
             .await
             .unwrap();
-        assert!(confirmation.admitted);
-        assert!(confirmation.ticket.is_empty());
-        assert_eq!(confirmation.wait_time, TopicConfig::default().ad_lifetime);
+        assert_eq!(
+            confirmation.confirmation,
+            RegConfirmation::Admitted {
+                lifetime: TopicConfig::default().ad_lifetime
+            }
+        );
         // The auxiliary nodes come from the routing table of the registrar, at most one
         // per distance.
         let registrar_id = nodes[1].local_enr().node_id();
@@ -1096,9 +1102,11 @@ mod topic {
             .send_regtopic(registrar.clone(), TOPIC, vec![], vec![])
             .await
             .unwrap();
-        assert!(!confirmation.admitted);
-        assert_eq!(confirmation.ticket.len(), crate::topic::TICKET_SIZE);
-        assert!(confirmation.wait_time > Duration::from_secs(40));
+        let RegConfirmation::Ticket { ticket, wait } = &confirmation.confirmation else {
+            panic!("expected a ticket, got {:?}", confirmation.confirmation);
+        };
+        assert_eq!(ticket.len(), crate::topic::TICKET_SIZE);
+        assert!(*wait > Duration::from_secs(40));
         assert!(confirmation.aux.is_empty());
 
         let result = nodes[3]
