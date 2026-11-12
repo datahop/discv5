@@ -159,7 +159,7 @@ pub(crate) fn preferred_udp_port(enr: &Enr) -> Option<u16> {
 }
 
 /// The first `bits` bits of an address, tagged with its family.
-fn prefix(ip: IpAddr, bits: u8) -> (bool, u128) {
+pub(crate) fn prefix(ip: IpAddr, bits: u8) -> (bool, u128) {
     match unmap(ip) {
         IpAddr::V4(v4) => {
             let bits = u32::from(bits.min(32));

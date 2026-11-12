@@ -11,8 +11,8 @@ use crate::{
     node_info::{NodeAddress, NodeContact},
     rpc::{RegTopicEnr, RequestBody, RequestId, Response, ResponseBody},
     topic::{
-        RegConfirmation, RegTopicResult, Registration, Search, SearchFilter, Ticket, TicketTiming,
-        TopicId, TopicQueryResult,
+        RegConfirmation, RegTopicResult, Registration, Search, SearchFilter, SearchSets, Ticket,
+        TicketTiming, TopicId, TopicQueryResult,
         netutil::{
             check_regtopic_record_ip, check_relay_addr, preferred_ip, preferred_udp_port, unmap,
         },
@@ -102,8 +102,9 @@ struct TopicSearch {
     found: Vec<Enr>,
     /// The advertisers returned by this search.
     result_filter: SearchFilter,
-    /// The registrars asked by the adaptive passes. Kept here between passes.
-    asked_filter: Option<SearchFilter>,
+    /// The asked, failed and admitted sets of the adaptive passes. Kept here between
+    /// passes.
+    sets: Option<SearchSets>,
     /// Where the last adaptive pass settled.
     active_bucket: usize,
     pass: Option<Search>,
@@ -150,12 +151,12 @@ impl TopicSearch {
         now: Instant,
     ) {
         let Ok(result) = result else {
-            pass.handle_error_response(&from.node_id());
+            pass.handle_error_response(&from.node_id(), now);
             return;
         };
         let from_id = from.node_id();
-        pass.add_nodes(Some(&from_id), capable(result.aux), now);
         pass.add_query_results(from, capable(result.advertisers), now);
+        pass.add_nodes(Some(&from_id), capable(result.aux), now);
     }
 }
 
@@ -856,7 +857,7 @@ impl Service {
                 callback,
                 found: Vec::new(),
                 result_filter: SearchFilter::new(&self.config.topic),
-                asked_filter: None,
+                sets: None,
                 active_bucket: 0,
                 pass: None,
                 seeded_at: None,
@@ -898,8 +899,8 @@ impl Service {
                     let local_id = self.local_enr.read().node_id();
                     let mut pass = Search::new(search.topic, local_id, self.config.topic.clone());
                     pass.set_active_bucket(search.active_bucket);
-                    if let Some(filter) = search.asked_filter.take() {
-                        pass.set_asked_filter(filter);
+                    if let Some(sets) = search.sets.take() {
+                        pass.set_sets(sets);
                     }
                     pass.add_nodes(None, nodes, now);
                     search.pass.insert(pass)
@@ -929,14 +930,17 @@ impl Service {
                     "Topic search rollover",
                 );
                 search.active_bucket = pass.active_bucket();
-                search.asked_filter = search.pass.take().map(Search::into_asked_filter);
+                search.sets = search.pass.take().map(Search::into_sets);
                 search.gap = search.pass_gap(search.pass_results);
                 continue;
             }
 
-            if search.in_flight.is_none()
-                && let Some(target) = pass.query_target()
-            {
+            if search.in_flight.is_none() {
+                // Without a target the pass is done: the selection dropped the last
+                // candidates over the subnet limit.
+                let Some(target) = pass.query_target(now) else {
+                    continue;
+                };
                 let request_body = RequestBody::TopicQuery {
                     topic: search.topic,
                     buckets: pass.buckets_with_free_space(),
@@ -945,7 +949,7 @@ impl Service {
                 if self.send_topic_request(target.clone(), request_body, callback) {
                     search.in_flight = Some(target);
                 } else {
-                    pass.handle_error_response(&target.node_id());
+                    pass.handle_error_response(&target.node_id(), now);
                     continue;
                 }
             }
@@ -2038,6 +2042,33 @@ mod tests {
         assert!(next_request(&mut handler).is_none());
     }
 
+    // The answering registrar leaves its bucket before its aux nodes are added: a full
+    // bucket takes an aux node in its place.
+    #[tokio::test]
+    async fn search_aux_node_takes_answered_slot() {
+        let first = far_registrar(12101);
+        let aux = far_registrar(12110);
+        let config = TopicConfig {
+            search_bucket_size: 1,
+            ..Default::default()
+        };
+        let (mut service, mut handler) = service(config, std::slice::from_ref(&first));
+        let (tx, _rx) = oneshot::channel();
+        service.start_topic_search(TOPIC, 1, tx);
+
+        let (contact, request) = next_request(&mut handler).unwrap();
+        assert_eq!(contact.node_id(), first.node_id());
+        let nodes = vec![aux.clone()];
+        respond(
+            &mut service,
+            &contact,
+            &request.id,
+            ResponseBody::Nodes { total: 1, nodes },
+        );
+        let (contact, _) = next_request(&mut handler).expect("aux node not queried");
+        assert_eq!(contact.node_id(), aux.node_id());
+    }
+
     // Auxiliary nodes join the pass. A registrar that fails after it sent nodes is
     // kept, one that sent nothing is dropped from the pass.
     #[tokio::test]
@@ -2120,9 +2151,9 @@ mod tests {
             assert!(search.active_bucket > 0);
             assert!(
                 search
-                    .asked_filter
+                    .sets
                     .as_ref()
-                    .is_some_and(|f| f.len() == asked.len())
+                    .is_some_and(|sets| sets.asked_len() == asked.len())
             );
             if asked.len() < registrars.len() {
                 let next_pass = service.topic_next_wakeup().unwrap();

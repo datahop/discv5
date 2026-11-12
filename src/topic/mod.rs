@@ -12,6 +12,7 @@ use crate::Enr;
 use enr::NodeId;
 use std::{net::IpAddr, time::Duration};
 
+mod admittedset;
 mod askedset;
 mod bound;
 mod config;
@@ -26,7 +27,7 @@ mod ticket;
 
 pub use config::TopicConfig;
 pub use registration::{RegAttempt, RegAttemptState, Registration};
-pub use search::Search;
+pub use search::{Search, SearchSets};
 pub use searchfilter::SearchFilter;
 pub use table::TopicTable;
 pub use ticket::{TICKET_SIZE, Ticket, TicketError, TicketSealer, TicketTiming, UsedTickets};

@@ -1,5 +1,5 @@
 //! A set of nodes kept for a fixed time from their first addition: the failed and
-//! overloaded sets of the advertiser.
+//! overloaded sets of the advertiser, the asked and failed sets of the discoverer.
 
 use enr::NodeId;
 use std::{
@@ -8,14 +8,19 @@ use std::{
 };
 
 /// Remembers nodes for `ttl` from the first add. Adding a node again does not extend
-/// its expiry.
+/// its expiry, it only records the time of the last add.
 #[derive(Debug, Clone)]
 pub struct AskedSet {
     ttl: Duration,
-    /// The time of the first add.
-    at: HashMap<NodeId, Instant>,
+    at: HashMap<NodeId, Asked>,
     /// When `expire` last ran.
     expired: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct Asked {
+    first: Instant,
+    last: Instant,
 }
 
 impl AskedSet {
@@ -36,7 +41,24 @@ impl AskedSet {
     /// Records `id`. The first add sets the expiry.
     pub fn add(&mut self, id: NodeId, now: Instant) {
         self.expire(now);
-        self.at.entry(id).or_insert(now);
+        self.at
+            .entry(id)
+            .and_modify(|e| e.last = now)
+            .or_insert(Asked {
+                first: now,
+                last: now,
+            });
+    }
+
+    /// When `id` was last added, if it is in the set.
+    pub fn last_asked(&mut self, id: &NodeId, now: Instant) -> Option<Instant> {
+        self.expire(now);
+        self.at.get(id).map(|e| e.last)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.at.len()
     }
 
     /// Drops the entries past the ttl, at most once a second.
@@ -50,7 +72,7 @@ impl AskedSet {
         self.expired = Some(now);
         let ttl = self.ttl;
         self.at
-            .retain(|_, first| now.saturating_duration_since(*first) < ttl);
+            .retain(|_, e| now.saturating_duration_since(e.first) < ttl);
     }
 }
 
@@ -68,6 +90,8 @@ mod tests {
         let now = start + Duration::from_secs(40);
         a.add(id, now);
         assert!(a.has(&id, now));
+        assert_eq!(a.last_asked(&id, now), Some(now));
         assert!(!a.has(&id, now + Duration::from_secs(21)));
+        assert_eq!(a.last_asked(&id, now + Duration::from_secs(21)), None);
     }
 }
