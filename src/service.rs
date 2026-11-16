@@ -201,9 +201,9 @@ pub(crate) enum ServiceRequest {
     /// Stop to advertise the local node for a topic.
     #[cfg(feature = "topic-discovery")]
     StopTopic(TopicId),
-    /// Search for the given number of advertisers of a topic.
+    /// Search for advertisers of a topic, delivered to the sender until it is closed.
     #[cfg(feature = "topic-discovery")]
-    TopicSearch(TopicId, usize, oneshot::Sender<Vec<Enr>>),
+    TopicSearch(TopicId, mpsc::Sender<Enr>),
 }
 
 use crate::discv5::PERMIT_BAN_LIST;
@@ -335,6 +335,7 @@ impl Service {
         kbuckets: Arc<RwLock<KBucketsTable<NodeId, Enr>>>,
         config: Config,
         #[cfg(feature = "topic-discovery")] topic_table: Option<Arc<RwLock<TopicTable>>>,
+        #[cfg(feature = "topic-discovery")] topic_reads: Arc<tokio::sync::Notify>,
     ) -> Result<(oneshot::Sender<()>, mpsc::Sender<ServiceRequest>), std::io::Error> {
         // process behaviour-level configuration parameters
         let ip_votes = if config.enr_update {
@@ -387,7 +388,7 @@ impl Service {
                     #[cfg(feature = "topic-discovery")]
                     topic_table,
                     #[cfg(feature = "topic-discovery")]
-                    topics: Default::default(),
+                    topics: topic::TopicSystem::new(topic_reads),
                     config: config.clone(),
                     ip_mode,
                     connectivity_state,
@@ -406,6 +407,7 @@ impl Service {
             #[cfg(feature = "topic-discovery")]
             self.topic_table_changes();
             let topic_wakeup = self.topic_wakeup();
+            let topic_reads = self.topic_reads();
             tokio::select! {
                 _ = &mut self.exit => {
                     if let Some(exit) = self.handler_exit.take() {
@@ -458,8 +460,8 @@ impl Service {
                         #[cfg(feature = "topic-discovery")]
                         ServiceRequest::StopTopic(topic) => self.stop_topic_registration(topic),
                         #[cfg(feature = "topic-discovery")]
-                        ServiceRequest::TopicSearch(topic, count, callback) => {
-                            self.start_topic_search(topic, count, callback);
+                        ServiceRequest::TopicSearch(topic, results) => {
+                            self.start_topic_search(topic, results);
                         }
                     }
                 }
@@ -523,9 +525,15 @@ impl Service {
                 event = Service::bucket_maintenance_poll(&self.kbuckets) => {
                     self.send_event(event);
                 }
-                _ = Service::topic_wakeup_poll(topic_wakeup) => {
+                read = Service::topic_wakeup_poll(topic_wakeup, topic_reads) => {
                     #[cfg(feature = "topic-discovery")]
-                    self.topic_tick();
+                    if read {
+                        self.topic_searches_read();
+                    } else {
+                        self.topic_tick();
+                    }
+                    #[cfg(not(feature = "topic-discovery"))]
+                    let _ = read;
                 }
                 query_event = Service::query_event_poll(&mut self.queries) => {
                     match query_event {
@@ -1816,13 +1824,41 @@ impl Service {
         }
     }
 
-    /// A future that resolves at the given time, or never without one. It is rebuilt on
-    /// every iteration of the main loop, so a new earlier time is picked up.
-    async fn topic_wakeup_poll(wakeup: Option<Instant>) {
-        match wakeup {
-            #[cfg(feature = "topic-discovery")]
-            Some(at) => tokio::time::sleep_until(at.into()).await,
-            _ => future::pending().await,
+    /// What wakes the topic system up when a search caller reads.
+    fn topic_reads(&self) -> Option<Arc<tokio::sync::Notify>> {
+        #[cfg(feature = "topic-discovery")]
+        {
+            Some(self.topics.reads.clone())
+        }
+        #[cfg(not(feature = "topic-discovery"))]
+        {
+            None
+        }
+    }
+
+    /// A future that resolves at the given time, or never without one, or with `true`
+    /// once a search caller read results. It is rebuilt on every iteration of the main
+    /// loop, so a new earlier time is picked up.
+    async fn topic_wakeup_poll(
+        wakeup: Option<Instant>,
+        reads: Option<Arc<tokio::sync::Notify>>,
+    ) -> bool {
+        let timer = async {
+            match wakeup {
+                #[cfg(feature = "topic-discovery")]
+                Some(at) => tokio::time::sleep_until(at.into()).await,
+                _ => future::pending().await,
+            }
+        };
+        let read = async {
+            match &reads {
+                Some(reads) => reads.notified().await,
+                None => future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = timer => false,
+            _ = read => true,
         }
     }
 

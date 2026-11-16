@@ -61,6 +61,12 @@ pub const SEARCH_PASS_BACKOFF: Duration = Duration::from_secs(60);
 pub const SEARCH_MIX_REGISTRARS: usize = 10;
 /// Release threshold: wait of the first queued result. Theory: Parameters, Result Delivery.
 pub const SEARCH_MIX_WAIT: Duration = Duration::from_secs(5);
+/// Capacity of a lookup's result filter, a bounded capacity in Result Delivery. geth's
+/// `searchFilterLimit`.
+pub const SEARCH_FILTER_LIMIT: usize = 50_000;
+/// Released results that may wait unread before a lookup stops querying, the local
+/// limit of Result Delivery. geth's `searchUnreadLimit`.
+pub const SEARCH_UNREAD_LIMIT: usize = 16;
 /// Topic-distances a registrar serves with auxiliary ENRs. Theory: Auxiliary ENR Selection.
 pub const AUX_ENR_LIMIT: usize = 8;
 /// How long a registrar remembers a credited ticket, `DELTA + EPSILON`. Theory: Tickets.
@@ -118,6 +124,8 @@ mod tests {
         assert_eq!(SEARCH_PASS_BACKOFF, sec(60));
         assert_eq!(SEARCH_MIX_REGISTRARS, 10);
         assert_eq!(SEARCH_MIX_WAIT, sec(5));
+        assert_eq!(SEARCH_FILTER_LIMIT, 50_000);
+        assert_eq!(SEARCH_UNREAD_LIMIT, 16);
         assert_eq!(AUX_ENR_LIMIT, 8);
         assert_eq!(USED_TICKET_TTL, DELTA + EPSILON);
         assert_eq!(USED_TICKET_LIMIT, 16_384);

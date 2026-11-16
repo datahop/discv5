@@ -420,17 +420,26 @@ impl<N: TopicNode> Search<N> {
         }
         self.sets.asked.add(from_id, now);
         self.remove_node(&from_id, true);
+        // The results may come from several registrars when the filter mixes them, so
+        // they are not attributed to `from`.
+        self.add_results(results);
+    }
 
+    /// Buffers results to hand out, except the local node and nodes that already were
+    /// results of this pass. A newer record of a node is left for the next pass.
+    pub fn add_results(&mut self, results: impl IntoIterator<Item = N>) {
         for n in results {
             let id = n.node_id();
-            if id == self.local_id {
-                continue;
-            }
-            if self.result_seen.insert(id) {
-                debug!(topic = %hex::encode(self.topic), from = %from_id, %id, "Added topic search result");
+            if id != self.local_id && self.result_seen.insert(id) {
+                debug!(topic = %hex::encode(self.topic), %id, "Added topic search result");
                 self.result_buffer.push_back(n);
             }
         }
+    }
+
+    /// The number of results waiting to be handed out.
+    pub fn buffered(&self) -> usize {
+        self.result_buffer.len()
     }
 
     /// The next result, if there is one.

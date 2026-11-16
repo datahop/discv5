@@ -2,8 +2,8 @@
 //! ENRs, keeps an advertisement for one topic alive and/or searches it, and serves its
 //! state as JSON on a status port.
 //!
-//! Every `TopicRegistered` and `TopicNodesFound` event, and the end of every search, is
-//! one JSON line on stdout. Logs go to stderr (`RUST_LOG`).
+//! Every `TopicRegistered` event, every search result, and every `--search` results
+//! read, is one JSON line on stdout. Logs go to stderr (`RUST_LOG`).
 //!
 //! ```sh
 //! cargo run --features topic-discovery --example topdisc_node -- \
@@ -14,6 +14,7 @@
 use clap::Parser;
 use discv5::{ConfigBuilder, Discv5, Enr, Event, ListenConfig, topic::TopicConfig};
 use enr::{CombinedKey, NodeId, k256};
+use futures::StreamExt;
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -58,13 +59,14 @@ struct Args {
     /// Seconds to wait after start before registering.
     #[clap(long, default_value_t = 0)]
     register_after: u64,
-    /// Search the topic for this many advertisers, again and again.
+    /// Search the topic with one lookup that runs until shutdown. Every this many
+    /// results read count as one search done.
     #[clap(long)]
     search: Option<usize>,
     /// Ad lifetime in seconds.
     #[clap(long, default_value_t = 900)]
     ad_lifetime: u64,
-    /// How long one search runs at most, in seconds.
+    /// Query timeout in seconds.
     #[clap(long, default_value_t = 60)]
     search_timeout: u64,
     /// TCP port of the status server.
@@ -263,23 +265,6 @@ async fn main() {
                             hex_id(&registrar)
                         );
                     }
-                    Event::TopicNodesFound { topic, nodes } => {
-                        let t = unix_ms();
-                        let mut st = state.lock().unwrap();
-                        let ids: Vec<[u8; 32]> = nodes.iter().map(|n| n.node_id().raw()).collect();
-                        let mut new = Vec::new();
-                        for id in &ids {
-                            if st.advertisers.insert(*id, t).is_none() {
-                                new.push(*id);
-                            }
-                        }
-                        println!(
-                            "{{\"t\":{t},\"event\":\"found\",\"topic\":\"{}\",\"nodes\":{},\"new\":{}}}",
-                            hex::encode(topic),
-                            json_ids(ids.iter()),
-                            json_ids(new.iter())
-                        );
-                    }
                     _ => {}
                 }
             }
@@ -303,25 +288,49 @@ async fn main() {
     if let Some(count) = args.search {
         let discv5 = discv5.clone();
         let state = state.clone();
+        let count = count.max(1);
         tokio::spawn(async move {
             loop {
-                let t0 = Instant::now();
-                let result = discv5.topic_search(topic, count).await;
-                let t = unix_ms();
-                let n = result.as_ref().map(Vec::len).unwrap_or(0);
-                let mut st = state.lock().unwrap();
-                st.searches_done += 1;
-                let total = st.advertisers.len();
-                drop(st);
-                println!(
-                    "{{\"t\":{t},\"event\":\"search_end\",\"topic\":\"{}\",\"results\":{n},\"ms\":{},\"distinct_total\":{total},\"err\":{}}}",
-                    hex::encode(topic),
-                    t0.elapsed().as_millis(),
-                    match &result {
-                        Ok(_) => "null".to_string(),
-                        Err(e) => format!("\"{e:?}\""),
+                let mut stream = match discv5.topic_search_stream(topic) {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!(error = ?e, "Topic search not started");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
-                );
+                };
+                let mut t0 = Instant::now();
+                let mut n = 0;
+                while let Some(enr) = stream.next().await {
+                    let t = unix_ms();
+                    let id = enr.node_id().raw();
+                    let mut st = state.lock().unwrap();
+                    let new = st.advertisers.insert(id, t).is_none();
+                    n += 1;
+                    let done = n % count == 0;
+                    if done {
+                        st.searches_done += 1;
+                    }
+                    let total = st.advertisers.len();
+                    drop(st);
+                    let new_ids = if new { vec![id] } else { vec![] };
+                    println!(
+                        "{{\"t\":{t},\"event\":\"found\",\"topic\":\"{}\",\"nodes\":{},\"new\":{}}}",
+                        hex::encode(topic),
+                        json_ids([id].iter()),
+                        json_ids(new_ids.iter())
+                    );
+                    if done {
+                        println!(
+                            "{{\"t\":{t},\"event\":\"search_end\",\"topic\":\"{}\",\"results\":{count},\"ms\":{},\"distinct_total\":{total},\"err\":null}}",
+                            hex::encode(topic),
+                            t0.elapsed().as_millis(),
+                        );
+                        t0 = Instant::now();
+                    }
+                }
+                warn!("Topic search stream ended");
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }

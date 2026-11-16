@@ -944,26 +944,12 @@ mod topic {
         assert_eq!(registrars.len(), 4);
         assert!(!registrars.contains(&ids[1]));
 
-        let mut found_events = nodes[2].event_stream().await.unwrap();
         let found = nodes[2].topic_search(TOPIC, 2).await.unwrap();
         assert_eq!(
             sorted_ids(&found),
             sorted_ids(&[nodes[0].local_enr(), nodes[1].local_enr()])
         );
         assert!(found.iter().all(supports_topic_discovery));
-
-        let mut reported = Vec::new();
-        while reported.len() < 2 {
-            let event = tokio::time::timeout(Duration::from_secs(5), found_events.recv())
-                .await
-                .expect("no search event")
-                .unwrap();
-            if let Event::TopicNodesFound { topic, nodes } = event {
-                assert_eq!(topic, TOPIC);
-                reported.extend(nodes);
-            }
-        }
-        assert_eq!(sorted_ids(&reported), sorted_ids(&found));
 
         nodes[0].stop_topic_registration(TOPIC).unwrap();
         nodes[0].stop_topic_registration(TOPIC).unwrap();
@@ -1032,6 +1018,48 @@ mod topic {
         assert!(started.elapsed() < Duration::from_secs(6));
 
         assert!(nodes[0].topic_search(TOPIC, 0).await.unwrap().is_empty());
+    }
+
+    // A search stream delivers each advertiser once, pass after pass: an advertiser
+    // that registers after the first results comes in a later pass, the earlier ones
+    // are not delivered again.
+    #[tokio::test]
+    async fn search_stream_finds_advertisers() {
+        use futures::StreamExt;
+        init();
+        let config = TopicConfig {
+            ad_lifetime: Duration::from_secs(30),
+            ..Default::default()
+        };
+        // Nodes 0 and 1 advertise first, node 2 later; node 5 searches.
+        let nodes = start_topic_nodes(ephemeral_ports(6), config).await;
+        let ids: Vec<NodeId> = nodes.iter().map(|n| n.local_enr().node_id()).collect();
+        let next = async |stream: &mut crate::TopicSearchStream, what: &str| {
+            tokio::time::timeout(Duration::from_secs(20), stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("{what} not found"))
+                .expect("stream ended")
+        };
+        for (node, id) in nodes[..2].iter().zip(&ids) {
+            node.register_topic(TOPIC).unwrap();
+            wait_registered(&nodes[2..5], *id, 1).await;
+        }
+
+        let mut stream = nodes[5].topic_search_stream(TOPIC).unwrap();
+        let mut found = Vec::new();
+        while found.len() < 2 {
+            found.push(next(&mut stream, "first advertisers").await);
+        }
+        assert_eq!(
+            sorted_ids(&found),
+            sorted_ids(&[nodes[0].local_enr(), nodes[1].local_enr()])
+        );
+
+        nodes[2].register_topic(TOPIC).unwrap();
+        wait_registered(&nodes[3..5], ids[2], 1).await;
+        let late = next(&mut stream, "late advertiser").await;
+        assert_eq!(late.node_id(), ids[2], "delivered again");
+        drop(stream);
     }
 
     /// UDP ports from the system's ephemeral range that are free now.

@@ -18,7 +18,7 @@ use crate::{
         },
         params::{
             AUX_ENR_LIMIT, ENRS_PER_PACKET, F_RETURN, QUERY_RESP_LIMIT, REG_RESP_LIMIT,
-            SEARCH_PASS_BACKOFF, SEARCH_PASS_GAP, SEARCH_TABLE_DEPTH,
+            SEARCH_PASS_BACKOFF, SEARCH_PASS_GAP, SEARCH_TABLE_DEPTH, SEARCH_UNREAD_LIMIT,
         },
         supports_topic_discovery,
     },
@@ -28,10 +28,10 @@ use rand::{RngExt, seq::SliceRandom};
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
-    sync::atomic::Ordering,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, trace, warn};
 
 /// The least time between two seedings of a registration or search table from the
@@ -53,6 +53,17 @@ pub(super) struct TopicSystem {
     next_id: u64,
     /// The messages received so far for the topic requests in flight.
     responses: HashMap<RequestId, TopicResponse>,
+    /// Notified when the caller of a search reads a result or closes the search.
+    pub(super) reads: Arc<Notify>,
+}
+
+impl TopicSystem {
+    pub(super) fn new(reads: Arc<Notify>) -> Self {
+        TopicSystem {
+            reads,
+            ..Default::default()
+        }
+    }
 }
 
 /// The messages that answer one REGTOPIC or TOPICQUERY.
@@ -93,14 +104,12 @@ impl TopicReg {
     }
 }
 
-/// One search: passes over the topic until enough advertisers are found.
+/// One search: passes over the topic until the caller closes it.
 struct TopicSearch {
     topic: TopicId,
-    count: usize,
-    deadline: Instant,
-    callback: oneshot::Sender<Vec<Enr>>,
-    found: Vec<Enr>,
-    /// The advertisers returned by this search.
+    /// The released results go out here, where those the caller has not read wait.
+    results: mpsc::Sender<Enr>,
+    /// The advertisers delivered by this search, and the mixer of the current pass.
     result_filter: SearchFilter,
     /// The asked, failed and admitted sets of the adaptive passes. Kept here between
     /// passes.
@@ -115,8 +124,10 @@ struct TopicSearch {
     gap: Duration,
     /// Idle passes in a row.
     idle_passes: usize,
-    /// Results of the current pass.
+    /// Results delivered in the current pass.
     pass_results: usize,
+    /// The current pass is over and its held results are released: it sends no query.
+    released: bool,
     /// The registrar of the request in flight. One request is sent at a time, and a
     /// pass does not end while it is out.
     in_flight: Option<Enr>,
@@ -124,11 +135,10 @@ struct TopicSearch {
 
 impl TopicSearch {
     fn wakeup(&self) -> Option<Instant> {
-        let seed = match self.pass {
+        match self.pass {
             Some(_) => None,
             None => self.seeded_at.map(|t| t + self.gap),
-        };
-        Some(seed.map_or(self.deadline, |t| t.min(self.deadline)))
+        }
     }
 
     /// Sets where the next pass starts from the pass that ended, and reports whether it
@@ -162,25 +172,31 @@ impl TopicSearch {
         SEARCH_PASS_BACKOFF.min(SEARCH_PASS_GAP * (1 << self.idle_passes))
     }
 
-    /// Feeds the answer of a registrar into the pass.
+    /// Feeds the answer of a registrar into the pass, its ads through the filter and
+    /// the mixer, which hands out what is due on every completed query.
     fn apply_response(
-        pass: &mut Search,
+        &mut self,
         from: &Enr,
         result: Result<TopicQueryResult, RequestError>,
         now: Instant,
     ) {
-        let Ok(result) = result else {
-            pass.handle_error_response(&from.node_id(), now);
+        let Some(pass) = &mut self.pass else {
             return;
         };
         let from_id = from.node_id();
+        let Ok(result) = result else {
+            pass.handle_error_response(&from_id, now);
+            pass.add_results(self.result_filter.take(from_id, [], now));
+            return;
+        };
         let sent = result.advertisers.len();
         let ads: Vec<Enr> = capable(result.advertisers).collect();
         let usable = ads.len();
+        let results = self.result_filter.take(from_id, ads, now);
         if result.complete {
-            pass.add_reply(from, ads, usable, sent, now);
+            pass.add_reply(from, results, usable, sent, now);
         } else {
-            pass.add_partial_reply(from, ads, usable, sent, now);
+            pass.add_partial_reply(from, results, usable, sent, now);
         }
         pass.add_nodes(Some(&from_id), capable(result.aux), now);
     }
@@ -863,26 +879,19 @@ impl Service {
         self.registration_step(topic, now);
     }
 
-    /// Starts a search for `count` advertisers of a topic. It ends after the query
-    /// timeout at the latest, with the advertisers found until then.
-    pub(super) fn start_topic_search(
-        &mut self,
-        topic: TopicId,
-        count: usize,
-        callback: oneshot::Sender<Vec<Enr>>,
-    ) {
+    /// Starts a search for advertisers of a topic. It delivers them to `results` until
+    /// the receiver is closed.
+    pub(super) fn start_topic_search(&mut self, topic: TopicId, results: mpsc::Sender<Enr>) {
         let now = Instant::now();
         let id = self.topics.next_id;
         self.topics.next_id += 1;
+        let local_id = self.local_enr.read().node_id();
         self.topics.searches.insert(
             id,
             TopicSearch {
                 topic,
-                count,
-                deadline: now + self.config.query_timeout,
-                callback,
-                found: Vec::new(),
-                result_filter: SearchFilter::new(&self.config.topic),
+                results,
+                result_filter: SearchFilter::new(local_id, &self.config.topic),
                 sets: None,
                 active_bucket: 0,
                 retried: false,
@@ -891,6 +900,7 @@ impl Service {
                 gap: LOOP_MIN_TIME,
                 idle_passes: 0,
                 pass_results: 0,
+                released: false,
                 in_flight: None,
             },
         );
@@ -902,26 +912,23 @@ impl Service {
         let Some(mut search) = self.topics.searches.remove(&id) else {
             return;
         };
-        let mut new_results = Vec::new();
-        let finished = loop {
-            if search.callback.is_closed()
-                || search.found.len() >= search.count
-                || now >= search.deadline
-            {
-                break true;
+        let open = loop {
+            if search.results.is_closed() {
+                break false;
             }
 
             let pass = match &mut search.pass {
                 Some(pass) => pass,
                 None => {
                     if search.seeded_at.is_some_and(|t| now < t + search.gap) {
-                        break false;
+                        break true;
                     }
                     search.seeded_at = Some(now);
                     search.pass_results = 0;
+                    search.released = false;
                     let nodes = self.topic_capable_nodes();
                     if nodes.is_empty() {
-                        break false;
+                        break true;
                     }
                     let local_id = self.local_enr.read().node_id();
                     let mut pass = Search::new(search.topic, local_id, self.config.topic.clone());
@@ -934,31 +941,36 @@ impl Service {
                 }
             };
 
-            // The results are taken at once, so none is left when the pass is checked.
-            while search.found.len() < search.count
-                && let Some(node) = pass.pop_result()
-            {
-                if search.result_filter.seen(&node, now) {
-                    continue;
+            // Delivered as far as the caller has room.
+            while let Some(node) = pass.peek_result().cloned() {
+                if search.results.try_send(node.clone()).is_err() {
+                    break;
                 }
                 search.result_filter.add(&node, now);
-                search.found.push(node.clone());
+                pass.pop_result();
                 search.pass_results += 1;
-                new_results.push(node);
-            }
-            if search.found.len() >= search.count {
-                continue;
             }
 
             if search.in_flight.is_some() {
-                break false;
+                break true;
             }
-            if pass.is_done() {
+            // Released results the caller has not read.
+            let unread =
+                pass.buffered() + search.results.max_capacity() - search.results.capacity();
+            if unread == 0 && pass.is_done() {
+                // The pass is over: hand out the results that still wait in the mixer,
+                // and end it once they are read.
+                let held = search.result_filter.release(now);
+                if !held.is_empty() {
+                    pass.add_results(held);
+                    search.released = true;
+                    continue;
+                }
                 let pass = search.pass.take().expect("the pass is running");
                 let moved = search.next_pass(&pass);
                 debug!(
                     topic = %hex::encode(search.topic),
-                    found = search.found.len(),
+                    delivered = search.pass_results,
                     next = search.active_bucket,
                     "Topic search rollover",
                 );
@@ -966,11 +978,17 @@ impl Service {
                 search.gap = search.pass_gap(search.pass_results, moved);
                 continue;
             }
+            if search.released || unread >= SEARCH_UNREAD_LIMIT {
+                break true;
+            }
 
-            // Without a target the pass is done: the selection dropped the last
-            // candidates over the subnet limit.
             let Some(target) = pass.query_target(now) else {
-                continue;
+                // Done if the selection dropped the last candidates over the subnet
+                // limit; otherwise the pass waits for the caller to read.
+                if unread == 0 && pass.is_done() {
+                    continue;
+                }
+                break true;
             };
             let request_body = RequestBody::TopicQuery {
                 topic: search.topic,
@@ -981,23 +999,25 @@ impl Service {
                 search.in_flight = Some(target);
             } else {
                 pass.handle_error_response(&target.node_id(), now);
+                pass.add_results(search.result_filter.take(target.node_id(), [], now));
                 continue;
             }
-            break false;
+            break true;
         };
 
-        if !new_results.is_empty() {
-            self.send_event(Event::TopicNodesFound {
-                topic: search.topic,
-                nodes: new_results,
-            });
-        }
-        if finished {
-            if search.callback.send(search.found).is_err() {
-                debug!("The topic search was dropped before it ended");
-            }
-        } else {
+        if open {
             self.topics.searches.insert(id, search);
+        } else {
+            debug!(topic = %hex::encode(search.topic), "Topic search closed");
+        }
+    }
+
+    /// Steps every search, after a caller read results or closed its search.
+    pub(super) fn topic_searches_read(&mut self) {
+        let now = Instant::now();
+        let searches: Vec<u64> = self.topics.searches.keys().copied().collect();
+        for id in searches {
+            self.search_step(id, now);
         }
     }
 
@@ -1018,9 +1038,7 @@ impl Service {
         if let Err(error) = &result {
             debug!(from = %from.node_id(), ?error, "TOPICQUERY failed");
         }
-        if let Some(pass) = &mut search.pass {
-            TopicSearch::apply_response(pass, &from, result, now);
-        }
+        search.apply_response(&from, result, now);
         self.search_step(id, now);
     }
 }
@@ -1118,7 +1136,7 @@ mod tests {
         *,
     };
     use crate::{
-        handler::TopicRespCount,
+        handler::{HandlerOut, TopicRespCount},
         kbucket::{ConnectionDirection, ConnectionState, NodeStatus},
         rpc::Request,
         topic::{RegAttemptState, TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION, TopicConfig},
@@ -1174,9 +1192,23 @@ mod tests {
     /// A service without a handler, with the topic state and the given nodes in the
     /// routing table.
     fn service(config: TopicConfig, table: &[Enr]) -> (Service, UnboundedReceiver<HandlerIn>) {
+        let (service, handler, _) = service_with_handler_out(config, table);
+        (service, handler)
+    }
+
+    /// The same, with the sender through which the handler passes responses to the
+    /// service.
+    fn service_with_handler_out(
+        config: TopicConfig,
+        table: &[Enr],
+    ) -> (
+        Service,
+        UnboundedReceiver<HandlerIn>,
+        mpsc::Sender<HandlerOut>,
+    ) {
         let key = CombinedKey::generate_secp256k1();
         let enr = record(Ipv4Addr::LOCALHOST, 12100, true);
-        let (mut service, handler, _) = build_non_handler_service(
+        let (mut service, handler, handler_out) = build_non_handler_service(
             Arc::new(RwLock::new(enr)),
             Arc::new(RwLock::new(key)),
             false,
@@ -1186,7 +1218,7 @@ mod tests {
         for enr in table {
             add_to_table(&service, enr);
         }
-        (service, handler)
+        (service, handler, handler_out)
     }
 
     /// The next topic request the service handed to the handler.
@@ -2016,22 +2048,39 @@ mod tests {
         asked
     }
 
-    // A pass asks every registrar of the farthest bucket once, the next pass asks one of
-    // them again, each advertiser is returned once, and the search ends when it has the
-    // wanted number.
+    /// Starts a search for `TOPIC`. Without `mix`, the mixer hands out every result as
+    /// it arrives.
+    fn start_search(service: &mut Service, mix: bool) -> (u64, mpsc::Receiver<Enr>) {
+        let (tx, rx) = mpsc::channel(SEARCH_UNREAD_LIMIT);
+        let id = service.topics.next_id;
+        service.start_topic_search(TOPIC, tx);
+        if !mix && let Some(search) = service.topics.searches.get_mut(&id) {
+            search.result_filter.set_mix_wait(Duration::ZERO);
+        }
+        (id, rx)
+    }
+
+    /// Reads the results waiting in `rx`, as the caller of a search stream does.
+    fn read_all(service: &mut Service, rx: &mut mpsc::Receiver<Enr>) -> Vec<Enr> {
+        let mut out = Vec::new();
+        while let Ok(enr) = rx.try_recv() {
+            out.push(enr);
+        }
+        service.topic_searches_read();
+        out
+    }
+
+    // A pass asks every registrar of the farthest bucket once and ends once its results
+    // are read, the next pass asks one of them again, each advertiser is delivered once,
+    // and the search ends when its receiver is dropped.
     #[tokio::test]
     async fn search_passes() {
         let registrars: Vec<Enr> = (0..6).map(|i| far_registrar(12101 + i)).collect();
         let advertisers: Vec<Enr> = (0..3).map(|i| registrar(12201 + i)).collect();
         let not_capable = record(Ipv4Addr::LOCALHOST, 12210, false);
         let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
-        let (events_tx, mut events) = mpsc::channel(10);
-        service.event_stream = Some(events_tx);
-
-        let (tx, mut rx) = oneshot::channel();
         let start = Instant::now();
-        service.start_topic_search(TOPIC, 3, tx);
-        let id = *service.topics.searches.keys().next().unwrap();
+        let (id, mut rx) = start_search(&mut service, false);
 
         // Every registrar returns the same two advertisers.
         let ads = vec![advertisers[0].clone(), not_capable, advertisers[1].clone()];
@@ -2043,37 +2092,37 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), 6, "asked {asked:?}");
         assert_eq!(asked.len(), 6);
-        assert!(rx.try_recv().is_err());
-        let Some(Event::TopicNodesFound { topic, nodes }) = events.try_recv().ok() else {
-            panic!("no search event");
-        };
-        assert_eq!(topic, TOPIC);
-        assert_eq!(ids(&nodes), ids(&advertisers[..2]));
-        assert!(events.try_recv().is_err());
+        assert!(
+            service.topics.searches[&id].pass.is_some(),
+            "pass over unread"
+        );
+        assert_eq!(
+            ids(&read_all(&mut service, &mut rx)),
+            ids(&advertisers[..2])
+        );
 
         // The pass is over. The next one starts after the pause.
         let search = &service.topics.searches[&id];
         assert!(search.pass.is_none() && search.in_flight.is_none());
-        assert_eq!(search.found.len(), 2);
         let wakeup = service.topic_next_wakeup().unwrap();
         assert!(wakeup >= start + LOOP_MIN_TIME && wakeup <= Instant::now() + LOOP_MIN_TIME);
         service.search_step(id, wakeup - Duration::from_millis(1));
         assert!(next_request(&mut handler).is_none());
 
         // The second pass asks a spare registrar, which brings one new advertiser with
-        // the known ones.
+        // a known one.
         service.search_step(id, wakeup);
         let (contact, request) = next_request(&mut handler).unwrap();
         let ads = vec![advertisers[1].clone(), advertisers[2].clone()];
         respond(&mut service, &contact, &request.id, topic_nodes(ads));
-        let found = rx.try_recv().unwrap();
-        assert_eq!(ids(&found), ids(&advertisers));
-        let Some(Event::TopicNodesFound { nodes, .. }) = events.try_recv().ok() else {
-            panic!("no search event");
-        };
-        assert_eq!(ids(&nodes), ids(&advertisers[2..]));
+        assert_eq!(
+            ids(&read_all(&mut service, &mut rx)),
+            ids(&advertisers[2..])
+        );
+
+        drop(rx);
+        service.topic_searches_read();
         assert!(service.topics.searches.is_empty());
-        // Nothing but the answer in flight is left of the search.
         assert!(next_request(&mut handler).is_none());
     }
 
@@ -2088,8 +2137,7 @@ mod tests {
             ..Default::default()
         };
         let (mut service, mut handler) = service(config, std::slice::from_ref(&first));
-        let (tx, _rx) = oneshot::channel();
-        service.start_topic_search(TOPIC, 1, tx);
+        let (_, _rx) = start_search(&mut service, true);
 
         let (contact, request) = next_request(&mut handler).unwrap();
         assert_eq!(contact.node_id(), first.node_id());
@@ -2111,8 +2159,7 @@ mod tests {
         let registrars: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
         let aux = registrar(12110);
         let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
-        let (tx, mut rx) = oneshot::channel();
-        service.start_topic_search(TOPIC, 1, tx);
+        let (_, mut rx) = start_search(&mut service, true);
 
         // The first registrar names the auxiliary node and then times out.
         let (contact, request) = next_request(&mut handler).unwrap();
@@ -2157,12 +2204,7 @@ mod tests {
         let registrars: Vec<Enr> = (0..8).map(|i| registrar(12101 + i)).collect();
         let advertiser = registrar(12201);
         let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
-        let (tx, mut rx) = oneshot::channel();
-        service.start_topic_search(TOPIC, 1, tx);
-        let id = *service.topics.searches.keys().next().unwrap();
-        // The empty passes back off; the search must outlive them.
-        service.topics.searches.get_mut(&id).unwrap().deadline =
-            Instant::now() + Duration::from_secs(3600);
+        let (id, mut rx) = start_search(&mut service, true);
 
         // Only the buckets around the active one are requested.
         let (contact, request) = next_request(&mut handler).unwrap();
@@ -2214,17 +2256,18 @@ mod tests {
             &request.id,
             topic_nodes(vec![advertiser.clone()]),
         );
-        assert_eq!(ids(&rx.try_recv().unwrap()), vec![advertiser.node_id()]);
-        assert!(service.topics.searches.is_empty());
+        assert_eq!(
+            ids(&read_all(&mut service, &mut rx)),
+            vec![advertiser.node_id()]
+        );
     }
 
-    // A search whose future was dropped ends.
+    // A search whose receiver was dropped ends.
     #[tokio::test]
     async fn dropped_search_ends() {
         let registrars: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
         let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
-        let (tx, rx) = oneshot::channel();
-        service.start_topic_search(TOPIC, 1, tx);
+        let (_, rx) = start_search(&mut service, true);
         let (contact, request) = next_request(&mut handler).unwrap();
         drop(rx);
         respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
@@ -2238,9 +2281,7 @@ mod tests {
     fn search_pass_gap() {
         let registrars: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
         let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
-        let (tx, _rx) = oneshot::channel();
-        service.start_topic_search(TOPIC, 1, tx);
-        let id = *service.topics.searches.keys().next().unwrap();
+        let (id, _rx) = start_search(&mut service, true);
         let _ = next_request(&mut handler);
         let search = service.topics.searches.get_mut(&id).unwrap();
 
@@ -2253,9 +2294,7 @@ mod tests {
 
     /// A search without a pass, for driving pass transitions by hand.
     fn idle_search(service: &mut Service) -> &mut TopicSearch {
-        let (tx, _rx) = oneshot::channel();
-        service.start_topic_search(TOPIC, 1, tx);
-        let id = *service.topics.searches.keys().next().unwrap();
+        let (id, _) = start_search(service, true);
         service.topics.searches.get_mut(&id).unwrap()
     }
 
@@ -2304,9 +2343,7 @@ mod tests {
         let last = SEARCH_TABLE_DEPTH - 1;
         for with_ad in [false, true] {
             let (mut service, mut handler) = service(TopicConfig::default(), &[]);
-            let (tx, _rx) = oneshot::channel();
-            service.start_topic_search(TOPIC, 5, tx);
-            let id = *service.topics.searches.keys().next().unwrap();
+            let (id, mut rx) = start_search(&mut service, true);
             add_to_table(&service, &far_registrar(12101));
             service.topics.searches.get_mut(&id).unwrap().active_bucket = last;
 
@@ -2321,6 +2358,7 @@ mod tests {
                 vec![]
             };
             respond(&mut service, &contact, &request.id, topic_nodes(ads));
+            assert_eq!(read_all(&mut service, &mut rx).len(), usize::from(with_ad));
             let search = &service.topics.searches[&id];
             assert!(search.pass.is_none(), "with_ad {with_ad}: pass not over");
             let want = if with_ad { last } else { 0 };
@@ -2361,12 +2399,10 @@ mod tests {
         Service,
         UnboundedReceiver<HandlerIn>,
         u64,
-        oneshot::Receiver<Vec<Enr>>,
+        mpsc::Receiver<Enr>,
     ) {
         let (mut service, handler) = service(TopicConfig::default(), &[]);
-        let (tx, rx) = oneshot::channel();
-        service.start_topic_search(TOPIC, 20, tx);
-        let id = *service.topics.searches.keys().next().unwrap();
+        let (id, rx) = start_search(&mut service, false);
         for port in 12101..12104 {
             add_to_table(&service, &registrar_in_bucket(port, bucket));
         }
@@ -2380,7 +2416,7 @@ mod tests {
     // active bucket do not move it; their ads are delivered.
     #[tokio::test]
     async fn search_partial_reply() {
-        let (mut service, mut handler, id, _rx) = search_in_bucket(0);
+        let (mut service, mut handler, id, mut rx) = search_in_bucket(0);
         for i in 0..2 {
             let (contact, request) = next_request(&mut handler).unwrap();
             let nodes = vec![registrar(13000 + 2 * i), registrar(13001 + 2 * i)];
@@ -2391,14 +2427,14 @@ mod tests {
         let search = &service.topics.searches[&id];
         assert!(search.in_flight.is_some(), "third registrar not asked");
         assert_eq!(search.pass.as_ref().map(Search::active_bucket), Some(0));
-        assert_eq!(search.found.len(), 4);
+        assert_eq!(read_all(&mut service, &mut rx).len(), 4);
     }
 
     // The yield sample counts the ads before the `td` check: full replies whose ads
     // mostly lack it move the search one bucket out.
     #[tokio::test]
     async fn search_sample_before_td() {
-        let (mut service, mut handler, id, _rx) = search_in_bucket(1);
+        let (mut service, mut handler, id, mut rx) = search_in_bucket(1);
         for i in 0..2u16 {
             let (contact, request) = next_request(&mut handler).unwrap();
             let mut nodes = vec![registrar(13000 + 2 * i), registrar(13001 + 2 * i)];
@@ -2411,7 +2447,7 @@ mod tests {
         let search = &service.topics.searches[&id];
         assert!(search.in_flight.is_some(), "third registrar not asked");
         assert_eq!(search.pass.as_ref().map(Search::active_bucket), Some(0));
-        assert_eq!(search.found.len(), 4);
+        assert_eq!(read_all(&mut service, &mut rx).len(), 4);
     }
 
     // A pass does not end while its query is out, also when nothing else is left to ask:
@@ -2422,9 +2458,7 @@ mod tests {
         let advertiser = registrar(12201);
         let (mut service, mut handler) =
             service(TopicConfig::default(), std::slice::from_ref(&reg));
-        let (tx, mut rx) = oneshot::channel();
-        service.start_topic_search(TOPIC, 1, tx);
-        let id = *service.topics.searches.keys().next().unwrap();
+        let (id, mut rx) = start_search(&mut service, true);
         let (contact, request) = next_request(&mut handler).unwrap();
         respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
         assert!(service.topics.searches[&id].pass.is_none());
@@ -2440,7 +2474,209 @@ mod tests {
 
         let ads = vec![advertiser.clone()];
         respond(&mut service, &contact, &request.id, topic_nodes(ads));
-        assert_eq!(ids(&rx.try_recv().unwrap()), vec![advertiser.node_id()]);
+        assert_eq!(
+            ids(&read_all(&mut service, &mut rx)),
+            vec![advertiser.node_id()]
+        );
+    }
+
+    /// `n` advertiser records on ports from `*port + 1` on.
+    fn advertisers(port: &mut u16, n: usize) -> Vec<Enr> {
+        (0..n)
+            .map(|_| {
+                *port += 1;
+                registrar(*port)
+            })
+            .collect()
+    }
+
+    // No query goes out while `SEARCH_UNREAD_LIMIT` released results wait unread, in
+    // the channel or in the pass; reading resumes the queries.
+    #[tokio::test]
+    async fn queries_stop_at_unread_limit() {
+        let registrars: Vec<Enr> = (0..4).map(|i| far_registrar(12101 + i)).collect();
+        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
+        let (id, mut rx) = start_search(&mut service, false);
+        let mut port = 13000;
+
+        // Ten results wait, below the limit: the next query goes out.
+        let (contact, request) = next_request(&mut handler).unwrap();
+        let ads = advertisers(&mut port, 10);
+        respond(&mut service, &contact, &request.id, topic_nodes(ads));
+        let (contact, request) = next_request(&mut handler).expect("stopped below the limit");
+        // Six more: exactly the limit.
+        let ads = advertisers(&mut port, 6);
+        respond(&mut service, &contact, &request.id, topic_nodes(ads));
+        assert!(
+            next_request(&mut handler).is_none(),
+            "query sent at the limit"
+        );
+        // One read: one below the limit.
+        assert!(rx.try_recv().is_ok());
+        service.topic_searches_read();
+        let (contact, request) = next_request(&mut handler).expect("stopped below the limit");
+
+        // Ten more: sixteen wait in the channel and nine in the pass.
+        let ads = advertisers(&mut port, 10);
+        respond(&mut service, &contact, &request.id, topic_nodes(ads));
+        assert!(
+            next_request(&mut handler).is_none(),
+            "query sent over the limit"
+        );
+        let search = &service.topics.searches[&id];
+        assert!(search.in_flight.is_none());
+        assert_eq!(search.pass.as_ref().map(Search::buffered), Some(9));
+        // Reading the channel leaves nine unread: the queries resume.
+        assert_eq!(read_all(&mut service, &mut rx).len(), 16);
+        assert!(
+            next_request(&mut handler).is_some(),
+            "queries did not resume"
+        );
+    }
+
+    /// The next topic request the running service hands to the handler within `wait`.
+    async fn wait_request(
+        handler: &mut UnboundedReceiver<HandlerIn>,
+        wait: Duration,
+    ) -> Option<(NodeContact, Request)> {
+        let request = async {
+            loop {
+                if let HandlerIn::Request(contact, request) = handler.recv().await?
+                    && request.body.is_topic_request()
+                {
+                    return Some((contact, *request));
+                }
+            }
+        };
+        tokio::time::timeout(wait, request).await.ok().flatten()
+    }
+
+    // In the running service, reading a stream paused at the unread limit resumes its
+    // queries, and dropping a paused stream ends its lookup, with no other event.
+    #[tokio::test]
+    async fn stream_drives_running_search() {
+        use futures::StreamExt;
+        let registrars: Vec<Enr> = (0..3).map(|i| far_registrar(12101 + i)).collect();
+        let (mut service, mut handler, handler_out) =
+            service_with_handler_out(TopicConfig::default(), &registrars);
+        let (exit_send, exit) = oneshot::channel();
+        service.exit = exit;
+        let (tx, rx) = mpsc::channel(SEARCH_UNREAD_LIMIT);
+        let lookup = tx.downgrade();
+        let id = service.topics.next_id;
+        service.start_topic_search(TOPIC, tx);
+        let search = service.topics.searches.get_mut(&id).unwrap();
+        search.result_filter.set_mix_wait(Duration::ZERO);
+        let mut stream = crate::TopicSearchStream::new(rx, service.topics.reads.clone());
+        tokio::spawn(async move { service.start().await });
+
+        let mut port = 13000;
+        let wait = Duration::from_millis(500);
+        let answer = async |contact: NodeContact, request: Request, ads: Vec<Enr>| {
+            let response = Response {
+                id: request.id,
+                body: topic_nodes(ads),
+            };
+            let out = HandlerOut::TopicResponse(contact.node_address(), Box::new(response), true);
+            handler_out.send(out).await.unwrap();
+        };
+
+        // Sixteen unread: the search pauses until the caller reads.
+        let (contact, request) = wait_request(&mut handler, wait).await.unwrap();
+        answer(contact, request, advertisers(&mut port, 16)).await;
+        assert!(
+            wait_request(&mut handler, wait).await.is_none(),
+            "query sent at the limit"
+        );
+        assert!(stream.next().await.is_some());
+        let (contact, request) = wait_request(&mut handler, wait)
+            .await
+            .expect("a read did not resume the queries");
+
+        // Paused again, with no query in flight: dropping the stream ends the lookup.
+        answer(contact, request, advertisers(&mut port, 16)).await;
+        assert!(
+            wait_request(&mut handler, wait).await.is_none(),
+            "query sent at the limit"
+        );
+        drop(stream);
+        let ended = async {
+            while lookup.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        assert!(
+            tokio::time::timeout(wait, ended).await.is_ok(),
+            "the dropped stream's lookup still runs"
+        );
+        let _ = exit_send.send(());
+    }
+
+    // The mixer holds the results of a lone registrar; at the end of the pass it
+    // releases them, and the pass ends only after the caller read them.
+    #[tokio::test]
+    async fn pass_waits_for_reads() {
+        let registrars: Vec<Enr> = (0..2).map(|i| far_registrar(12101 + i)).collect();
+        let advertiser = registrar(12201);
+        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
+        let (id, mut rx) = start_search(&mut service, true);
+
+        let (contact, request) = next_request(&mut handler).unwrap();
+        let ads = vec![advertiser.clone()];
+        respond(&mut service, &contact, &request.id, topic_nodes(ads));
+        assert!(
+            rx.try_recv().is_err(),
+            "a lone reply went out before the wait"
+        );
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
+
+        let search = &service.topics.searches[&id];
+        assert!(
+            search.pass.is_some() && search.released,
+            "pass ended unread"
+        );
+        service.topic_searches_read();
+        assert!(
+            service.topics.searches[&id].pass.is_some(),
+            "pass ended unread"
+        );
+        assert_eq!(
+            ids(&read_all(&mut service, &mut rx)),
+            vec![advertiser.node_id()]
+        );
+        assert!(service.topics.searches[&id].pass.is_none(), "pass not over");
+    }
+
+    // The mixer is checked on every completed query, a failed one too: results that
+    // waited long enough go out when the next query fails.
+    #[tokio::test]
+    async fn failed_query_checks_mix() {
+        let registrars: Vec<Enr> = (0..3).map(|i| far_registrar(12101 + i)).collect();
+        let advertiser = registrar(12201);
+        let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
+        let (id, mut rx) = start_search(&mut service, true);
+
+        let (contact, request) = next_request(&mut handler).unwrap();
+        let ads = vec![advertiser.clone()];
+        respond(&mut service, &contact, &request.id, topic_nodes(ads));
+        assert!(
+            rx.try_recv().is_err(),
+            "a lone reply went out before the wait"
+        );
+        // The wait is over by the time the next query fails.
+        let search = service.topics.searches.get_mut(&id).unwrap();
+        search.result_filter.set_mix_wait(Duration::ZERO);
+        let (_, request) = next_request(&mut handler).unwrap();
+        service.rpc_failure(request.id, RequestError::Timeout);
+        assert!(
+            service.topics.searches[&id].in_flight.is_some(),
+            "pass over"
+        );
+        assert_eq!(
+            ids(&read_all(&mut service, &mut rx)),
+            vec![advertiser.node_id()]
+        );
     }
 
     // An empty pass delays the next one by the back-off gap; a pass with results does
@@ -2450,10 +2686,8 @@ mod tests {
         let registrars: Vec<Enr> = (0..1).map(|i| registrar(12101 + i)).collect();
         let advertiser = registrar(12201);
         let (mut service, mut handler) = service(TopicConfig::default(), &registrars);
-        let (tx, _rx) = oneshot::channel();
         let start = Instant::now();
-        service.start_topic_search(TOPIC, 2, tx);
-        let id = *service.topics.searches.keys().next().unwrap();
+        let (id, mut rx) = start_search(&mut service, true);
 
         // An empty pass: the next one waits 4 s.
         let (contact, request) = next_request(&mut handler).unwrap();
@@ -2476,6 +2710,7 @@ mod tests {
             &request.id,
             topic_nodes(vec![advertiser]),
         );
+        assert_eq!(read_all(&mut service, &mut rx).len(), 1);
         assert_eq!(service.topics.searches[&id].gap, LOOP_MIN_TIME);
     }
 
