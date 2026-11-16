@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Loopback interop smoke between geth `devp2p discv5 listen` and examples/topdisc_node.
-# Usage: GETH_DEVP2P=<path to devp2p> interop/geth-smoke.sh basic|all|case1..case5
+# Usage: GETH_DEVP2P=<path to devp2p> interop/geth-smoke.sh basic|all|case1..case4
 # See interop/README.md.
 set -euo pipefail
 
 MODE=${1:-basic}
 case $MODE in
-basic | all | case[1-5]) ;;
-*) echo "unknown mode: $MODE (supported: basic, all, case1..case5)" >&2; exit 2 ;;
+basic | all | case[1-4]) ;;
+*) echo "unknown mode: $MODE (supported: basic, all, case1..case4)" >&2; exit 2 ;;
 esac
 : "${GETH_DEVP2P:?set GETH_DEVP2P to a devp2p binary built from geth topdisc}"
 [[ -x $GETH_DEVP2P ]] || { echo "not executable: $GETH_DEVP2P" >&2; exit 2; }
@@ -374,15 +374,10 @@ case4() {
     stop_nodes
 }
 
-# Hook for D48. The gate-off case cannot run: topic discovery is always on (D46).
-case5() {
-    echo "SKIP case5 gate off: no runtime switch (topic discovery always on), pending D48"
-}
-
 echo "run dir: $RUNDIR"
 case $MODE in
 basic) case_basic ;;
-all) case1; case2; case3; case4; case5 ;;
+all) case1; case2; case3; case4 ;;
 *) "$MODE" ;;
 esac
 exit $STATUS

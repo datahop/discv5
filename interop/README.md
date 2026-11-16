@@ -17,12 +17,12 @@ go build -p 16 -o /tmp/<rundir>/devp2p ./cmd/devp2p
 GETH_DEVP2P=/tmp/<rundir>/devp2p interop/geth-smoke.sh all
 ```
 
-Modes: `basic`, `all` (cases 1 to 5), or one of `case1` .. `case5`. The script builds the
+Modes: `basic`, `all` (cases 1 to 4), or one of `case1` .. `case4`. The script builds the
 example with `cargo build --example topdisc_node --features topic-discovery` (set
-`TOPDISC_NODE=<path>` to use a prebuilt binary). It prints one `PASS`/`FAIL` line per check,
-`SKIP` for a case that cannot run, and exits non-zero on any `FAIL`. Each case starts its
-own nodes and stops them at the end. Topics are SHA-256 of fixed names: the Rust node gets
-`--service <name>`, geth the same name in its RPC calls.
+`TOPDISC_NODE=<path>` to use a prebuilt binary). It prints one `PASS`/`FAIL` line per check
+and exits non-zero on any `FAIL`. Each case starts its own nodes and stops them at the end.
+Topics are SHA-256 of fixed names: the Rust node gets `--service <name>`, geth the same name
+in its RPC calls.
 
 ## Mode `basic`
 
@@ -50,8 +50,6 @@ lists geth.
 4. Rejection. A Rust `--probe-regtopic` with `--enr-ip 127.0.0.9` (the record IP differs
    from the packet source) against geth exits 0 within 30 s, prints `rejected`, and geth logs
    `address does not match packet source`.
-5. Prints `SKIP`: the old gate-off check has no counterpart while topic discovery is always
-   on. Hook for decision D48.
 
 A geth RPC check passes only when curl succeeds and the body is exactly one JSON object
 with a `result` and no `error`; ids must be members of the result. Rust `/status` checks
