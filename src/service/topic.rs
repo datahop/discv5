@@ -18,7 +18,7 @@ use crate::{
         },
         params::{
             AUX_ENR_LIMIT, ENRS_PER_PACKET, F_RETURN, QUERY_RESP_LIMIT, REG_RESP_LIMIT,
-            SEARCH_PASS_BACKOFF, SEARCH_PASS_GAP,
+            SEARCH_PASS_BACKOFF, SEARCH_PASS_GAP, SEARCH_TABLE_DEPTH,
         },
         supports_topic_discovery,
     },
@@ -105,13 +105,15 @@ struct TopicSearch {
     /// The asked, failed and admitted sets of the adaptive passes. Kept here between
     /// passes.
     sets: Option<SearchSets>,
-    /// Where the last adaptive pass settled.
+    /// Where the next pass starts.
     active_bucket: usize,
+    /// The last pass kept its bucket because every query to it failed.
+    retried: bool,
     pass: Option<Search>,
     seeded_at: Option<Instant>,
     /// The minimum length of the current pass.
     gap: Duration,
-    /// Passes in a row that returned nothing new.
+    /// Idle passes in a row.
     idle_passes: usize,
     /// Results of the current pass.
     pass_results: usize,
@@ -129,10 +131,27 @@ impl TopicSearch {
         Some(seed.map_or(self.deadline, |t| t.min(self.deadline)))
     }
 
+    /// Sets where the next pass starts from the pass that ended, and reports whether it
+    /// moved with usable ads seen. A bucket whose queries all failed is kept for one
+    /// retry pass only.
+    fn next_pass(&mut self, pass: &Search) -> bool {
+        let mut next = pass.next_pass_bucket();
+        let mut retry = next == self.active_bucket && pass.active_failed();
+        if retry && self.retried {
+            next = (next + 1).min(SEARCH_TABLE_DEPTH - 1);
+            retry = false;
+        }
+        self.retried = retry;
+        let moved = next != self.active_bucket && pass.ads_seen() > 0;
+        self.active_bucket = next;
+        moved
+    }
+
     /// The minimum length of the next pass: `SEARCH_PASS_GAP`, doubling after every
-    /// pass that returned nothing new, up to `SEARCH_PASS_BACKOFF`.
-    fn pass_gap(&mut self, nresults: usize) -> Duration {
-        if nresults > 0 {
+    /// idle pass, one that delivered nothing and did not move with usable ads seen, up
+    /// to `SEARCH_PASS_BACKOFF`.
+    fn pass_gap(&mut self, nresults: usize, moved: bool) -> Duration {
+        if nresults > 0 || moved {
             self.idle_passes = 0;
             return SEARCH_PASS_GAP;
         }
@@ -155,7 +174,14 @@ impl TopicSearch {
             return;
         };
         let from_id = from.node_id();
-        pass.add_query_results(from, capable(result.advertisers), now);
+        let sent = result.advertisers.len();
+        let ads: Vec<Enr> = capable(result.advertisers).collect();
+        let usable = ads.len();
+        if result.complete {
+            pass.add_reply(from, ads, usable, sent, now);
+        } else {
+            pass.add_partial_reply(from, ads, usable, sent, now);
+        }
         pass.add_nodes(Some(&from_id), capable(result.aux), now);
     }
 }
@@ -859,6 +885,7 @@ impl Service {
                 result_filter: SearchFilter::new(&self.config.topic),
                 sets: None,
                 active_bucket: 0,
+                retried: false,
                 pass: None,
                 seeded_at: None,
                 gap: LOOP_MIN_TIME,
@@ -923,35 +950,38 @@ impl Service {
                 continue;
             }
 
+            if search.in_flight.is_some() {
+                break false;
+            }
             if pass.is_done() {
+                let pass = search.pass.take().expect("the pass is running");
+                let moved = search.next_pass(&pass);
                 debug!(
                     topic = %hex::encode(search.topic),
                     found = search.found.len(),
+                    next = search.active_bucket,
                     "Topic search rollover",
                 );
-                search.active_bucket = pass.active_bucket();
-                search.sets = search.pass.take().map(Search::into_sets);
-                search.gap = search.pass_gap(search.pass_results);
+                search.sets = Some(pass.into_sets());
+                search.gap = search.pass_gap(search.pass_results, moved);
                 continue;
             }
 
-            if search.in_flight.is_none() {
-                // Without a target the pass is done: the selection dropped the last
-                // candidates over the subnet limit.
-                let Some(target) = pass.query_target(now) else {
-                    continue;
-                };
-                let request_body = RequestBody::TopicQuery {
-                    topic: search.topic,
-                    buckets: pass.buckets_with_free_space(),
-                };
-                let callback = CallbackResponse::TopicSearch(id);
-                if self.send_topic_request(target.clone(), request_body, callback) {
-                    search.in_flight = Some(target);
-                } else {
-                    pass.handle_error_response(&target.node_id(), now);
-                    continue;
-                }
+            // Without a target the pass is done: the selection dropped the last
+            // candidates over the subnet limit.
+            let Some(target) = pass.query_target(now) else {
+                continue;
+            };
+            let request_body = RequestBody::TopicQuery {
+                topic: search.topic,
+                buckets: pass.buckets_with_free_space(),
+            };
+            let callback = CallbackResponse::TopicSearch(id);
+            if self.send_topic_request(target.clone(), request_body, callback) {
+                search.in_flight = Some(target);
+            } else {
+                pass.handle_error_response(&target.node_id(), now);
+                continue;
             }
             break false;
         };
@@ -1116,9 +1146,14 @@ mod tests {
 
     /// A registrar in the farthest bucket from `TOPIC`.
     fn far_registrar(port: u16) -> Enr {
+        registrar_in_bucket(port, 0)
+    }
+
+    /// A registrar in search bucket `bucket` of `TOPIC`.
+    fn registrar_in_bucket(port: u16, bucket: usize) -> Enr {
         loop {
             let enr = registrar(port);
-            if crate::topic::log_dist(&TOPIC, &enr.node_id()) == 256 {
+            if crate::topic::log_dist(&TOPIC, &enr.node_id()) == 256 - bucket {
                 return enr;
             }
         }
@@ -2210,10 +2245,202 @@ mod tests {
         let search = service.topics.searches.get_mut(&id).unwrap();
 
         for want in [4, 8, 16, 32, 60, 60] {
-            assert_eq!(search.pass_gap(0), Duration::from_secs(want));
+            assert_eq!(search.pass_gap(0, false), Duration::from_secs(want));
         }
-        assert_eq!(search.pass_gap(3), SEARCH_PASS_GAP);
-        assert_eq!(search.pass_gap(0), Duration::from_secs(4));
+        assert_eq!(search.pass_gap(3, false), SEARCH_PASS_GAP);
+        assert_eq!(search.pass_gap(0, false), Duration::from_secs(4));
+    }
+
+    /// A search without a pass, for driving pass transitions by hand.
+    fn idle_search(service: &mut Service) -> &mut TopicSearch {
+        let (tx, _rx) = oneshot::channel();
+        service.start_topic_search(TOPIC, 1, tx);
+        let id = *service.topics.searches.keys().next().unwrap();
+        service.topics.searches.get_mut(&id).unwrap()
+    }
+
+    /// A pass from `start` over `regs`, each answered with `sent` ads of which `usable`
+    /// pass the `td` check, or failing when `sent` is `None`.
+    fn run_pass(start: usize, regs: &[Enr], sent: Option<usize>, usable: usize) -> Search {
+        let now = Instant::now();
+        let mut pass = Search::new(TOPIC, NodeId::random(), TopicConfig::default());
+        pass.set_active_bucket(start);
+        pass.add_nodes(None, regs.iter().cloned(), now);
+        while let Some(n) = pass.query_target(now) {
+            match sent {
+                Some(sent) => pass.add_reply(&n, [], usable, sent, now),
+                None => pass.handle_error_response(&n.node_id(), now),
+            }
+        }
+        assert!(pass.is_done());
+        pass
+    }
+
+    // A bucket whose queries all failed is kept for one retry pass; when that fails too,
+    // the next pass moves one bucket in. A later failed pass gets its retry again.
+    #[test]
+    fn retry_pass_once() {
+        let regs: Vec<Enr> = (0..2).map(|i| far_registrar(12101 + i)).collect();
+        let (mut service, _handler) = service(TopicConfig::default(), &[]);
+        let search = idle_search(&mut service);
+        for want in [0, 1] {
+            let pass = run_pass(search.active_bucket, &regs, None, 0);
+            assert!(pass.active_failed());
+            search.next_pass(&pass);
+            assert_eq!(search.active_bucket, want);
+        }
+        search.active_bucket = 0;
+        search.next_pass(&run_pass(0, &regs, None, 0));
+        assert_eq!(
+            search.active_bucket, 0,
+            "a failed pass after the move gets its retry again"
+        );
+    }
+
+    // A pass that started at the closest bucket and saw no usable ad starts the next one
+    // at the farthest; one that saw an ad stays.
+    #[tokio::test]
+    async fn restart_at_farthest() {
+        let last = SEARCH_TABLE_DEPTH - 1;
+        for with_ad in [false, true] {
+            let (mut service, mut handler) = service(TopicConfig::default(), &[]);
+            let (tx, _rx) = oneshot::channel();
+            service.start_topic_search(TOPIC, 5, tx);
+            let id = *service.topics.searches.keys().next().unwrap();
+            add_to_table(&service, &far_registrar(12101));
+            service.topics.searches.get_mut(&id).unwrap().active_bucket = last;
+
+            let wakeup = service.topic_next_wakeup().unwrap();
+            service.search_step(id, wakeup);
+            let pass = service.topics.searches[&id].pass.as_ref();
+            assert_eq!(pass.map(Search::active_bucket), Some(last));
+            let (contact, request) = next_request(&mut handler).unwrap();
+            let ads = if with_ad {
+                vec![registrar(12201)]
+            } else {
+                vec![]
+            };
+            respond(&mut service, &contact, &request.id, topic_nodes(ads));
+            let search = &service.topics.searches[&id];
+            assert!(search.pass.is_none(), "with_ad {with_ad}: pass not over");
+            let want = if with_ad { last } else { 0 };
+            assert_eq!(search.active_bucket, want, "with_ad {with_ad}");
+        }
+    }
+
+    // A pass is idle when it delivered nothing and either saw no usable ad or starts the
+    // next pass where it started itself. Idle passes double the gap; others reset it.
+    #[test]
+    fn backoff_idle_definition() {
+        let regs: Vec<Enr> = (0..2).map(|i| far_registrar(12101 + i)).collect();
+        let (mut service, _handler) = service(TopicConfig::default(), &[]);
+        let search = idle_search(&mut service);
+        // (sent, usable, delivered, next bucket, gap in s)
+        let cases = [
+            (0, 0, 0, 4, 4),
+            (1, 0, 0, 3, 8),
+            (8, 8, 0, 0, 16),
+            (1, 1, 0, 3, 2),
+            (0, 0, 0, 4, 4),
+            (8, 8, 1, 0, 2),
+        ];
+        for (i, (sent, usable, delivered, next, gap)) in cases.into_iter().enumerate() {
+            search.active_bucket = 0;
+            let moved = search.next_pass(&run_pass(0, &regs, Some(sent), usable));
+            assert_eq!(search.active_bucket, next, "case {i}");
+            let got = search.pass_gap(delivered, moved);
+            assert_eq!(got, Duration::from_secs(gap), "case {i}");
+        }
+    }
+
+    /// A search for `TOPIC` whose first pass starts at `bucket` over three registrars
+    /// there, with the first query sent.
+    fn search_in_bucket(
+        bucket: usize,
+    ) -> (
+        Service,
+        UnboundedReceiver<HandlerIn>,
+        u64,
+        oneshot::Receiver<Vec<Enr>>,
+    ) {
+        let (mut service, handler) = service(TopicConfig::default(), &[]);
+        let (tx, rx) = oneshot::channel();
+        service.start_topic_search(TOPIC, 20, tx);
+        let id = *service.topics.searches.keys().next().unwrap();
+        for port in 12101..12104 {
+            add_to_table(&service, &registrar_in_bucket(port, bucket));
+        }
+        service.topics.searches.get_mut(&id).unwrap().active_bucket = bucket;
+        let wakeup = service.topic_next_wakeup().unwrap();
+        service.search_step(id, wakeup);
+        (service, handler, id, rx)
+    }
+
+    // Partial responses below the floor are no yield sample, so two of them from the
+    // active bucket do not move it; their ads are delivered.
+    #[tokio::test]
+    async fn search_partial_reply() {
+        let (mut service, mut handler, id, _rx) = search_in_bucket(0);
+        for i in 0..2 {
+            let (contact, request) = next_request(&mut handler).unwrap();
+            let nodes = vec![registrar(13000 + 2 * i), registrar(13001 + 2 * i)];
+            let body = ResponseBody::TopicNodes { total: 2, nodes };
+            respond(&mut service, &contact, &request.id, body);
+            service.rpc_failure(request.id, RequestError::Timeout);
+        }
+        let search = &service.topics.searches[&id];
+        assert!(search.in_flight.is_some(), "third registrar not asked");
+        assert_eq!(search.pass.as_ref().map(Search::active_bucket), Some(0));
+        assert_eq!(search.found.len(), 4);
+    }
+
+    // The yield sample counts the ads before the `td` check: full replies whose ads
+    // mostly lack it move the search one bucket out.
+    #[tokio::test]
+    async fn search_sample_before_td() {
+        let (mut service, mut handler, id, _rx) = search_in_bucket(1);
+        for i in 0..2u16 {
+            let (contact, request) = next_request(&mut handler).unwrap();
+            let mut nodes = vec![registrar(13000 + 2 * i), registrar(13001 + 2 * i)];
+            nodes.extend(
+                (0..F_RETURN as u16 - 2)
+                    .map(|j| record(Ipv4Addr::LOCALHOST, 14000 + 100 * i + j, false)),
+            );
+            respond(&mut service, &contact, &request.id, topic_nodes(nodes));
+        }
+        let search = &service.topics.searches[&id];
+        assert!(search.in_flight.is_some(), "third registrar not asked");
+        assert_eq!(search.pass.as_ref().map(Search::active_bucket), Some(0));
+        assert_eq!(search.found.len(), 4);
+    }
+
+    // A pass does not end while its query is out, also when nothing else is left to ask:
+    // the answer goes to the pass that sent the query.
+    #[tokio::test]
+    async fn pass_not_ended_with_query_in_flight() {
+        let reg = far_registrar(12101);
+        let advertiser = registrar(12201);
+        let (mut service, mut handler) =
+            service(TopicConfig::default(), std::slice::from_ref(&reg));
+        let (tx, mut rx) = oneshot::channel();
+        service.start_topic_search(TOPIC, 1, tx);
+        let id = *service.topics.searches.keys().next().unwrap();
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
+        assert!(service.topics.searches[&id].pass.is_none());
+
+        // The next pass re-asks the registrar as its spare.
+        let wakeup = service.topic_next_wakeup().unwrap();
+        service.search_step(id, wakeup);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        assert_eq!(contact.node_id(), reg.node_id());
+        service.search_step(id, wakeup);
+        let search = &service.topics.searches[&id];
+        assert!(search.pass.is_some() && search.in_flight.is_some());
+
+        let ads = vec![advertiser.clone()];
+        respond(&mut service, &contact, &request.id, topic_nodes(ads));
+        assert_eq!(ids(&rx.try_recv().unwrap()), vec![advertiser.node_id()]);
     }
 
     // An empty pass delays the next one by the back-off gap; a pass with results does

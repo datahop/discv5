@@ -12,7 +12,7 @@ use super::{
     netutil::{DistinctNetSet, is_lan},
     params::{
         ASKED_FAILED_TTL, F_RETURN, SEARCH_AUX_RADIUS, SEARCH_MAX_JUMP, SEARCH_MIN_SAMPLES,
-        SEARCH_TABLE_DEPTH, SEARCH_YIELD_FLOOR, SEARCH_YIELD_WINDOW,
+        SEARCH_PASS_QUERIES, SEARCH_TABLE_DEPTH, SEARCH_YIELD_FLOOR, SEARCH_YIELD_WINDOW,
     },
 };
 use crate::Enr;
@@ -32,6 +32,10 @@ struct SearchBucket<N> {
     new: HashMap<NodeId, N>,
     /// Ad counts of the last `SEARCH_YIELD_WINDOW` replies.
     yields: VecDeque<usize>,
+    /// Replies from this bucket in the pass, partial or not.
+    done: usize,
+    /// Queries to this bucket that failed in the pass.
+    failed: usize,
     ips: DistinctNetSet,
 }
 
@@ -81,6 +85,14 @@ pub struct Search<N: TopicNode = Enr> {
     buckets: Vec<SearchBucket<N>>,
     /// The bucket the search queries.
     active: usize,
+    /// The bucket this pass started at.
+    start: usize,
+    /// A yield sample placed the active bucket in this pass.
+    placed: bool,
+    /// Queries answered or failed in this pass.
+    replies: usize,
+    /// Usable ads the replies of this pass carried.
+    ads: usize,
     sets: SearchSets,
     /// Asked nodes offered again. One is asked again per pass when nothing else is left.
     spare: HashMap<NodeId, N>,
@@ -98,6 +110,8 @@ impl<N: TopicNode> Search<N> {
                 dist: (256 - i) as u64,
                 new: HashMap::new(),
                 yields: VecDeque::new(),
+                done: 0,
+                failed: 0,
                 ips: DistinctNetSet::new(SEARCH_SUBNET, SEARCH_BUCKET_IP_LIMIT),
             })
             .collect();
@@ -107,6 +121,10 @@ impl<N: TopicNode> Search<N> {
             config,
             buckets,
             active: 0,
+            start: 0,
+            placed: false,
+            replies: 0,
+            ads: 0,
             sets: SearchSets::default(),
             spare: HashMap::new(),
             spare_used: false,
@@ -124,6 +142,19 @@ impl<N: TopicNode> Search<N> {
     /// Sets the bucket to query first.
     pub fn set_active_bucket(&mut self, i: usize) {
         self.active = i.min(self.buckets.len() - 1);
+        self.start = self.active;
+    }
+
+    /// Reports whether the active bucket was asked in this pass and every query to it
+    /// failed, with no yield sample placing it.
+    pub fn active_failed(&self) -> bool {
+        let b = &self.buckets[self.active];
+        !self.placed && b.done == 0 && b.failed > 0
+    }
+
+    /// The usable ads the replies of this pass carried.
+    pub fn ads_seen(&self) -> usize {
+        self.ads
     }
 
     /// Hands over the sets of the previous passes.
@@ -136,10 +167,9 @@ impl<N: TopicNode> Search<N> {
         self.sets
     }
 
-    /// Reports whether the pass is over. When nothing is left to ask, this moves the
-    /// active bucket one step closer for the next pass, so it must be called once per
-    /// such state.
-    pub fn is_done(&mut self) -> bool {
+    /// Reports whether the pass is over. The next pass starts at `next_pass_bucket`
+    /// with a new state.
+    pub fn is_done(&self) -> bool {
         // Not done while there are unused results.
         if !self.result_buffer.is_empty() {
             return false;
@@ -150,20 +180,31 @@ impl<N: TopicNode> Search<N> {
         if self.buckets.iter().any(|b| !b.new.is_empty()) {
             return false;
         }
-        if !self.spare_used && !self.spare.is_empty() {
-            return false;
-        }
-        if self.active < self.buckets.len() - 1 {
-            self.active += 1;
-        }
-        true
+        self.spare_used || self.spare.is_empty()
     }
 
-    /// Reports whether the active bucket is exhausted with enough replies to place the
-    /// next pass.
+    /// The bucket the next pass starts at once this one is done: the active one, or the
+    /// next one in when the pass ran dry before the bucket could decide, unless every
+    /// query to it failed. A pass that started at the closest bucket and saw no usable
+    /// ad starts the next one at the farthest.
+    pub fn next_pass_bucket(&self) -> usize {
+        let last = self.buckets.len() - 1;
+        let mut next = self.active;
+        if !self.active_done() && !self.placed && !self.active_failed() {
+            next = (self.active + 1).min(last);
+        }
+        if self.ads == 0 && next == last && self.start == last {
+            return 0;
+        }
+        next
+    }
+
+    /// Reports whether the pass spent its queries, or the active bucket is exhausted
+    /// with enough samples to place the next pass.
     fn active_done(&self) -> bool {
         let b = &self.buckets[self.active];
-        b.new.is_empty() && b.yields.len() >= SEARCH_MIN_SAMPLES
+        self.replies >= SEARCH_PASS_QUERIES
+            || (b.new.is_empty() && b.yields.len() >= SEARCH_MIN_SAMPLES)
     }
 
     /// The distances within `SEARCH_AUX_RADIUS` of the active bucket at which the table
@@ -228,9 +269,12 @@ impl<N: TopicNode> Search<N> {
     /// Drops a node whose query failed, with its slot and subnet entry, and keeps it out
     /// for an ad lifetime across the passes that share the sets.
     pub fn handle_error_response(&mut self, id: &NodeId, now: Instant) {
+        self.replies += 1;
         self.asked_now.insert(*id);
         self.sets.failed.add(*id, now);
         self.spare.remove(id);
+        let bi = self.bucket_index(id);
+        self.buckets[bi].failed += 1;
         self.remove_node(id, false);
     }
 
@@ -293,7 +337,8 @@ impl<N: TopicNode> Search<N> {
     }
 
     /// Records the ad count of a reply and moves the active bucket by the median of the
-    /// recent replies from that bucket.
+    /// recent replies from that bucket. A bucket outside `SEARCH_AUX_RADIUS` of the
+    /// active one can only pull the search toward itself.
     fn observe(&mut self, bi: usize, ads: usize) {
         let last = self.buckets.len() - 1;
         let b = &mut self.buckets[bi];
@@ -308,7 +353,7 @@ impl<N: TopicNode> Search<N> {
         sorted.sort_unstable();
         let (lower, upper) = (sorted[(sorted.len() - 1) / 2], sorted[sorted.len() / 2]);
         let floor = SEARCH_YIELD_FLOOR;
-        self.active = if lower >= F_RETURN {
+        let next = if lower >= F_RETURN {
             bi.saturating_sub(1)
         } else if upper >= floor {
             bi
@@ -318,22 +363,61 @@ impl<N: TopicNode> Search<N> {
             let jump = (floor as f64 / upper as f64).log2().ceil() as usize;
             last.min(bi + jump.min(SEARCH_MAX_JUMP))
         };
+        let a = self.active;
+        if bi.abs_diff(a) <= SEARCH_AUX_RADIUS || (bi < a && next <= bi) || (bi > a && next > bi) {
+            self.active = next;
+            self.placed = true;
+        }
     }
 
-    /// Adds the answer of `from` to a topic query. `from` keeps its subnet counted
-    /// against its bucket's IP limit for the rest of the pass.
-    pub fn add_query_results(
+    /// Adds the complete answer of `from` to a topic query. `ads` is the number of
+    /// usable ads it carried; `sent` is its yield sample, the ads counted before the
+    /// `td` check. `from` keeps its subnet counted against its bucket's IP limit for the
+    /// rest of the pass.
+    pub fn add_reply(
         &mut self,
         from: &N,
         results: impl IntoIterator<Item = N>,
+        ads: usize,
+        sent: usize,
         now: Instant,
     ) {
-        let results: Vec<N> = results.into_iter().collect();
+        self.add_reply_sampled(from, results, ads, sent, true, now);
+    }
+
+    /// Adds an answer cut short. Its count is a lower bound, a yield sample only when it
+    /// reaches `SEARCH_YIELD_FLOOR` on its own.
+    pub fn add_partial_reply(
+        &mut self,
+        from: &N,
+        results: impl IntoIterator<Item = N>,
+        ads: usize,
+        sent: usize,
+        now: Instant,
+    ) {
+        let sample = sent >= SEARCH_YIELD_FLOOR;
+        self.add_reply_sampled(from, results, ads, sent, sample, now);
+    }
+
+    fn add_reply_sampled(
+        &mut self,
+        from: &N,
+        results: impl IntoIterator<Item = N>,
+        ads: usize,
+        sent: usize,
+        sample: bool,
+        now: Instant,
+    ) {
         let from_id = from.node_id();
+        self.replies += 1;
+        self.ads += ads;
         self.asked_now.insert(from_id);
         self.spare.remove(&from_id);
         let bi = self.bucket_index(&from_id);
-        self.observe(bi, results.len());
+        self.buckets[bi].done += 1;
+        if sample {
+            self.observe(bi, sent);
+        }
         self.sets.asked.add(from_id, now);
         self.remove_node(&from_id, true);
 
@@ -380,6 +464,20 @@ mod tests {
 
     fn local_id() -> NodeId {
         NodeId::new(&[0xff; 32])
+    }
+
+    impl Search<TestNode> {
+        /// Adds a reply whose ads are all usable and all taken as results.
+        fn add_query_results(
+            &mut self,
+            from: &TestNode,
+            results: impl IntoIterator<Item = TestNode>,
+            now: Instant,
+        ) {
+            let results: Vec<_> = results.into_iter().collect();
+            let n = results.len();
+            self.add_reply(from, results, n, n, now);
+        }
     }
 
     fn search(config: TopicConfig) -> Search<TestNode> {
@@ -824,8 +922,8 @@ mod tests {
         assert!(next.buckets[0].contains(&other.id));
     }
 
-    // A search with nothing left to ask moves one bucket closer for the next pass, and
-    // stops at the closest one.
+    // A search with nothing left to ask starts the next pass one bucket closer, and
+    // lands at the closest one.
     #[test]
     fn adaptive_walked_dry() {
         let now = Instant::now();
@@ -833,11 +931,294 @@ mod tests {
         s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 256, 1, 1), now);
         reply(&mut s, 0, 0);
         assert!(s.is_done());
-        assert_eq!(s.active_bucket(), 1);
+        assert_eq!(s.next_pass_bucket(), 1);
+        s.set_active_bucket(DEPTH - 2);
+        assert!(s.is_done());
+        assert_eq!(s.next_pass_bucket(), DEPTH - 1);
         s.set_active_bucket(DEPTH + 5);
         assert_eq!(s.active_bucket(), DEPTH - 1);
+    }
+
+    // is_done does not move the active bucket, however often it is called. A pass that
+    // ran dry starts the next one a bucket in.
+    #[test]
+    fn adaptive_is_done_once() {
+        let mut s = search(test_config());
+        s.set_active_bucket(3);
+        for _ in 0..3 {
+            assert!(s.is_done(), "empty search not done");
+            assert_eq!(s.active_bucket(), 3);
+        }
+        assert_eq!(s.next_pass_bucket(), 4);
+    }
+
+    // The yield sample of a reply is the number of ads it carried, not the number of
+    // results taken from it.
+    #[test]
+    fn adaptive_reply_size() {
+        let now = Instant::now();
+        let mut s = adaptive_search();
+        s.set_active_bucket(3);
+        for i in 0..2 {
+            let n = s.query_target(now).unwrap();
+            assert_eq!(s.bucket_index(&n.id), 3, "query {i} not to bucket 3");
+            let results = nodes_at_distance_from(&TOPIC1, 100, 6, 300 + 10 * i);
+            s.add_reply(&n, results, F_RETURN, F_RETURN, now);
+        }
+        assert_eq!(s.active_bucket(), 2);
+    }
+
+    // Replies from a helper outside the active neighbourhood do not drag a search
+    // settled close to the topic back out; full replies from a neighbour do move it.
+    #[test]
+    fn helper_keeps_bucket() {
+        let now = Instant::now();
+        let mut s = search(test_config());
+        s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 255, 2, 1), now);
+        s.set_active_bucket(8);
+        reply(&mut s, 1, 0);
+        reply(&mut s, 1, 0);
+        assert_eq!(s.active_bucket(), 8);
+        s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 249, 2, 10), now);
+        reply(&mut s, 7, F_RETURN);
+        reply(&mut s, 7, F_RETURN);
+        assert_eq!(s.active_bucket(), 6);
+    }
+
+    // A pass ends after SEARCH_PASS_QUERIES queries whatever their outcome, while every
+    // query refills the active bucket.
+    #[test]
+    fn pass_budget() {
+        type Outcome = fn(&mut Search<TestNode>, &TestNode, Instant);
+        let outcomes: [(&str, Outcome); 3] = [
+            ("full", |s, n, now| {
+                s.add_reply(n, [], F_RETURN, F_RETURN, now)
+            }),
+            ("partial", |s, n, now| {
+                s.add_partial_reply(n, [], 0, SEARCH_YIELD_FLOOR - 1, now)
+            }),
+            ("failed", |s, n, now| s.handle_error_response(&n.id, now)),
+        ];
+        for (name, outcome) in outcomes {
+            let now = Instant::now();
+            let mut s = search(test_config());
+            s.set_active_bucket(3);
+            // Distinct /24s, so the IP limit admits every node.
+            let fresh = |s: &Search<TestNode>, i: usize| {
+                let ip = Ipv4Addr::new(1 + (i / 256) as u8, (i % 256) as u8, 3, 4).into();
+                node_at_distance(&TOPIC1, s.buckets[s.active].dist as usize, ip)
+            };
+            let seeds = [fresh(&s, 0), fresh(&s, 1)];
+            s.add_nodes(None, seeds, now);
+            for i in 0..SEARCH_PASS_QUERIES {
+                let n = s
+                    .query_target(now)
+                    .unwrap_or_else(|| panic!("{name}: no target at query {i}"));
+                outcome(&mut s, &n, now);
+                let aux = fresh(&s, 2 + i);
+                s.add_nodes(Some(&n.id), [aux], now);
+            }
+            assert!(s.query_target(now).is_none(), "{name}: query after budget");
+            assert!(s.is_done(), "{name}: pass not done after its budget");
+            assert_eq!(s.next_pass_bucket(), s.active_bucket(), "{name}");
+        }
+    }
+
+    // A helper farther out than the active bucket can only pull the search out.
+    #[test]
+    fn far_helper_pulls_out() {
+        let far = || {
+            let mut s = search(test_config());
+            s.add_nodes(
+                None,
+                nodes_at_distance_from(&TOPIC1, 247, 2, 1),
+                Instant::now(),
+            );
+            s.set_active_bucket(12);
+            s
+        };
+        for (ads, want) in [([2, 2], 12), ([16, 16], 8), ([8, 9], 9)] {
+            let mut s = far();
+            for n in ads {
+                reply(&mut s, 9, n);
+            }
+            assert_eq!(s.active_bucket(), want, "replies {ads:?}");
+        }
+    }
+
+    // A partial reply is a yield sample only at the floor or above, and its usable ads
+    // count either way.
+    #[test]
+    fn partial_reply() {
+        let now = Instant::now();
+        let mut s = adaptive_search();
+        s.set_active_bucket(3);
+        reply(&mut s, 3, 0);
+        let regs = nodes_at_distance_from(&TOPIC1, 253, 2, 50);
+        s.add_nodes(None, regs.clone(), now);
+        s.add_partial_reply(&regs[0], [], 0, 0, now);
+        assert_eq!(s.active_bucket(), 3, "moved on an empty partial reply");
+        s.add_partial_reply(&regs[1], [], F_RETURN, F_RETURN, now);
+        assert_eq!(s.active_bucket(), 3);
+        assert_eq!(s.ads_seen(), F_RETURN);
+        let more = nodes_at_distance_from(&TOPIC1, 253, 1, 60);
+        s.add_nodes(None, more.clone(), now);
+        s.add_partial_reply(&more[0], [], F_RETURN, F_RETURN, now);
+        assert_eq!(s.active_bucket(), 2);
+    }
+
+    // A partial reply that reaches the floor exactly is a yield sample.
+    #[test]
+    fn partial_reply_at_floor() {
+        let now = Instant::now();
+        let mut s = search(test_config());
+        s.set_active_bucket(4);
+        let regs = nodes_at_distance_from(&TOPIC1, 253, 2, 1);
+        s.add_nodes(None, regs.clone(), now);
+        for n in &regs {
+            s.add_partial_reply(n, [], 0, SEARCH_YIELD_FLOOR, now);
+        }
+        assert_eq!(s.active_bucket(), 3);
+    }
+
+    // A bucket within SEARCH_AUX_RADIUS moves the search either way; a helper closer in
+    // beyond it can push the search in.
+    #[test]
+    fn near_helpers_move() {
+        let now = Instant::now();
+        for (dist, ads, want) in [(247, 8, 9), (246, 0, 14)] {
+            let mut s = search(test_config());
+            s.add_nodes(None, nodes_at_distance_from(&TOPIC1, dist, 2, 1), now);
+            s.set_active_bucket(8);
+            reply(&mut s, 256 - dist, ads);
+            reply(&mut s, 256 - dist, ads);
+            assert_eq!(
+                s.active_bucket(),
+                want,
+                "replies of {ads} from {}",
+                256 - dist
+            );
+        }
+    }
+
+    // The active bucket is not failed when one of its queries was answered, even below
+    // the sample threshold, or when a yield sample placed it.
+    #[test]
+    fn answered_or_placed_not_failed() {
+        let now = Instant::now();
+        let mut s = adaptive_search();
+        s.set_active_bucket(3);
+        reply(&mut s, 3, 0);
+        let n = s.query_target(now).unwrap();
+        assert_eq!(s.bucket_index(&n.id), 3);
+        s.handle_error_response(&n.id, now);
+        while let Some(n) = s.query_target(now) {
+            s.handle_error_response(&n.id, now);
+        }
         assert!(s.is_done());
-        assert_eq!(s.active_bucket(), DEPTH - 1);
+        assert!(!s.active_failed());
+        assert_eq!(s.next_pass_bucket(), 4);
+
+        let mut s = search(test_config());
+        s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 252, 2, 1), now);
+        s.set_active_bucket(3);
+        reply(&mut s, 4, F_RETURN);
+        reply(&mut s, 4, F_RETURN);
+        assert_eq!(s.active_bucket(), 3);
+        s.add_nodes(None, nodes_at_distance_from(&TOPIC1, 253, 1, 10), now);
+        let n = s.query_target(now).unwrap();
+        assert_eq!(s.bucket_index(&n.id), 3);
+        s.handle_error_response(&n.id, now);
+        assert!(!s.active_failed());
+        assert_eq!(s.next_pass_bucket(), 3);
+    }
+
+    // A yield sample that moved the active bucket places the next pass, also when the
+    // rest of the pass fails and runs dry.
+    #[test]
+    fn move_survives_pass_end() {
+        let now = Instant::now();
+        let mut s = adaptive_search();
+        s.set_active_bucket(5);
+        reply(&mut s, 5, F_RETURN);
+        reply(&mut s, 5, F_RETURN);
+        assert_eq!(s.active_bucket(), 4);
+        while s.pop_result().is_some() {}
+        while let Some(n) = s.query_target(now) {
+            s.handle_error_response(&n.id, now);
+        }
+        assert!(s.is_done());
+        assert_eq!(s.next_pass_bucket(), 4);
+    }
+
+    // A pass with no ads that started at the closest bucket starts the next one at the
+    // farthest. Landing at the closest bucket is not enough.
+    #[test]
+    fn empty_topic_restarts_wide() {
+        let now = Instant::now();
+        let mut s = adaptive_search();
+        let last = DEPTH - 1;
+        s.set_active_bucket(last - 1);
+        assert_eq!(s.next_pass_bucket(), last);
+        s.set_active_bucket(last);
+        s.add_nodes(
+            None,
+            nodes_at_distance_from(&TOPIC1, 256 - last, 1, 70),
+            now,
+        );
+        reply(&mut s, last, 0);
+        assert_eq!(s.next_pass_bucket(), 0);
+        s.set_active_bucket(3);
+        assert_eq!(s.next_pass_bucket(), 4);
+    }
+
+    // An empty pass that started at an empty closest bucket starts the next one wide.
+    #[test]
+    fn empty_closest_restarts_wide() {
+        let now = Instant::now();
+        let mut s = adaptive_search();
+        s.set_active_bucket(DEPTH - 1);
+        while let Some(n) = s.query_target(now) {
+            s.add_reply(&n, [], 0, 0, now);
+        }
+        assert!(s.is_done());
+        assert_eq!(s.next_pass_bucket(), 0);
+    }
+
+    // Yield samples that confirm the active bucket place it: the next pass starts there.
+    #[test]
+    fn confirmed_bucket_holds() {
+        let now = Instant::now();
+        let mut s = adaptive_search();
+        s.set_active_bucket(5);
+        reply(&mut s, 5, SEARCH_YIELD_FLOOR);
+        reply(&mut s, 5, SEARCH_YIELD_FLOOR);
+        while s.pop_result().is_some() {}
+        assert_eq!(s.active_bucket(), 5);
+        while let Some(n) = s.query_target(now) {
+            s.handle_error_response(&n.id, now);
+        }
+        assert_eq!(s.next_pass_bucket(), 5);
+    }
+
+    // An active bucket that was asked but whose queries all failed is kept for the next
+    // pass.
+    #[test]
+    fn failures_keep_bucket() {
+        let now = Instant::now();
+        let mut s = adaptive_search();
+        s.set_active_bucket(3);
+        for i in 0..2 {
+            let n = s.query_target(now).unwrap();
+            assert_eq!(s.bucket_index(&n.id), 3, "query {i} not to bucket 3");
+            s.handle_error_response(&n.id, now);
+        }
+        assert!(s.active_failed());
+        while let Some(n) = s.query_target(now) {
+            s.handle_error_response(&n.id, now);
+        }
+        assert!(s.is_done());
+        assert_eq!(s.next_pass_bucket(), 3);
     }
 
     // A pass with every known node already asked asks one of them again, once, and
