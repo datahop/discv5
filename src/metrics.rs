@@ -37,6 +37,8 @@ pub(crate) struct TopicCounters {
     pub topicnodes_recv: AtomicUsize,
     pub regtopic_rejected: AtomicUsize,
     pub ticket_issued: AtomicUsize,
+    pub ticket_recv: AtomicUsize,
+    pub rejection_recv: AtomicUsize,
     pub ticket_early: AtomicUsize,
     pub ticket_late: AtomicUsize,
     pub ticket_expired: AtomicUsize,
@@ -58,6 +60,8 @@ impl TopicCounters {
             topicnodes_recv: self.topicnodes_recv.load(Ordering::Relaxed),
             regtopic_rejected: self.regtopic_rejected.load(Ordering::Relaxed),
             ticket_issued: self.ticket_issued.load(Ordering::Relaxed),
+            ticket_recv: self.ticket_recv.load(Ordering::Relaxed),
+            rejection_recv: self.rejection_recv.load(Ordering::Relaxed),
             ticket_early: self.ticket_early.load(Ordering::Relaxed),
             ticket_late: self.ticket_late.load(Ordering::Relaxed),
             ticket_expired: self.ticket_expired.load(Ordering::Relaxed),
@@ -83,6 +87,10 @@ pub struct TopicMetrics {
     pub regtopic_rejected: usize,
     /// Tickets issued in REGCONFIRMATION.
     pub ticket_issued: usize,
+    /// REGCONFIRMATIONs received with a ticket.
+    pub ticket_recv: usize,
+    /// REGCONFIRMATIONs received with a rejection.
+    pub rejection_recv: usize,
     /// Tickets presented before their window and echoed.
     pub ticket_early: usize,
     /// Tickets credited late, within the grace.

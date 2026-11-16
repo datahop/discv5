@@ -568,6 +568,11 @@ impl Service {
                         .topic
                         .regconfirmation_recv
                         .fetch_add(1, Ordering::Relaxed);
+                    if !ticket.is_empty() {
+                        METRICS.topic.ticket_recv.fetch_add(1, Ordering::Relaxed);
+                    } else if wait_time == 0 {
+                        METRICS.topic.rejection_recv.fetch_add(1, Ordering::Relaxed);
+                    }
                     collected.confirmation = Some((ticket, wait_time));
                 }
                 ResponseBody::Nodes { nodes, .. } => {
