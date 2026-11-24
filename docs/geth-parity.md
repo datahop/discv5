@@ -154,7 +154,8 @@ more than one reading. The Rust code follows the spec in each.
   `trackTopicRequest(.., true)` (`v5_topic.go:329-338`), so the answer does not clear the
   failures. Rust clears them on any REGCONFIRMATION (`service/topic.rs:663-667`, test
   `service/topic.rs::answer_restores_liveness`, case "error after confirmation") and fails the
-  attempt as geth does (`reg_outcome`, `service/topic.rs:1096`). No Rust change.
+  attempt as geth does (`reg_outcome`, `service/topic.rs:1096`). No Rust change. geth fix proposed in
+  datahop/go-ethereum#194 (open).
 - **S4, TOPICQUERY packet and record caps (geth deviation, three parts):** per datahop/devp2p#52
   (pending) `QueryRespLimit` is 24, `F_return` + `AuxENRLimit`, so that an honest registrar may
   send one record per packet; the spec text at `ff1e30ab0` still says 16 (quoted in S1). A
@@ -175,6 +176,7 @@ more than one reading. The Rust code follows the spec in each.
   records, announced 5, announced 24 at one record per packet),
   `service/topic.rs::topic_response_caps` (24 packets, 16 advertisers, 8 auxiliary ENRs kept). The
   interop smoke is not affected: no case sends a TOPICQUERY response of more than a few packets.
+  geth fix for all three parts proposed in datahop/go-ethereum#194 (open).
 
 Checked with no other mismatch found: liveness apart from S3 and S4 (a REGTOPIC timeout before
 the REGCONFIRMATION or a TOPICQUERY timeout before any valid record is one failure, other

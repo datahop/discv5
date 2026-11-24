@@ -9,7 +9,7 @@ datahop/devp2p `ff1e30ab0` and geth at datahop/go-ethereum `topdisc` `3b8bef9e3`
 ## Enable
 
 ```toml
-discv5 = { git = "https://github.com/datahop/discv5", branch = "discng-clients/m1", features = ["topic-discovery"] }
+discv5 = { git = "https://github.com/datahop/discv5", branch = "topdisc", features = ["topic-discovery"] }
 ```
 
 With the feature on, the node always runs TopDisc: its ENR carries `td = 1`, it answers
