@@ -3,10 +3,11 @@
 This crate implements the topic-based service discovery (TopDisc) part of the Discovery v5
 spec: the wire messages of `discv5-wire.md` (REGTOPIC, REGCONFIRMATION, TOPICQUERY,
 TOPICNODES) and the behaviour of `discv5-theory.md`, section "Topic-based Service
-Discovery" (datahop/devp2p, `master`). The spec is the reference. This file says where each
-part lives, and lists the few points the spec leaves to the implementation, with the choice
-made here. Those choices match the geth implementation (datahop/go-ethereum, `topdisc`)
-except where noted.
+Discovery" (datahop/devp2p `master` at `ff1e30ab0`). The spec is the reference. This file
+says where each part lives, and lists the few points the spec leaves to the implementation,
+with the choice made here. Those choices match the geth implementation (datahop/go-ethereum
+`topdisc` at `3b8bef9e3`) except where noted. `docs/geth-parity.md` maps the geth PRs and tests
+to this code and lists the differences.
 
 Everything is behind the Cargo feature `topic-discovery` (default off). With the feature
 off the crate is upstream discv5. With it on, topic discovery is always on: there is no
@@ -94,11 +95,14 @@ strict decoding.
   `REG_STANDBY_LIMIT` standby candidates and one registrar per `/24` per bucket.
 - Candidates come from the routing table (all `td` entries, random order) and from
   auxiliary ENRs, under the five rules of Advertisement Placement. The failed and overloaded
-  sets keep a registrar out for `ASKED_FAILED_TTL` / `OVERLOADED_TTL` from its first entry.
+  sets keep a registrar out for the ad lifetime from its first entry (`ASKED_FAILED_TTL` /
+  `OVERLOADED_TTL` at the default lifetime).
 - Scheduling: due attempts are served one per bucket in turn from the farthest bucket, a due
   ticket retry before a first contact. A ticket retry does not wait for other requests.
-- Quotes below `W_MIN` are waited as `W_MIN` and count toward `REG_ATTEMPT_BUDGET`; a single
-  or total quote above the budget abandons the attempt into the overloaded set. A rejection,
+- Quotes below `W_MIN` are waited as `W_MIN` and count toward the attempt budget,
+  `TopicConfig::reg_attempt_timeout` or 1.5 times the ad lifetime (`REG_ATTEMPT_BUDGET` at the
+  default lifetime); a single or total quote above the budget abandons the attempt into the
+  overloaded set. A rejection,
   or a timeout before the REGCONFIRMATION, puts the registrar into the failed set. A timeout
   after it keeps the confirmation. Each removal refills the slot from standby.
 - Renewal follows the spec: no re-registration before expiry; at expiry the registrar leaves
@@ -110,7 +114,7 @@ strict decoding.
 - `Discv5::topic_search_stream` runs one lookup until the stream is dropped. Each pass
   fills a fresh search table (`SEARCH_TABLE_DEPTH` buckets, `SEARCH_BUCKET_SIZE` candidates,
   two per `/24` per bucket) from the routing table and sends one TOPICQUERY at a time.
-- Registrar selection, the asked and failed sets (`ASKED_FAILED_TTL`), spares, and the
+- Registrar selection, the asked and failed sets (kept for the ad lifetime), spares, and the
   `SEARCH_SUBNET_LIMIT` per `/24` follow Registrar Selection. A registrar that answered keeps
   its `/24` slot in the pass; a failed one releases it. One candidate per bucket per reply is
   admitted.
@@ -133,15 +137,25 @@ strict decoding.
   packet. Topic requests are never retransmitted and are not re-sent when a session is
   re-established; a request lost that way ends as a timeout.
 - The first `total` counts, capped at `REG_RESP_LIMIT` (REGTOPIC, which also needs the
-  REGCONFIRMATION) or `QUERY_RESP_LIMIT` (TOPICQUERY). A TOPICQUERY reply cut short by the
-  cap, a timeout or an error after a valid record is partial (`TopicQueryResult::complete`
-  is false), also when no record is valid at the cap.
+  REGCONFIRMATION) or `QUERY_RESP_LIMIT` (TOPICQUERY; 24 = `F_RETURN + AUX_ENR_LIMIT` per
+  datahop/devp2p#52, pending, so that a registrar may send one record per packet). TOPICQUERY
+  outcomes follow the pending spec clarification (datahop/devp2p#52): complete when the whole
+  announced `total` arrived, with any number of records, so a `total` above `QUERY_RESP_LIMIT`
+  never completes; partial (`TopicQueryResult::complete` is false) when it ended early, by the
+  cap, a timeout or an error, after a valid record; failed when it ended early without one, at
+  the cap as `RequestError::InvalidRemotePacket`. A failed query puts the registrar in the
+  lookup's failed set.
 - Returned records pass the relay rule against the registrar's address and are
-  de-duplicated per kind; at most `F_RETURN` advertisers and the cap of the request kind for
-  auxiliary ENRs are kept.
+  de-duplicated per kind; at most `F_RETURN` advertisers and, for auxiliary ENRs,
+  `REG_RESP_LIMIT` (REGTOPIC) or `AUX_ENR_LIMIT` (TOPICQUERY, datahop/devp2p#52, pending) are
+  kept.
 - Liveness: the routing table has no failure counter. A REGTOPIC timeout before the
   REGCONFIRMATION, or a TOPICQUERY timeout before any valid record, marks the node
-  `Disconnected` in the routing table. Nothing else does.
+  `Disconnected` in the routing table and takes it off the ping schedule, as one failed
+  request of the routing table does. Nothing else does. An answer to a later topic request
+  (a REGCONFIRMATION, a complete TOPICQUERY response even without records, or a partial
+  one) connects a `Disconnected` entry again and puts it back on the ping schedule. A failed
+  request that is not a timeout changes nothing.
 
 ## Where the spec is silent
 
@@ -189,7 +203,8 @@ pub enum RegConfirmation { Admitted { lifetime }, Ticket { ticket, wait }, Rejec
 pub struct RegTopicResult { pub confirmation: RegConfirmation, pub aux: Vec<Enr> }
 pub struct TopicQueryResult { pub advertisers: Vec<Enr>, pub aux: Vec<Enr>, pub complete: bool }
 pub struct TopicConfig { ad_lifetime, ad_cache_size, reg_bucket_size,
-                         reg_bucket_standby_limit, reg_attempt_timeout, search_bucket_size }
+                         reg_bucket_standby_limit, reg_attempt_timeout: Option<Duration>,
+                         search_bucket_size }
 
 // discv5::Event
 Event::TopicRegistered { topic: TopicId, registrar: NodeId }
@@ -203,7 +218,8 @@ Event::TopicRegistered { topic: TopicId, registrar: NodeId }
 - `topic_search` reads a stream until `count` distinct advertisers or `Config::query_timeout`.
 - `send_regtopic` and `send_topic_query` are single requests to a chosen node, without the
   `td` filter, for tools and tests.
-- `TopicConfig` defaults are the spec's parameters. `Discv5::metrics().topic` counts topic
+- `TopicConfig` defaults are the spec's parameters; an unset or zero `reg_attempt_timeout`
+  is 1.5 times `ad_lifetime`, as in geth. `Discv5::metrics().topic` counts topic
   messages, tickets issued and received, rejections sent and received, and ticket outcomes.
 
 ## Tests

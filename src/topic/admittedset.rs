@@ -4,7 +4,7 @@
 use super::{
     TopicNode,
     netutil::{is_lan, prefix},
-    params::{E, SEARCH_SUBNET_LIMIT},
+    params::SEARCH_SUBNET_LIMIT,
 };
 use enr::NodeId;
 use std::{
@@ -15,8 +15,8 @@ use std::{
 /// The prefix length of the search limits, for both address families.
 pub(crate) const SEARCH_SUBNET: u8 = 24;
 
-/// Remembers the nodes a lookup queried, by the `/24` of their endpoint address, for `E`
-/// from the first query: a prefix with `SEARCH_SUBNET_LIMIT` node ids counted can only
+/// Remembers the nodes a lookup queried, by the `/24` of their endpoint address, for the
+/// ad lifetime from the first query: a prefix with `SEARCH_SUBNET_LIMIT` node ids counted can only
 /// have those queried again. A node whose query failed keeps its slot until it expires.
 /// LAN and address-less nodes are not counted.
 #[derive(Debug, Clone)]
@@ -28,17 +28,15 @@ pub struct AdmittedSet {
     expired: Option<Instant>,
 }
 
-impl Default for AdmittedSet {
-    fn default() -> Self {
+impl AdmittedSet {
+    pub fn new(ttl: Duration) -> Self {
         AdmittedSet {
-            ttl: E,
+            ttl,
             subnets: HashMap::new(),
             expired: None,
         }
     }
-}
 
-impl AdmittedSet {
     /// Reports whether `n` may be queried. It does not count `n`.
     pub fn allows<N: TopicNode>(&mut self, n: &N, now: Instant) -> bool {
         let Some(key) = key(n) else {
@@ -88,7 +86,10 @@ fn key<N: TopicNode>(n: &N) -> Option<(bool, u128)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{super::test_util::TestNode, *};
+    use super::{
+        super::{params::E, test_util::TestNode},
+        *,
+    };
     use std::net::{IpAddr, Ipv4Addr};
 
     fn node_with_ip(ip: Option<IpAddr>) -> TestNode {
@@ -111,7 +112,7 @@ mod tests {
     #[test]
     fn limit() {
         let now = Instant::now();
-        let mut a = AdmittedSet::default();
+        let mut a = AdmittedSet::new(E);
         let nodes = subnet_nodes(SEARCH_SUBNET_LIMIT + 1);
         for (i, n) in nodes[..SEARCH_SUBNET_LIMIT].iter().enumerate() {
             assert!(a.allows(n, now), "node {i} refused below the limit");
@@ -125,7 +126,7 @@ mod tests {
         let other = node_with_ip(Some(Ipv4Addr::new(203, 0, 114, 1).into()));
         assert!(a.allows(&other, now), "node from another subnet refused");
 
-        let mut a = AdmittedSet::default();
+        let mut a = AdmittedSet::new(E);
         for n in &nodes[..SEARCH_SUBNET_LIMIT - 1] {
             a.add(n, now);
         }
@@ -140,7 +141,7 @@ mod tests {
     #[test]
     fn exempt() {
         let now = Instant::now();
-        let mut a = AdmittedSet::default();
+        let mut a = AdmittedSet::new(E);
         let mut nodes = Vec::new();
         for i in 0..=SEARCH_SUBNET_LIMIT {
             nodes.push(node_with_ip(Some(
@@ -161,7 +162,7 @@ mod tests {
     #[test]
     fn keeps_first_expiry() {
         let start = Instant::now();
-        let mut a = AdmittedSet::default();
+        let mut a = AdmittedSet::new(E);
         let nodes = subnet_nodes(SEARCH_SUBNET_LIMIT + 1);
         for n in &nodes[..SEARCH_SUBNET_LIMIT] {
             a.add(n, start);

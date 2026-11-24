@@ -6,7 +6,7 @@ use super::{
     askedset::AskedSet,
     bucket_index,
     netutil::{DistinctNetSet, is_lan, same_net},
-    params::{ASKED_FAILED_TTL, OVERLOADED_TTL, REG_TABLE_DEPTH, W_MIN},
+    params::{REG_TABLE_DEPTH, W_MIN},
 };
 use crate::Enr;
 use enr::NodeId;
@@ -127,6 +127,7 @@ impl<N: TopicNode> Registration<N> {
                 ips: DistinctNetSet::new(REG_BUCKET_SUBNET, REG_BUCKET_IP_LIMIT),
             })
             .collect();
+        let ttl = config.ad_lifetime;
         Registration {
             topic,
             local_id,
@@ -134,8 +135,8 @@ impl<N: TopicNode> Registration<N> {
             buckets,
             queue: BTreeMap::new(),
             next_seq: 0,
-            failed: AskedSet::new(ASKED_FAILED_TTL),
-            overloaded: AskedSet::new(OVERLOADED_TTL),
+            failed: AskedSet::new(ttl),
+            overloaded: AskedSet::new(ttl),
             rr_bucket: REG_TABLE_DEPTH - 1,
         }
     }
@@ -348,7 +349,7 @@ impl<N: TopicNode> Registration<N> {
         };
         let clamped = wait_time < W_MIN;
         let wait_time = wait_time.max(W_MIN);
-        let budget = self.config.reg_attempt_timeout;
+        let budget = self.config.attempt_timeout();
         let Some(att) = self.buckets[bi].att.get_mut(id) else {
             return clamped;
         };
@@ -469,7 +470,10 @@ impl<N: TopicNode> Registration<N> {
 #[cfg(test)]
 mod tests {
     use super::{
-        super::{params::MAX_WAIT_TIME, test_util::*},
+        super::{
+            params::{ASKED_FAILED_TTL, MAX_WAIT_TIME, OVERLOADED_TTL},
+            test_util::*,
+        },
         *,
     };
     use std::{collections::HashMap, net::Ipv4Addr};
@@ -781,7 +785,7 @@ mod tests {
     fn ticket_response_total_above_budget() {
         let mut now = Instant::now();
         let mut config = test_config();
-        config.reg_attempt_timeout = Duration::from_secs(100);
+        config.reg_attempt_timeout = Some(Duration::from_secs(100));
         let mut r = registration(config);
         r.add_nodes(None, nodes_at_distance(&TOPIC1, 30, 1), now);
         let att = r.update(now).unwrap();
@@ -835,7 +839,7 @@ mod tests {
         let now = Instant::now();
         let mut config = test_config();
         config.ad_lifetime = Duration::from_secs(15 * 60);
-        config.reg_attempt_timeout = Duration::from_secs(22 * 60 + 30);
+        config.reg_attempt_timeout = Some(Duration::from_secs(22 * 60 + 30));
         let mut r = registration(config);
         let node = nodes_at_distance(&TOPIC1, 30, 1);
         r.add_nodes(None, node.clone(), now);
@@ -863,7 +867,7 @@ mod tests {
             let now = Instant::now();
             let mut config = test_config();
             config.ad_lifetime = Duration::from_secs(15 * 60);
-            config.reg_attempt_timeout = Duration::from_secs(22 * 60 + 30);
+            config.reg_attempt_timeout = Some(Duration::from_secs(22 * 60 + 30));
             config.reg_bucket_size = 1;
             let mut r = registration(config);
             let nodes = nodes_at_distance(&TOPIC1, 30, 2);
@@ -925,7 +929,7 @@ mod tests {
     fn ticket_response_below_floor() {
         let mut now = Instant::now();
         let mut config = test_config();
-        config.reg_attempt_timeout = 5 * W_MIN;
+        config.reg_attempt_timeout = Some(5 * W_MIN);
         let mut r = registration(config);
         let node = nodes_at_distance(&TOPIC1, 30, 1);
         r.add_nodes(None, node.clone(), now);
@@ -956,28 +960,34 @@ mod tests {
         assert_eq!(r.attempt(&att).unwrap().next_time, now + W_MIN);
     }
 
-    // A failed registrar is not admitted again until the failed TTL has passed.
+    // A failed registrar is not admitted again until the failed TTL, the configured ad
+    // lifetime, has passed.
     #[test]
     fn failed_excluded() {
-        let start = Instant::now();
-        let mut r = registration(test_config());
-        let node = nodes_at_distance(&TOPIC1, 30, 1);
-        r.add_nodes(None, node.clone(), start);
-        let att = r.update(start).expect("no request scheduled");
-        assert!(r.start_request(&att));
-        r.handle_error_response(&att, start);
-        assert_eq!(r.node_count(), 0);
+        for ttl in [ASKED_FAILED_TTL, Duration::from_secs(60)] {
+            let start = Instant::now();
+            let mut r = registration(TopicConfig {
+                ad_lifetime: ttl,
+                ..test_config()
+            });
+            let node = nodes_at_distance(&TOPIC1, 30, 1);
+            r.add_nodes(None, node.clone(), start);
+            let att = r.update(start).expect("no request scheduled");
+            assert!(r.start_request(&att));
+            r.handle_error_response(&att, start);
+            assert_eq!(r.node_count(), 0);
 
-        for now in [start, start + ASKED_FAILED_TTL - Duration::from_secs(1)] {
+            for now in [start, start + ttl - Duration::from_secs(1)] {
+                r.add_nodes(None, node.clone(), now);
+                assert_eq!(r.node_count(), 0, "ttl {ttl:?}: failed node re-admitted");
+                assert!(r.update(now).is_none());
+            }
+
+            let now = start + ttl;
             r.add_nodes(None, node.clone(), now);
-            assert_eq!(r.node_count(), 0, "failed node re-admitted");
-            assert!(r.update(now).is_none());
+            assert_eq!(r.update(now), Some(node[0].id), "ttl {ttl:?}");
+            assert_eq!(r.attempt(&att).unwrap().state, RegAttemptState::Waiting);
         }
-
-        let now = start + ASKED_FAILED_TTL;
-        r.add_nodes(None, node.clone(), now);
-        assert_eq!(r.update(now), Some(node[0].id));
-        assert_eq!(r.attempt(&att).unwrap().state, RegAttemptState::Waiting);
     }
 
     // Within a bucket a due ticket holder goes before due first contacts, which follow

@@ -5,7 +5,8 @@ on 127.0.0.1 and checks TopDisc between them in both directions.
 
 ## Build geth devp2p
 
-From a geth checkout at the `topdisc` branch (datahop fork), into a scratch directory:
+From a checkout of datahop/go-ethereum `topdisc` at `3b8bef9e3` or later, into a scratch
+directory:
 
 ```sh
 go build -p 16 -o /tmp/<rundir>/devp2p ./cmd/devp2p

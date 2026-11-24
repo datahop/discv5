@@ -11,8 +11,8 @@ use super::{
     bucket_index,
     netutil::{DistinctNetSet, is_lan},
     params::{
-        ASKED_FAILED_TTL, F_RETURN, SEARCH_AUX_RADIUS, SEARCH_MAX_JUMP, SEARCH_MIN_SAMPLES,
-        SEARCH_PASS_QUERIES, SEARCH_TABLE_DEPTH, SEARCH_YIELD_FLOOR, SEARCH_YIELD_WINDOW,
+        F_RETURN, SEARCH_AUX_RADIUS, SEARCH_MAX_JUMP, SEARCH_MIN_SAMPLES, SEARCH_PASS_QUERIES,
+        SEARCH_TABLE_DEPTH, SEARCH_YIELD_FLOOR, SEARCH_YIELD_WINDOW,
     },
 };
 use crate::Enr;
@@ -20,7 +20,7 @@ use enr::NodeId;
 use rand::seq::IteratorRandom;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::debug;
 
@@ -59,19 +59,30 @@ pub struct SearchSets {
 }
 
 impl Default for SearchSets {
+    /// Empty sets for the default ad lifetime `E`.
     fn default() -> Self {
-        SearchSets {
-            asked: AskedSet::new(ASKED_FAILED_TTL),
-            failed: AskedSet::new(ASKED_FAILED_TTL),
-            admitted: AdmittedSet::default(),
-        }
+        SearchSets::new(super::params::E)
     }
 }
 
 impl SearchSets {
+    /// Empty sets keeping their entries for `ttl`, the ad lifetime.
+    pub fn new(ttl: Duration) -> Self {
+        SearchSets {
+            asked: AskedSet::new(ttl),
+            failed: AskedSet::new(ttl),
+            admitted: AdmittedSet::new(ttl),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn asked_len(&self) -> usize {
         self.asked.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit<N: TopicNode>(&mut self, n: &N, now: Instant) {
+        self.admitted.add(n, now);
     }
 }
 
@@ -115,6 +126,7 @@ impl<N: TopicNode> Search<N> {
                 ips: DistinctNetSet::new(SEARCH_SUBNET, SEARCH_BUCKET_IP_LIMIT),
             })
             .collect();
+        let sets = SearchSets::new(config.ad_lifetime);
         Search {
             topic,
             local_id,
@@ -125,7 +137,7 @@ impl<N: TopicNode> Search<N> {
             placed: false,
             replies: 0,
             ads: 0,
-            sets: SearchSets::default(),
+            sets,
             spare: HashMap::new(),
             spare_used: false,
             asked_now: HashSet::new(),
@@ -461,12 +473,12 @@ impl<N: TopicNode> Search<N> {
 mod tests {
     use super::{
         super::{
-            params::{E, SEARCH_SUBNET_LIMIT},
+            params::{ASKED_FAILED_TTL, E, SEARCH_SUBNET_LIMIT},
             test_util::*,
         },
         *,
     };
-    use std::{net::Ipv4Addr, time::Duration};
+    use std::net::Ipv4Addr;
 
     const DEPTH: usize = 18;
     const SEC: Duration = Duration::from_secs(1);
@@ -718,7 +730,8 @@ mod tests {
         assert!(s.pop_result().is_none());
     }
 
-    // A node already returned in this pass is not returned again with a newer record.
+    // A node already returned in this pass is not returned again, with a newer record
+    // or the old one.
     #[test]
     fn result_newer_record() {
         let now = Instant::now();
@@ -734,10 +747,12 @@ mod tests {
             seq: 2,
             ..old.clone()
         };
-        s.add_query_results(&regs[0], [old], now);
+        s.add_query_results(&regs[0], [old.clone()], now);
         s.pop_result();
         s.add_query_results(&regs[1], [updated], now);
-        assert!(s.peek_result().is_none());
+        assert!(s.peek_result().is_none(), "newer record returned again");
+        s.add_results([old]);
+        assert!(s.peek_result().is_none(), "older record returned again");
     }
 
     // The buckets with room around the active one are listed.
@@ -1414,6 +1429,32 @@ mod tests {
         }
     }
 
+    // The asked, failed and admitted sets keep their entries for the configured ad
+    // lifetime, as geth's sets built from `AdLifetime`.
+    #[test]
+    fn sets_follow_ad_lifetime() {
+        let start = Instant::now();
+        let lifetime = 60 * SEC;
+        let mut sets = search(TopicConfig {
+            ad_lifetime: lifetime,
+            ..test_config()
+        })
+        .into_sets();
+        let nodes = subnet_nodes_at(10, &[200; SEARCH_SUBNET_LIMIT + 1]);
+        for n in &nodes[..SEARCH_SUBNET_LIMIT] {
+            sets.asked.add(n.id, start);
+            sets.failed.add(n.id, start);
+            sets.admitted.add(n, start);
+        }
+        let (n, last) = (&nodes[0], &nodes[SEARCH_SUBNET_LIMIT]);
+        let before = start + lifetime - SEC;
+        assert!(sets.asked.has(&n.id, before) && sets.failed.has(&n.id, before));
+        assert!(!sets.admitted.allows(last, before));
+        let at = start + lifetime;
+        assert!(!sets.asked.has(&n.id, at) && !sets.failed.has(&n.id, at));
+        assert!(sets.admitted.allows(last, at));
+    }
+
     // A spare asked from the table in this pass leaves the spares, whether it answers
     // or fails: the pass does not wait on a spare it will never ask.
     #[test]
@@ -1445,7 +1486,7 @@ mod tests {
         let start = Instant::now();
         let seeds = subnet_nodes_at(1, &[256, 256, 255, 255, 254, 254, 253, 253, 252, 252]);
         let helper = node_at_distance(&TOPIC1, 243, int_ip(9));
-        let mut sets = SearchSets::default();
+        let mut sets = SearchSets::new(E);
         let mut now = start;
         let mut pass = 0;
         while now <= start + E * 2 {
@@ -1516,7 +1557,7 @@ mod tests {
 
         let start = Instant::now();
         let mut now = start;
-        let mut sets = SearchSets::default();
+        let mut sets = SearchSets::new(E);
         let mut queried = HashSet::new();
         let nodes = subnet_nodes_at(1, &[256; SEARCH_SUBNET_LIMIT + 2]);
         for i in (0..nodes.len()).step_by(2) {
@@ -1559,7 +1600,7 @@ mod tests {
         let pass = || {
             let mut sets = SearchSets {
                 asked: asked.clone(),
-                ..Default::default()
+                ..SearchSets::new(E)
             };
             for n in &others[..SEARCH_SUBNET_LIMIT - 1] {
                 sets.admitted.add(n, now);

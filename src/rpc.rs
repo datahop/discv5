@@ -1596,4 +1596,182 @@ mod topic_tests {
         vec![250u64, 251].encode(&mut list);
         assert!(Message::decode(&wrap_list(vec![7], &list)).is_err());
     }
+
+    fn regtopic(id: Vec<u8>, ticket: Vec<u8>, buckets: Vec<u64>) -> Vec<u8> {
+        Message::Request(Request {
+            id: RequestId(id),
+            body: RequestBody::RegTopic {
+                topic: topic(),
+                ticket,
+                enr: record().into(),
+                buckets,
+            },
+        })
+        .encode()
+    }
+
+    fn regconfirmation(id: Vec<u8>, ticket: Vec<u8>) -> Vec<u8> {
+        Message::Response(Response {
+            id: RequestId(id),
+            body: ResponseBody::RegConfirmation {
+                total: 1,
+                ticket,
+                wait_time: 0,
+            },
+        })
+        .encode()
+    }
+
+    fn topicquery(id: Vec<u8>, buckets: Vec<u64>) -> Vec<u8> {
+        Message::Request(Request {
+            id: RequestId(id),
+            body: RequestBody::TopicQuery {
+                topic: topic(),
+                buckets,
+            },
+        })
+        .encode()
+    }
+
+    fn topicnodes(id: Vec<u8>, nodes: usize) -> Vec<u8> {
+        Message::Response(Response {
+            id: RequestId(id),
+            body: ResponseBody::TopicNodes {
+                total: 1,
+                nodes: vec![record(); nodes],
+            },
+        })
+        .encode()
+    }
+
+    /// A message of `kind` whose list holds the given encoded items.
+    fn raw(kind: u8, items: &[&[u8]]) -> Vec<u8> {
+        wrap_list(vec![kind], &items.concat())
+    }
+
+    fn rlp<T: Encodable + ?Sized>(v: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        v.encode(&mut out);
+        out
+    }
+
+    // The malformed topic messages of geth's decode tests do not decode.
+    #[test]
+    fn rejects_malformed_topic_kinds() {
+        let trailing = |mut b: Vec<u8>| {
+            b.push(0);
+            b
+        };
+        let truncated = |mut b: Vec<u8>| {
+            b.pop();
+            b
+        };
+        let id = rlp([1u8].as_slice());
+        let no_buckets = rlp(&Vec::<u64>::new());
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("unknown type", raw(0xee, &[&[1]])),
+            ("regtopic empty", vec![7]),
+            ("regtopic not a list", vec![7, 1]),
+            ("topicquery not a list", vec![9, 1]),
+            ("regtopic too few", raw(7, &[&[1]])),
+            ("regconfirmation too few", raw(8, &[&[1]])),
+            ("topicquery too few", raw(9, &[&[1]])),
+            ("topicnodes too few", raw(10, &[&[1]])),
+            ("topicquery trailing", trailing(topicquery(vec![1], vec![]))),
+            ("topicnodes trailing", trailing(topicnodes(vec![1], 1))),
+            (
+                "regtopic truncated",
+                truncated(regtopic(vec![1], vec![2], vec![])),
+            ),
+            (
+                "topicquery truncated",
+                truncated(topicquery(vec![1], vec![])),
+            ),
+            ("topicnodes truncated", truncated(topicnodes(vec![1], 1))),
+            ("regtopic big req-id", regtopic(vec![0; 9], vec![], vec![])),
+            (
+                "regconfirmation big req-id",
+                regconfirmation(vec![0; 9], vec![]),
+            ),
+            ("topicquery big req-id", topicquery(vec![0; 9], vec![])),
+            ("topicnodes big req-id", topicnodes(vec![0; 9], 0)),
+            (
+                "topicquery too many fields",
+                raw(
+                    9,
+                    &[&id, &rlp(&topic()), &no_buckets, &rlp([2u8].as_slice())],
+                ),
+            ),
+            (
+                "topicquery topic short",
+                raw(9, &[&id, &rlp([0u8; 31].as_slice()), &no_buckets]),
+            ),
+            (
+                "topicquery topic long",
+                raw(9, &[&id, &rlp([0u8; 33].as_slice()), &no_buckets]),
+            ),
+            (
+                "regconfirmation total overflow",
+                raw(8, &[&id, &rlp(&256u64), &rlp([].as_slice()), &rlp(&0u64)]),
+            ),
+            (
+                "topicnodes total overflow",
+                raw(10, &[&id, &rlp(&256u64), &no_buckets]),
+            ),
+            (
+                "regtopic bad enr",
+                raw(
+                    7,
+                    &[&id, &rlp(&topic()), &rlp([].as_slice()), &[1], &no_buckets],
+                ),
+            ),
+            (
+                "topicnodes bad enr",
+                raw(10, &[&id, &rlp(&1u64), &wrap_list(vec![], &[1])]),
+            ),
+            (
+                "regtopic distances above the cap",
+                regtopic(vec![1], vec![1], vec![1; MAX_TOPIC_DISTANCES + 1]),
+            ),
+        ];
+        for (name, data) in cases {
+            assert!(Message::decode(&data).is_err(), "{name} decoded");
+        }
+    }
+
+    // Fields at their caps, large opaque tickets and request ids of 0 to 8 bytes
+    // decode.
+    #[test]
+    fn decodes_topic_fields_at_bounds() {
+        let ticket = vec![0xab; 1 << 16];
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "regtopic distances at the cap",
+                regtopic(vec![1], vec![1], vec![1; MAX_TOPIC_DISTANCES]),
+            ),
+            (
+                "topicquery distances at the cap",
+                topicquery(vec![1], vec![1; MAX_TOPIC_DISTANCES]),
+            ),
+            (
+                "topicnodes records at the cap",
+                topicnodes(vec![1], MAX_TOPIC_NODES),
+            ),
+            (
+                "regtopic large ticket",
+                regtopic(vec![1], ticket.clone(), vec![]),
+            ),
+            (
+                "regconfirmation large ticket",
+                regconfirmation(vec![1], ticket),
+            ),
+            ("topicquery empty req-id", topicquery(vec![], vec![])),
+            ("topicquery 1-byte req-id", topicquery(vec![0], vec![])),
+            ("topicquery 8-byte req-id", topicquery(vec![0; 8], vec![])),
+        ];
+        for (name, data) in cases {
+            let message = Message::decode(&data).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(message.encode(), data, "{name}");
+        }
+    }
 }

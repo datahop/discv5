@@ -298,6 +298,53 @@ mod tests {
         assert_eq!(preferred_udp_port(&both), Some(30303));
     }
 
+    // geth's record IP cases: the entry of the source's family must be the source, the
+    // other entry must be routable. The port is not checked.
+    #[test]
+    fn regtopic_record_ip_cases() {
+        let (src4, src6) = (ip("203.0.113.7"), ip("2001:db8::7"));
+        let (other4, pub4, pub6) = (ip("198.51.100.9"), ip("1.2.3.4"), ip("2606:4700::1111"));
+        let (lan4, loop4, linkl6) = (ip("192.168.1.5"), ip("127.0.0.1"), ip("fe80::1"));
+        let mapped4 = ip("::ffff:203.0.113.7");
+        let cases = [
+            ("v4 match", src4, Some(src4), None, true),
+            ("v4 mismatch", src4, Some(other4), None, false),
+            ("v4 src, no v4", src4, None, Some(src6), false),
+            ("v4 src mapped", mapped4, Some(src4), None, true),
+            ("v6 match", src6, None, Some(src6), true),
+            ("v6 mismatch", src6, None, Some(pub6), false),
+            ("v6 src, no v6", src6, Some(src4), None, false),
+            ("v4 src, public v6", src4, Some(src4), Some(pub6), true),
+            ("v6 src, public v4", src6, Some(pub4), Some(src6), true),
+            (
+                "v4 src, link-local v6",
+                src4,
+                Some(src4),
+                Some(linkl6),
+                false,
+            ),
+            ("v6 src, private v4", src6, Some(lan4), Some(src6), false),
+            ("v6 src, loopback v4", src6, Some(loop4), Some(src6), false),
+            ("no addresses", src4, None, None, false),
+        ];
+        for (name, src, ip4, ip6, ok) in cases {
+            let key = CombinedKey::generate_secp256k1();
+            let mut builder = Enr::builder();
+            if let Some(IpAddr::V4(v4)) = ip4 {
+                builder.ip4(v4).udp4(30303);
+            }
+            if let Some(IpAddr::V6(v6)) = ip6 {
+                builder.ip6(v6).udp6(30303);
+            }
+            let enr = builder.build(&key).unwrap();
+            assert_eq!(check_regtopic_record_ip(&enr, src).is_ok(), ok, "{name}");
+        }
+        let key = CombinedKey::generate_secp256k1();
+        let v4 = Ipv4Addr::new(203, 0, 113, 7);
+        let enr = Enr::builder().ip4(v4).udp4(40404).build(&key).unwrap();
+        assert!(check_regtopic_record_ip(&enr, src4).is_ok(), "port differs");
+    }
+
     #[test]
     fn distinct_net_set() {
         let mut set = DistinctNetSet::new(24, 2);

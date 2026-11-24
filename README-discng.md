@@ -2,7 +2,9 @@
 
 This fork adds topic-based service discovery (TopDisc) to discv5, as specified in
 datahop/devp2p `discv5/discv5-theory.md` and `discv5/discv5-wire.md`. `PLAN.md` describes
-what is implemented and where; this file is the usage guide.
+what is implemented and where; this file is the usage guide. The code matches the spec at
+datahop/devp2p `ff1e30ab0` and geth at datahop/go-ethereum `topdisc` `3b8bef9e3`;
+`docs/geth-parity.md` has the evidence and the differences.
 
 ## Enable
 
@@ -70,6 +72,11 @@ cargo run --features topic-discovery --example topdisc_node -- \
 | `--enr-ip`, `--listen-ip`, `--port` | addresses; `--enr-ip` may differ from the socket address |
 | `--bootnode`, `--bootnode-file` | bootnode ENRs |
 | `--report-topic <hex>` | more topics whose held ads `/status` lists |
+| `--lookup-interval <s>` | seconds between the FINDNODE lookups that fill the routing table (default 30) |
+| `--register-after <s>` | seconds to wait after start before registering (default 0) |
+| `--search-timeout <s>` | query timeout of the node (default 60) |
+| `--key <hex>` | private key; a random one when absent |
+| `--status-port <port>` | TCP port of the `/status` server; no server when absent |
 
 `/status` fields include `ads_held_ids` (per topic), `registrars`, `advertiser_ids`,
 `searches_done`, the message counters, and `tickets_issued`, `tickets_recv`,

@@ -79,8 +79,10 @@ pub struct TopicQueryResult {
     pub advertisers: Vec<Enr>,
     /// Registrars near the topic that the registrar knows.
     pub aux: Vec<Enr>,
-    /// All announced packets arrived, up to `QUERY_RESP_LIMIT`. A partial response
-    /// ended early: at the packet cap, a timeout or an error after a valid record.
+    /// All announced packets arrived; a `total` above `QUERY_RESP_LIMIT` never does, as
+    /// the requester stops at the cap. A partial response ended early, at the packet
+    /// cap, by a timeout or an error, after a valid record; one that ended early without
+    /// a valid record is an error.
     pub complete: bool,
 }
 

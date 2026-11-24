@@ -165,12 +165,11 @@ async fn main() {
         .build(&key)
         .unwrap();
 
-    let mut topic_config = TopicConfig {
+    let topic_config = TopicConfig {
         ad_lifetime: Duration::from_secs(args.ad_lifetime),
         ad_cache_size: args.ad_cache_size,
         ..Default::default()
     };
-    topic_config.reg_attempt_timeout = topic_config.ad_lifetime + topic_config.ad_lifetime / 2;
     let listen = ListenConfig::from_ip(IpAddr::V4(args.listen_ip), args.port);
     let config = ConfigBuilder::new(listen)
         .query_timeout(Duration::from_secs(args.search_timeout))

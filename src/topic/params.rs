@@ -75,8 +75,10 @@ pub const USED_TICKET_TTL: Duration = Duration::from_secs(DELTA.as_secs() + EPSI
 pub const USED_TICKET_LIMIT: usize = 16_384;
 /// Response packets an advertiser waits for per REGTOPIC. Theory: Response Splitting.
 pub const REG_RESP_LIMIT: usize = 8;
-/// Response packets a discoverer waits for per TOPICQUERY. Theory: Response Splitting.
-pub const QUERY_RESP_LIMIT: usize = 16;
+/// Response packets a discoverer waits for per TOPICQUERY, `F_RETURN + AUX_ENR_LIMIT`: one
+/// record per packet from an honest registrar. Theory: Response Splitting, as amended by
+/// datahop/devp2p#52 (pending).
+pub const QUERY_RESP_LIMIT: usize = F_RETURN + AUX_ENR_LIMIT;
 /// ENRs per NODES or TOPICNODES response. Theory: Response Splitting.
 pub const ENRS_PER_PACKET: usize = 3;
 /// ENRs above which a TOPICNODES is not decoded. Theory: Response Splitting.
@@ -130,7 +132,7 @@ mod tests {
         assert_eq!(USED_TICKET_TTL, DELTA + EPSILON);
         assert_eq!(USED_TICKET_LIMIT, 16_384);
         assert_eq!(REG_RESP_LIMIT, 8);
-        assert_eq!(QUERY_RESP_LIMIT, 16);
+        assert_eq!(QUERY_RESP_LIMIT, 24);
         assert_eq!(ENRS_PER_PACKET, 3);
         assert_eq!(MAX_TOPIC_NODES, 16);
         assert_eq!(MAX_TOPIC_DISTANCES, 256);

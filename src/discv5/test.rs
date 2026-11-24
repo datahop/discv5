@@ -1062,10 +1062,143 @@ mod topic {
         drop(stream);
     }
 
+    // Twelve advertisers and three registrars on distinct addresses of 127.0.0.0/24, as
+    // the nodes of a docker network: the registrars share a /24 and a registration
+    // bucket, so every advertiser registers with all three only through the LAN
+    // exemption, and a searcher that knows only the registrars finds every advertiser.
+    #[tokio::test]
+    async fn many_advertisers_one_subnet() {
+        init();
+        let config = TopicConfig {
+            ad_lifetime: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let ips: Vec<Ipv4Addr> = (0..16).map(|i| Ipv4Addr::new(127, 0, 0, 10 + i)).collect();
+        let ports = free_ports(&ips);
+        let start = |i: usize, key: CombinedKey| {
+            let (ip, port) = (ips[i], ports[i]);
+            let enr = Enr::builder().ip4(ip).udp4(port).build(&key).unwrap();
+            let config = ConfigBuilder::new(ListenConfig::Ipv4 { ip, port })
+                .topic_config(config.clone())
+                .query_timeout(Duration::from_secs(30))
+                .build();
+            Discv5::new(enr, key, config).unwrap()
+        };
+        // Registrars at distance 256 from the topic: all in bucket 0.
+        let mut keys = Vec::new();
+        while keys.len() < 3 {
+            let key = CombinedKey::generate_secp256k1();
+            if (NodeId::from(key.public()).raw()[0] ^ TOPIC[0]) & 0x80 != 0 {
+                keys.push(key);
+            }
+        }
+        keys.extend((0..13).map(|_| CombinedKey::generate_secp256k1()));
+        let mut nodes: Vec<Discv5> = keys
+            .into_iter()
+            .enumerate()
+            .map(|(i, key)| start(i, key))
+            .collect();
+        for node in &mut nodes {
+            node.start().await.unwrap();
+        }
+        let (registrars, rest) = nodes.split_at(3);
+        let (advertisers, searcher) = rest.split_at(12);
+        let searcher = &searcher[0];
+        for r in registrars {
+            for n in advertisers {
+                r.add_enr(n.local_enr()).unwrap();
+                n.add_enr(r.local_enr()).unwrap();
+            }
+            searcher.add_enr(r.local_enr()).unwrap();
+        }
+
+        for n in advertisers {
+            n.register_topic(TOPIC).unwrap();
+        }
+        let ids: Vec<NodeId> = advertisers
+            .iter()
+            .map(|n| n.local_enr().node_id())
+            .collect();
+        let held = |r: &Discv5| {
+            let ads: Vec<NodeId> = r
+                .local_topic_nodes(TOPIC)
+                .iter()
+                .map(|enr| enr.node_id())
+                .collect();
+            ids.iter().filter(|id| ads.contains(id)).count()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        while registrars.iter().any(|r| held(r) < ids.len()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ads held per registrar: {:?}",
+                registrars.iter().map(held).collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let found = searcher.topic_search(TOPIC, ids.len()).await.unwrap();
+        let mut want = ids.clone();
+        want.sort_by_key(|id| id.raw());
+        assert_eq!(sorted_ids(&found), want);
+    }
+
+    // A shutdown ends the search streams, of a search in a pass and of one waiting for
+    // nodes to ask, and later topic calls fail as not started.
+    #[tokio::test]
+    async fn shutdown_ends_searches() {
+        use futures::StreamExt;
+        init();
+        let config = TopicConfig {
+            ad_lifetime: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let mut nodes = start_topic_nodes(ephemeral_ports(3), config.clone()).await;
+        let mut lone = start_topic_nodes(ephemeral_ports(1), config)
+            .await
+            .remove(0);
+        let advertiser = nodes[0].local_enr().node_id();
+        nodes[0].register_topic(TOPIC).unwrap();
+        wait_registered(&nodes[1..2], advertiser, 1).await;
+
+        let mut running = nodes[2].topic_search_stream(TOPIC).unwrap();
+        let found = tokio::time::timeout(Duration::from_secs(20), running.next())
+            .await
+            .expect("advertiser not found")
+            .expect("stream ended");
+        assert_eq!(found.node_id(), advertiser);
+        let mut waiting = lone.topic_search_stream(TOPIC).unwrap();
+
+        for (node, stream) in [(&mut nodes[2], &mut running), (&mut lone, &mut waiting)] {
+            node.shutdown();
+            let end = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+            assert!(matches!(end, Ok(None)), "stream not ended: {end:?}");
+            assert!(matches!(
+                node.register_topic(TOPIC),
+                Err(Error::ServiceNotStarted)
+            ));
+            assert!(matches!(
+                node.topic_search_stream(TOPIC),
+                Err(Error::ServiceNotStarted)
+            ));
+            assert!(matches!(
+                node.topic_search(TOPIC, 1).await,
+                Err(QueryError::ServiceNotStarted)
+            ));
+        }
+    }
+
     /// UDP ports from the system's ephemeral range that are free now.
     fn ephemeral_ports(n: usize) -> Vec<u16> {
-        let sockets: Vec<std::net::UdpSocket> = (0..n)
-            .map(|_| std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+        free_ports(&vec![Ipv4Addr::LOCALHOST; n])
+    }
+
+    /// One UDP port per address, from the system's ephemeral range, free on that
+    /// address now.
+    fn free_ports(ips: &[Ipv4Addr]) -> Vec<u16> {
+        let sockets: Vec<std::net::UdpSocket> = ips
+            .iter()
+            .map(|ip| std::net::UdpSocket::bind((*ip, 0)).unwrap())
             .collect();
         sockets
             .iter()

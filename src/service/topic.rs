@@ -550,7 +550,7 @@ impl Service {
         }
         let aux_limit = match active_request.request_body {
             RequestBody::RegTopic { .. } => REG_RESP_LIMIT,
-            _ => QUERY_RESP_LIMIT,
+            _ => AUX_ENR_LIMIT,
         };
         let sender = node_address.socket_addr.ip();
         let mut collected = self.topics.responses.remove(&id).unwrap_or_default();
@@ -624,6 +624,32 @@ impl Service {
         self.topic_request_done(active_request, response, Some(error));
     }
 
+    /// Connects a `Disconnected` routing-table entry again after it answered a topic
+    /// request, and pings it on the usual schedule.
+    fn topic_liveness_restored(&mut self, id: NodeId) {
+        let key = kbucket::Key::from(id);
+        let disconnected = matches!(
+            self.kbuckets.write().entry(&key),
+            kbucket::Entry::Present(_, status) if !status.is_connected()
+        );
+        if !disconnected {
+            return;
+        }
+        match self.kbuckets.write().update_node_status(
+            &key,
+            kbucket::ConnectionState::Connected,
+            None,
+        ) {
+            kbucket::UpdateResult::Failed(reason) => {
+                self.peers_to_ping.remove(&id);
+                debug!(%id, ?reason, "Could not reconnect node after a topic answer");
+            }
+            _ => {
+                self.peers_to_ping.insert(id);
+            }
+        }
+    }
+
     fn topic_request_done(
         &mut self,
         active_request: ActiveRequest,
@@ -632,13 +658,22 @@ impl Service {
     ) {
         let from = active_request.contact.node_id();
         // Only a timeout before the REGCONFIRMATION, or before any valid record of a
-        // TOPICQUERY, is a liveness failure. A rejection is an answer.
-        let answered = match active_request.request_body {
-            RequestBody::RegTopic { .. } => response.confirmation.is_some(),
-            _ => !response.aux.is_empty() || !response.advertisers.is_empty(),
+        // TOPICQUERY, is a liveness failure. A rejection is an answer, and an answer
+        // clears an earlier failure.
+        let (answered, cleared) = match active_request.request_body {
+            RequestBody::RegTopic { .. } => {
+                let confirmed = response.confirmation.is_some();
+                (confirmed, confirmed)
+            }
+            _ => {
+                let records = response.has_records();
+                (records, records || response.query_complete(&error))
+            }
         };
         if matches!(error, Some(RequestError::Timeout)) && !answered {
             self.connection_updated(from, ConnectionStatus::Disconnected);
+        } else if cleared {
+            self.topic_liveness_restored(from);
         }
         match active_request.callback {
             Some(CallbackResponse::RegConfirmation(callback)) => {
@@ -1063,24 +1098,38 @@ fn reg_outcome(
     }
 }
 
-/// The outcome of a TOPICQUERY. A response that ended before the capped `total`, at
-/// the packet cap or with an error after a valid record, is partial.
+impl TopicResponse {
+    fn has_records(&self) -> bool {
+        !self.aux.is_empty() || !self.advertisers.is_empty()
+    }
+
+    /// Whether a TOPICQUERY response got its whole announced `total` without an error.
+    /// Reaching `QUERY_RESP_LIMIT` short of a larger `total` is an early end.
+    fn query_complete(&self, error: &Option<RequestError>) -> bool {
+        error.is_none()
+            && self
+                .announced
+                .is_some_and(|total| total <= QUERY_RESP_LIMIT as u64 && self.received >= total)
+    }
+}
+
+/// The outcome of a TOPICQUERY, per the pending spec clarification: complete when the
+/// announced `total` arrived, whatever it holds; partial when it ended early, by a
+/// timeout, the packet cap or an error, after a valid record; failed when it ended
+/// early without one.
 fn query_outcome(
     response: TopicResponse,
     error: Option<RequestError>,
 ) -> Result<TopicQueryResult, RequestError> {
-    let records = !response.aux.is_empty() || !response.advertisers.is_empty();
-    match error {
-        Some(error) if !records => Err(error),
-        _ => Ok(TopicQueryResult {
-            complete: error.is_none()
-                && response
-                    .announced
-                    .is_some_and(|total| response.received >= total.min(QUERY_RESP_LIMIT as u64)),
-            advertisers: response.advertisers,
-            aux: response.aux,
-        }),
+    let complete = response.query_complete(&error);
+    if !complete && !response.has_records() {
+        return Err(error.unwrap_or(RequestError::InvalidRemotePacket));
     }
+    Ok(TopicQueryResult {
+        complete,
+        advertisers: response.advertisers,
+        aux: response.aux,
+    })
 }
 
 /// Checks a record of a response to a topic request: it needs an address that the
@@ -1144,7 +1193,10 @@ mod tests {
         handler::{HandlerOut, TopicRespCount},
         kbucket::{ConnectionDirection, ConnectionState, NodeStatus},
         rpc::Request,
-        topic::{RegAttemptState, TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION, TopicConfig},
+        topic::{
+            RegAttemptState, TOPIC_DISCOVERY_ENR_KEY, TOPIC_DISCOVERY_VERSION, TopicConfig,
+            params::{DELTA, E, RESP_TIMEOUT},
+        },
     };
     use enr::CombinedKey;
     use parking_lot::RwLock;
@@ -1383,11 +1435,12 @@ mod tests {
         );
         assert_eq!(confirmation.aux.len(), 8);
 
-        // TOPICQUERY: 16 messages, 16 records of each kind.
+        // TOPICQUERY: QUERY_RESP_LIMIT messages, F_RETURN advertisers and AUX_ENR_LIMIT
+        // auxiliary records.
         let (tx, mut rx) = oneshot::channel();
         service.request_topic_query(target.into(), TOPIC, vec![256], tx);
         let (contact, request) = next_request(&mut handler).unwrap();
-        for i in 0..16u16 {
+        for i in 0..QUERY_RESP_LIMIT as u16 {
             assert!(rx.try_recv().is_err());
             let nodes = (0..3).map(|j| registrar(14000 + 3 * i + j)).collect();
             let body = if i % 2 == 0 {
@@ -1398,9 +1451,9 @@ mod tests {
             respond(&mut service, &contact, &request.id, body);
         }
         let result = rx.try_recv().unwrap().unwrap();
-        assert_eq!(result.aux.len(), 16);
-        assert_eq!(result.advertisers.len(), 16);
-        assert!(result.complete);
+        assert_eq!(result.aux.len(), AUX_ENR_LIMIT);
+        assert_eq!(result.advertisers.len(), F_RETURN);
+        assert!(!result.complete, "the cap short of `total` is an early end");
     }
 
     // A single empty TOPICNODES ends a TOPICQUERY; a failure goes to the user.
@@ -1513,6 +1566,156 @@ mod tests {
         assert!(service.topics.responses.is_empty());
     }
 
+    // A REGTOPIC ends at REG_RESP_LIMIT packets of any kind. It succeeds when the
+    // REGCONFIRMATION is among them and keeps the ENRs that came with it.
+    #[tokio::test]
+    async fn regtopic_packet_limit() {
+        let limit = REG_RESP_LIMIT;
+        let talk = |n: usize| vec![ResponseBody::Talk { response: vec![] }; n];
+        let nodes = |n: usize, total: u64| -> Vec<ResponseBody> {
+            (0..n as u16).map(|i| aux_nodes(total, 12102 + i)).collect()
+        };
+        let confirm = |total: u64| vec![confirmation(total, vec![1], 1000)];
+        let cases: [(&str, Vec<ResponseBody>, bool, usize); 5] = [
+            ("unexpected kinds only", talk(limit), false, 0),
+            (
+                "confirmation above the limit, then unexpected kinds",
+                [confirm(200), talk(limit - 1)].concat(),
+                true,
+                0,
+            ),
+            (
+                "unexpected kinds, then the confirmation",
+                [talk(limit - 1), confirm(1)].concat(),
+                true,
+                0,
+            ),
+            (
+                "confirmation and nodes up to the limit",
+                [confirm(limit as u64), nodes(limit - 1, limit as u64)].concat(),
+                true,
+                limit - 1,
+            ),
+            (
+                "confirmation and nodes, then unexpected kinds",
+                [
+                    confirm(limit as u64),
+                    nodes(2, limit as u64),
+                    talk(limit - 3),
+                ]
+                .concat(),
+                true,
+                2,
+            ),
+        ];
+        let target = registrar(12101);
+        for (name, packets, confirmed, want_aux) in cases {
+            let (mut service, mut handler) = service(TopicConfig::default(), &[]);
+            let (tx, mut rx) = oneshot::channel();
+            service.request_regtopic(target.clone().into(), TOPIC, vec![], vec![], tx);
+            let (contact, request) = next_request(&mut handler).unwrap();
+            for body in packets {
+                assert!(rx.try_recv().is_err(), "{name}: ended early");
+                respond(&mut service, &contact, &request.id, body);
+            }
+            match rx.try_recv().unwrap() {
+                Ok(result) => {
+                    assert!(confirmed, "{name}: confirmed");
+                    assert_eq!(result.aux.len(), want_aux, "{name}");
+                }
+                Err(e) => {
+                    assert!(!confirmed, "{name}: {e:?}");
+                    assert_eq!(e, RequestError::InvalidRemotePacket, "{name}");
+                }
+            }
+            assert!(service.active_requests.is_empty(), "{name}");
+        }
+    }
+
+    // A REGTOPIC that fails, by a timeout before the REGCONFIRMATION or at the packet
+    // cap, still hands the ENRs that arrived to the registration table.
+    #[tokio::test]
+    async fn failed_regtopic_keeps_aux_nodes() {
+        for cap in [false, true] {
+            let target = registrar(12101);
+            let (mut service, mut handler) =
+                service(TopicConfig::default(), std::slice::from_ref(&target));
+            service.topic_table_changes();
+            service.register_topic(TOPIC);
+            let (contact, request) = next_request(&mut handler).unwrap();
+            let count = if cap { REG_RESP_LIMIT } else { 1 };
+            // One per bucket: a source places at most one node in each.
+            let aux: Vec<Enr> = (0..count)
+                .map(|i| registrar_in_bucket(12102 + i as u16, i))
+                .collect();
+            for enr in &aux {
+                let body = ResponseBody::Nodes {
+                    total: if cap { 1 } else { 3 },
+                    nodes: vec![enr.clone()],
+                };
+                respond(&mut service, &contact, &request.id, body);
+            }
+            if !cap {
+                service.rpc_failure(request.id.clone(), RequestError::Timeout);
+            }
+            assert!(
+                !service.active_requests.contains_key(&request.id),
+                "cap {cap}"
+            );
+            let reg = &service.topics.registrations[&TOPIC];
+            assert!(reg.table.attempt(&target.node_id()).is_none(), "cap {cap}");
+            for enr in &aux {
+                assert!(
+                    reg.table.attempt(&enr.node_id()).is_some(),
+                    "cap {cap}: aux node not added"
+                );
+            }
+        }
+    }
+
+    // A REGTOPIC whose service stops after the REGCONFIRMATION, before the announced
+    // NODES, ends as an error, not as a success; a registration stopped meanwhile
+    // takes no answer.
+    #[tokio::test]
+    async fn regtopic_closed_after_confirmation() {
+        let target = registrar(12101);
+        let (mut first, mut handler) = service(TopicConfig::default(), &[]);
+        let (tx, mut rx) = oneshot::channel();
+        first.request_regtopic(target.clone().into(), TOPIC, vec![], vec![], tx);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(
+            &mut first,
+            &contact,
+            &request.id,
+            confirmation(3, vec![1], 1000),
+        );
+        assert!(rx.try_recv().is_err());
+        drop(first);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+
+        let (mut service, mut handler) =
+            service(TopicConfig::default(), std::slice::from_ref(&target));
+        service.topic_table_changes();
+        let (events_tx, mut events) = mpsc::channel(10);
+        service.event_stream = Some(events_tx);
+        service.register_topic(TOPIC);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(
+            &mut service,
+            &contact,
+            &request.id,
+            confirmation(3, vec![], 1000),
+        );
+        service.stop_topic_registration(TOPIC);
+        service.rpc_failure(request.id, RequestError::Timeout);
+        assert!(events.try_recv().is_err());
+        assert!(!service.topics.registrations.contains_key(&TOPIC));
+        assert!(next_request(&mut handler).is_none());
+    }
+
     // The `total` of the first packet applies; later ones are ignored, both above and
     // below it.
     #[tokio::test]
@@ -1586,6 +1789,121 @@ mod tests {
         assert!(!result.complete);
         assert_eq!((result.advertisers.len(), result.aux.len()), (0, 1));
         assert!(service.topics.responses.is_empty());
+    }
+
+    // A TOPICQUERY answered only by packets of other kinds ends at QUERY_RESP_LIMIT
+    // without a valid record: a failed query, per the pending spec clarification. The
+    // search keeps the registrar out as failed, and its liveness does not change.
+    #[tokio::test]
+    async fn query_cap_without_records_fails() {
+        let target = registrar(12101);
+        let (mut direct, mut handler) = service(TopicConfig::default(), &[]);
+        let (tx, mut rx) = oneshot::channel();
+        direct.request_topic_query(target.into(), TOPIC, vec![], tx);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        for _ in 0..QUERY_RESP_LIMIT {
+            assert!(rx.try_recv().is_err());
+            respond(&mut direct, &contact, &request.id, talk());
+        }
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err(),
+            RequestError::InvalidRemotePacket
+        );
+
+        let reg = far_registrar(12102);
+        let (mut service, mut handler) =
+            service(TopicConfig::default(), std::slice::from_ref(&reg));
+        let (id, _rx) = start_search(&mut service, true);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        for _ in 0..QUERY_RESP_LIMIT {
+            respond(&mut service, &contact, &request.id, talk());
+        }
+        assert!(connected(&service, &reg));
+        assert!(service.topics.searches[&id].pass.is_none());
+        let wakeup = service.topic_next_wakeup().unwrap();
+        service.search_step(id, wakeup);
+        assert!(
+            next_request(&mut handler).is_none(),
+            "failed registrar asked again"
+        );
+    }
+
+    // The packet cap short of a larger announced `total` is an early end: with empty
+    // TOPICNODES only the query failed and liveness is unchanged, with records it is
+    // partial and clears it. A `total` that arrived whole is complete, also empty, and
+    // also at the cap with one record per packet, as an honest registrar may send.
+    #[tokio::test]
+    async fn query_cap_below_announced_total() {
+        let cap = QUERY_RESP_LIMIT as u64;
+        let cases = [
+            ("cap, no records", 40, QUERY_RESP_LIMIT, false, None),
+            ("cap, records", 40, QUERY_RESP_LIMIT, true, Some(false)),
+            ("whole total, no records", 5, 5, false, Some(true)),
+            (
+                "whole total at the cap",
+                cap,
+                QUERY_RESP_LIMIT,
+                true,
+                Some(true),
+            ),
+        ];
+        for (name, total, packets, records, want) in cases {
+            let target = registrar(12101);
+            let (mut service, mut handler) =
+                service(TopicConfig::default(), std::slice::from_ref(&target));
+            let (tx, _) = oneshot::channel();
+            service.request_topic_query(target.clone().into(), TOPIC, vec![], tx);
+            let (_, request) = next_request(&mut handler).unwrap();
+            service.rpc_failure(request.id, RequestError::Timeout);
+            assert!(!connected(&service, &target), "{name}");
+
+            let (tx, mut rx) = oneshot::channel();
+            service.request_topic_query(target.clone().into(), TOPIC, vec![], tx);
+            let (contact, request) = next_request(&mut handler).unwrap();
+            // With records: one per packet, the auxiliary ENRs first, then F_RETURN ads.
+            let aux = if records {
+                packets.saturating_sub(F_RETURN)
+            } else {
+                0
+            };
+            for i in 0..packets {
+                assert!(rx.try_recv().is_err(), "{name}: ended early");
+                let nodes = if records {
+                    vec![registrar(13000 + i as u16)]
+                } else {
+                    vec![]
+                };
+                let body = if i < aux {
+                    ResponseBody::Nodes { total, nodes }
+                } else {
+                    ResponseBody::TopicNodes { total, nodes }
+                };
+                respond(&mut service, &contact, &request.id, body);
+            }
+            match (rx.try_recv().unwrap(), want) {
+                (Ok(result), Some(complete)) => {
+                    assert_eq!(result.complete, complete, "{name}");
+                    let ads = if records { packets - aux } else { 0 };
+                    assert_eq!(
+                        (result.advertisers.len(), result.aux.len()),
+                        (ads, aux),
+                        "{name}"
+                    );
+                }
+                (Err(e), None) => assert_eq!(e, RequestError::InvalidRemotePacket, "{name}"),
+                (got, _) => panic!("{name}: {got:?}"),
+            }
+            assert_eq!(connected(&service, &target), want.is_some(), "{name}");
+            assert_eq!(
+                service.peers_to_ping.contains_key(&target.node_id()),
+                want.is_some(),
+                "{name}"
+            );
+        }
+    }
+
+    fn talk() -> ResponseBody {
+        ResponseBody::Talk { response: vec![] }
     }
 
     fn connected(service: &Service, enr: &Enr) -> bool {
@@ -2031,6 +2349,444 @@ mod tests {
         let attempt = reg.table.attempt(&target.node_id()).unwrap();
         assert_eq!(attempt.state, RegAttemptState::Registered);
         assert!(reg.in_flight.is_empty());
+    }
+
+    // An answer clears an earlier liveness failure: a registrar marked disconnected by a
+    // timeout is connected again, and pinged, once it answers a REGTOPIC or a TOPICQUERY,
+    // also with a rejection or an empty TOPICNODES, and also when a REGTOPIC ends in an
+    // error after its REGCONFIRMATION.
+    #[tokio::test]
+    async fn answer_restores_liveness() {
+        let answers = [
+            ("admission", true, confirmation(1, vec![], 900_000), false),
+            ("rejection", true, confirmation(1, vec![], 0), false),
+            (
+                "error after confirmation",
+                true,
+                confirmation(3, vec![1], 1000),
+                true,
+            ),
+            ("empty topicnodes", false, topic_nodes(vec![]), false),
+        ];
+        for (name, regtopic, answer, fail) in answers {
+            let target = registrar(12101);
+            let (mut service, mut handler) =
+                service(TopicConfig::default(), std::slice::from_ref(&target));
+            let mut send = |service: &mut Service| {
+                if regtopic {
+                    let (tx, _) = oneshot::channel();
+                    service.request_regtopic(target.clone().into(), TOPIC, vec![], vec![], tx);
+                } else {
+                    let (tx, _) = oneshot::channel();
+                    service.request_topic_query(target.clone().into(), TOPIC, vec![], tx);
+                }
+                next_request(&mut handler).unwrap()
+            };
+            let (_, request) = send(&mut service);
+            service.rpc_failure(request.id, RequestError::Timeout);
+            assert!(!connected(&service, &target), "{name}: still connected");
+            assert!(!service.peers_to_ping.contains_key(&target.node_id()));
+
+            let (contact, request) = send(&mut service);
+            respond(&mut service, &contact, &request.id, answer);
+            if fail {
+                service.rpc_failure(request.id, RequestError::InvalidRemotePacket);
+            }
+            assert!(connected(&service, &target), "{name}: not connected again");
+            assert!(
+                service.peers_to_ping.contains_key(&target.node_id()),
+                "{name}: not pinged"
+            );
+        }
+    }
+
+    // Two timeouts leave the entry disconnected, in the table and off the ping schedule,
+    // as one failed request of the routing table does; an answer then connects it again.
+    #[tokio::test]
+    async fn two_timeouts_then_answer() {
+        let target = registrar(12101);
+        let (mut service, mut handler) =
+            service(TopicConfig::default(), std::slice::from_ref(&target));
+        for _ in 0..2 {
+            let (tx, _) = oneshot::channel();
+            service.request_topic_query(target.clone().into(), TOPIC, vec![], tx);
+            let (_, request) = next_request(&mut handler).unwrap();
+            service.rpc_failure(request.id, RequestError::Timeout);
+            assert!(!connected(&service, &target));
+            assert!(!service.peers_to_ping.contains_key(&target.node_id()));
+        }
+        let (tx, _) = oneshot::channel();
+        service.request_topic_query(target.clone().into(), TOPIC, vec![], tx);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(&mut service, &contact, &request.id, topic_nodes(vec![]));
+        assert!(connected(&service, &target));
+        assert!(service.peers_to_ping.contains_key(&target.node_id()));
+    }
+
+    // A failed topic request is no answer: after a timeout the entry stays disconnected
+    // and off the ping schedule when a REGTOPIC ends at the packet cap without its
+    // REGCONFIRMATION, or a TOPICQUERY ends with an error or at the cap before any valid
+    // record. An answer from a node outside the routing table does not insert it.
+    #[tokio::test]
+    async fn failed_answer_keeps_liveness() {
+        let cases: [(&str, bool, Option<RequestError>, usize); 3] = [
+            ("regtopic cap", true, None, REG_RESP_LIMIT),
+            (
+                "topicquery error",
+                false,
+                Some(RequestError::InvalidRemotePacket),
+                0,
+            ),
+            ("topicquery cap", false, None, QUERY_RESP_LIMIT),
+        ];
+        for (name, regtopic, error, packets) in cases {
+            let target = registrar(12101);
+            let (mut service, mut handler) =
+                service(TopicConfig::default(), std::slice::from_ref(&target));
+            let mut send = |service: &mut Service| {
+                if regtopic {
+                    let (tx, _) = oneshot::channel();
+                    service.request_regtopic(target.clone().into(), TOPIC, vec![], vec![], tx);
+                } else {
+                    let (tx, _) = oneshot::channel();
+                    service.request_topic_query(target.clone().into(), TOPIC, vec![], tx);
+                }
+                next_request(&mut handler).unwrap()
+            };
+            let (_, request) = send(&mut service);
+            service.rpc_failure(request.id, RequestError::Timeout);
+            assert!(!connected(&service, &target), "{name}");
+
+            let (contact, request) = send(&mut service);
+            for _ in 0..packets {
+                respond(&mut service, &contact, &request.id, talk());
+            }
+            if let Some(error) = error {
+                service.rpc_failure(request.id.clone(), error);
+            }
+            assert!(!service.active_requests.contains_key(&request.id), "{name}");
+            assert!(!connected(&service, &target), "{name}: connected again");
+            assert!(
+                !service.peers_to_ping.contains_key(&target.node_id()),
+                "{name}: pinged"
+            );
+        }
+
+        let outside = registrar(12102);
+        let (mut service, mut handler) = service(TopicConfig::default(), &[]);
+        let (tx, _) = oneshot::channel();
+        service.request_regtopic(outside.clone().into(), TOPIC, vec![], vec![], tx);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        respond(
+            &mut service,
+            &contact,
+            &request.id,
+            confirmation(1, vec![], 900_000),
+        );
+        let key = kbucket::Key::from(outside.node_id());
+        assert!(!matches!(
+            service.kbuckets.write().entry(&key),
+            kbucket::Entry::Present(..)
+        ));
+        assert!(!service.peers_to_ping.contains_key(&outside.node_id()));
+    }
+
+    // A registration stopped and started again sends a new REGTOPIC; the answer to the
+    // old one is not applied to the new registration.
+    #[tokio::test]
+    async fn stop_and_register_again() {
+        let target = registrar(12101);
+        let (mut service, mut handler) =
+            service(TopicConfig::default(), std::slice::from_ref(&target));
+        service.topic_table_changes();
+        let (events_tx, mut events) = mpsc::channel(10);
+        service.event_stream = Some(events_tx);
+
+        service.register_topic(TOPIC);
+        let (old_contact, old) = next_request(&mut handler).unwrap();
+        service.stop_topic_registration(TOPIC);
+        service.register_topic(TOPIC);
+        let (contact, request) = next_request(&mut handler).expect("no new REGTOPIC");
+        assert_eq!(contact.node_id(), target.node_id());
+        assert_ne!(request.id, old.id);
+
+        respond(
+            &mut service,
+            &old_contact,
+            &old.id,
+            confirmation(1, vec![], 1000),
+        );
+        assert!(events.try_recv().is_err());
+        let reg = &service.topics.registrations[&TOPIC];
+        assert!(reg.in_flight.contains(&target.node_id()));
+
+        service.stop_topic_registration(TOPIC);
+        service.stop_topic_registration(TOPIC);
+        assert!(service.topics.registrations.is_empty());
+    }
+
+    // A REGTOPIC timeout marks the registrar disconnected but leaves the ad it holds at
+    // the local node; the registration does not ask it again when it re-reads the
+    // routing table.
+    #[tokio::test]
+    async fn regtopic_timeout_keeps_ad() {
+        let target = record(Ipv4Addr::new(10, 0, 2, 55), 30303, true);
+        let (mut service, mut handler) =
+            service(TopicConfig::default(), std::slice::from_ref(&target));
+        service.topic_table_changes();
+        let now = Instant::now();
+        let table = service.topic_table.clone().unwrap();
+        assert!(table.write().add(&target, TOPIC, now));
+
+        service.register_topic(TOPIC);
+        let (_, request) = next_request(&mut handler).unwrap();
+        service.rpc_failure(request.id, RequestError::Timeout);
+        assert!(!connected(&service, &target));
+        service.topic_table_changes();
+        assert_eq!(
+            ids(&table.read().nodes(&TOPIC, now)),
+            ids(std::slice::from_ref(&target))
+        );
+
+        let wakeup = service.topic_next_wakeup().unwrap();
+        service.registration_step(TOPIC, wakeup.max(now + LOOP_MIN_TIME));
+        assert!(next_request(&mut handler).is_none());
+        assert_eq!(service.topics.registrations[&TOPIC].table.node_count(), 0);
+    }
+
+    // A TOPICQUERY timeout marks the registrar disconnected and keeps it out of the
+    // next pass.
+    #[tokio::test]
+    async fn search_timeout_not_reasked() {
+        let reg = record(Ipv4Addr::new(10, 0, 2, 56), 30303, true);
+        let (mut service, mut handler) =
+            service(TopicConfig::default(), std::slice::from_ref(&reg));
+        let (id, _rx) = start_search(&mut service, true);
+        let (contact, request) = next_request(&mut handler).unwrap();
+        assert_eq!(contact.node_id(), reg.node_id());
+        service.rpc_failure(request.id, RequestError::Timeout);
+        assert!(!connected(&service, &reg));
+        assert!(service.topics.searches[&id].pass.is_none());
+
+        let wakeup = service.topic_next_wakeup().unwrap();
+        service.search_step(id, wakeup);
+        assert!(
+            next_request(&mut handler).is_none(),
+            "failed registrar asked again"
+        );
+    }
+
+    // The largest wait time on the wire does not overflow: as a ticket it is above the
+    // budget and the registrar is held out as overloaded, as an ad lifetime it is
+    // capped at the configured one. Either way the registrar is not asked again soon.
+    #[tokio::test]
+    async fn regtopic_huge_wait_time() {
+        for ticket in [vec![1u8], vec![]] {
+            let target = record(Ipv4Addr::new(10, 0, 3, 48), 30303, true);
+            let config = TopicConfig::default();
+            let (mut service, mut handler) = service(config.clone(), std::slice::from_ref(&target));
+            service.topic_table_changes();
+            service.register_topic(TOPIC);
+            let now = Instant::now();
+            let (contact, request) = next_request(&mut handler).unwrap();
+            let body = confirmation(1, ticket.clone(), u64::MAX);
+            respond(&mut service, &contact, &request.id, body);
+
+            let reg = &service.topics.registrations[&TOPIC];
+            match reg.table.attempt(&target.node_id()) {
+                Some(attempt) => {
+                    assert!(ticket.is_empty(), "ticket kept");
+                    assert_eq!(attempt.state, RegAttemptState::Registered);
+                    assert!(attempt.next_time <= Instant::now() + config.ad_lifetime);
+                    assert!(attempt.next_time > now + 2 * LOOP_MIN_TIME);
+                }
+                None => assert!(!ticket.is_empty(), "registered attempt dropped"),
+            }
+            service.registration_step(TOPIC, now + 2 * LOOP_MIN_TIME);
+            assert!(
+                next_request(&mut handler).is_none(),
+                "ticket {ticket:?}: asked again"
+            );
+        }
+    }
+
+    // Records without `td` count for the density sample as sent, but not as ads seen: a
+    // pass whose replies, complete or partial, held only such records is idle.
+    #[tokio::test]
+    async fn search_unsupported_ads_idle() {
+        for partial in [false, true] {
+            let (mut service, mut handler, id, mut rx) = search_in_bucket(1);
+            let mut port = 14000;
+            let mut asked = 0;
+            while let Some((contact, request)) = next_request(&mut handler) {
+                asked += 1;
+                let nodes: Vec<Enr> = (0..F_RETURN)
+                    .map(|_| {
+                        port += 1;
+                        record(Ipv4Addr::LOCALHOST, port, false)
+                    })
+                    .collect();
+                let total = if partial { 2 * F_RETURN as u64 } else { 1 };
+                respond(
+                    &mut service,
+                    &contact,
+                    &request.id,
+                    ResponseBody::TopicNodes { total, nodes },
+                );
+                if partial {
+                    service.rpc_failure(request.id, RequestError::Timeout);
+                }
+            }
+            assert!(asked > 0);
+            assert!(read_all(&mut service, &mut rx).is_empty());
+            let search = &service.topics.searches[&id];
+            assert!(search.pass.is_none(), "partial {partial}: pass not over");
+            assert_eq!(search.idle_passes, 1, "partial {partial}");
+            assert_eq!(search.gap, 2 * SEARCH_PASS_GAP, "partial {partial}");
+        }
+    }
+
+    // Ticket retries go out in their window while dead registrars hold the request
+    // slots: every slot a timeout frees goes to a due retry before a first contact.
+    #[tokio::test]
+    async fn retries_not_blocked_by_dead_registrars() {
+        let live: Vec<Enr> = (1..=4)
+            .map(|i| record(Ipv4Addr::new(10, 0, i, 1), 30303, true))
+            .collect();
+        let dead: Vec<Enr> = (5..=16)
+            .map(|i| record(Ipv4Addr::new(10, 0, i, 1), 30303, true))
+            .collect();
+        let (mut service, mut handler) = service(TopicConfig::default(), &live);
+        service.topic_table_changes();
+        service.register_topic(TOPIC);
+        let wait = Duration::from_millis(1500);
+        let mut tickets = HashMap::new();
+        for (i, (contact, request)) in all_requests(&mut handler).into_iter().enumerate() {
+            let ticket = vec![i as u8 + 1];
+            tickets.insert(contact.node_id(), ticket.clone());
+            let body = confirmation(1, ticket, wait.as_millis() as u64);
+            respond(&mut service, &contact, &request.id, body);
+        }
+        assert_eq!(tickets.len(), live.len());
+        let replied = Instant::now();
+
+        for enr in &dead {
+            add_to_table(&service, enr);
+        }
+        service.topic_table_changes();
+        service.topic_tick();
+        let mut out = all_requests(&mut handler);
+        let (mut retried, mut dead_seen) = (0, 0);
+        for _ in 0..10 {
+            let mut next = Vec::new();
+            for (contact, request) in std::mem::take(&mut out) {
+                let RequestBody::RegTopic { ticket, .. } = &request.body else {
+                    panic!("not a REGTOPIC");
+                };
+                match tickets.remove(&contact.node_id()) {
+                    Some(issued) => {
+                        assert_eq!(ticket, &issued);
+                        let delay = replied.elapsed();
+                        assert!(
+                            delay >= wait && delay < wait + DELTA,
+                            "retry after {delay:?}"
+                        );
+                        retried += 1;
+                        let body = confirmation(1, vec![], 900_000);
+                        respond(&mut service, &contact, &request.id, body);
+                    }
+                    None => {
+                        assert!(ticket.is_empty());
+                        dead_seen += 1;
+                        next.push(request.id);
+                    }
+                }
+                out.extend(all_requests(&mut handler));
+            }
+            if retried == live.len() && dead_seen == dead.len() {
+                break;
+            }
+            tokio::time::sleep(RESP_TIMEOUT).await;
+            for id in next {
+                service.rpc_failure(id, RequestError::Timeout);
+                out.extend(all_requests(&mut handler));
+            }
+        }
+        assert_eq!((retried, dead_seen), (live.len(), dead.len()));
+    }
+
+    // A bucket whose only node never answers is kept for one more pass, which does not
+    // ask the dead node again, and not more: the search then walks on.
+    #[test]
+    fn dead_frontier_kept_once() {
+        let dead = registrar_in_bucket(12101, 4);
+        let helper = registrar_in_bucket(12102, 1);
+        let (mut service, _handler) = service(TopicConfig::default(), &[]);
+        let search = idle_search(&mut service);
+        search.active_bucket = 4;
+        let now = Instant::now();
+        let (mut got, mut dead_asked, mut sets) = (Vec::new(), 0, None);
+        for _ in 0..6 {
+            let mut pass = Search::new(TOPIC, NodeId::random(), TopicConfig::default());
+            pass.set_active_bucket(search.active_bucket);
+            if let Some(sets) = sets.take() {
+                pass.set_sets(sets);
+            }
+            pass.add_nodes(None, [dead.clone(), helper.clone()], now);
+            while let Some(n) = pass.query_target(now) {
+                if n.node_id() == dead.node_id() {
+                    dead_asked += 1;
+                    pass.handle_error_response(&n.node_id(), now);
+                } else {
+                    pass.add_reply(&n, [], 0, 0, now);
+                }
+            }
+            assert!(pass.is_done());
+            search.next_pass(&pass);
+            got.push(search.active_bucket);
+            sets = Some(pass.into_sets());
+        }
+        assert_eq!(got, [4, 5, 6, 7, 8, 9]);
+        assert_eq!(dead_asked, 1);
+    }
+
+    // The pass ends when the selection drops its last candidate over the `/24` limit
+    // with no query in flight.
+    #[tokio::test]
+    async fn subnet_limit_ends_pass() {
+        let (mut service, mut handler) = service(TopicConfig::default(), &[]);
+        let (id, _rx) = start_search(&mut service, true);
+        let now = Instant::now();
+        let mut sets = SearchSets::new(E);
+        for host in 1..=9 {
+            sets.admit(&record(Ipv4Addr::new(203, 0, 113, host), 30303, true), now);
+        }
+        let mut regs = Vec::new();
+        for host in 100.. {
+            let enr = record(Ipv4Addr::new(203, 0, 113, host), 30303, true);
+            if crate::topic::log_dist(&TOPIC, &enr.node_id()) == 256 {
+                regs.push(enr);
+                if regs.len() == 2 {
+                    break;
+                }
+            }
+        }
+        for enr in &regs {
+            add_to_table(&service, enr);
+        }
+        service.topics.searches.get_mut(&id).unwrap().sets = Some(sets);
+        let wakeup = service.topic_next_wakeup().unwrap();
+        service.search_step(id, wakeup);
+        let (_, request) = next_request(&mut handler).expect("no query");
+        service.rpc_failure(request.id, RequestError::Timeout);
+        assert!(
+            next_request(&mut handler).is_none(),
+            "query over the subnet limit"
+        );
+        assert!(
+            service.topics.searches[&id].pass.is_none(),
+            "pass not ended"
+        );
     }
 
     /// Answers the queries of a search until it stops to send them. Returns the nodes
@@ -3122,6 +3878,35 @@ mod tests {
             assert!((40_000..=50_000).contains(&reply.wait_time), "{name}");
         }
         assert_eq!(reg.ads(), 1);
+    }
+
+    // A credited ticket presented again after the ad expired, cycle after cycle, is
+    // past its grace: it earns nothing and waits like a fresh attempt.
+    #[tokio::test]
+    async fn replayed_ticket_after_ad_expiry() {
+        let mut reg = Registrar::new();
+        let adv = advertiser(Ipv4Addr::new(10, 0, 2, 1));
+        let on_time = reg.seal(adv.address.node_id, TOPIC, 2 * SEC, SEC, 60 * SEC);
+        assert_eq!(
+            reg.request(&adv.address, adv.enr.clone(), on_time.clone()),
+            reg.admitted()
+        );
+        let lifetime = reg.table().read().ad_lifetime();
+        for cycle in 1..=3 {
+            reg.now += lifetime + SEC;
+            let seed = record(Ipv4Addr::new(10, 0, 9, 1), 30303, true);
+            let now = reg.now;
+            assert!(reg.table().write().add(&seed, TOPIC, now));
+            assert_eq!(reg.ads(), 1, "cycle {cycle}");
+            let fresh = reg.fresh_wait(&adv);
+            assert!(fresh > 0);
+            let reply = reg.request(&adv.address, adv.enr.clone(), on_time.clone());
+            assert!(
+                !reply.ticket.is_empty() && reply.ticket != on_time,
+                "cycle {cycle}: admitted"
+            );
+            assert_eq!(reply.wait_time, fresh, "cycle {cycle}");
+        }
     }
 
     // A ticket presented by another node is a new attempt for it and is not used up:

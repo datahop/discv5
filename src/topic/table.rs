@@ -580,6 +580,22 @@ mod tests {
         assert!(tab.topics.is_empty());
     }
 
+    // A full cache refuses an ad until one expires, then admits one.
+    #[test]
+    fn full_cache_admits_after_expiry() {
+        let t0 = Instant::now();
+        let mut tab = sized(3);
+        let lifetime = tab.ad_lifetime();
+        assert!(tab.add(&node(), TOPIC1, t0));
+        let at = t0 + Duration::from_secs(60);
+        assert!(tab.add(&node(), TOPIC1, at));
+        assert!(tab.add(&node(), TOPIC1, at));
+        assert!(!tab.add(&node(), TOPIC1, at), "full cache admitted an ad");
+        assert!(!tab.add(&node(), TOPIC1, t0 + lifetime - Duration::from_secs(1)));
+        assert!(tab.add(&node(), TOPIC1, t0 + lifetime), "slot not freed");
+        assert_eq!(tab.occupancy().0, 3);
+    }
+
     #[test]
     fn expired_ad_not_served_or_counted() {
         // Ads past expiry are neither served nor reported registered before a sweep.
@@ -921,6 +937,30 @@ mod tests {
 
         tab.expire(now + tab.ad_lifetime());
         assert!(!tab.wt.topic_bounds.contains_key(&TOPIC1));
+    }
+
+    // A topic bound that outlives the topic's ads goes with the last ad: the topic is
+    // quoted as an empty one again and admits at once.
+    #[test]
+    fn topic_bound_outliving_ads_collected() {
+        let now = Instant::now();
+        let mut tab = sized(20);
+        for _ in 0..16 {
+            assert!(tab.add(&node(), TOPIC1, now));
+        }
+        assert!(tab.register(&node(), TOPIC1, Duration::ZERO, now) > W_MIN);
+        let lifetime = tab.ad_lifetime();
+        assert!(tab.wt.topic_bounds[&TOPIC1].remaining(now) > lifetime + Duration::from_secs(1));
+
+        let later = now + lifetime + Duration::from_secs(1);
+        let n = node();
+        let empty = sized(20).wait_time(&n, &TOPIC1, later);
+        assert_eq!(tab.wait_time(&n, &TOPIC1, later), empty);
+        assert!(!tab.wt.topic_bounds.contains_key(&TOPIC1));
+        assert_eq!(
+            tab.register(&n, TOPIC1, Duration::ZERO, later),
+            Duration::ZERO
+        );
     }
 
     #[test]
