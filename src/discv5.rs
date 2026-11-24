@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 #[cfg(feature = "topic-discovery")]
-use crate::topic::{RegConfirmation, TopicId, TopicQueryResult, TopicTable};
+use crate::topic::{RegTopicResult, TopicId, TopicQueryResult, TopicTable};
 #[cfg(feature = "libp2p")]
 use multiaddr::Multiaddr;
 
@@ -86,9 +86,6 @@ pub enum Event {
     /// A registrar stores the advertisement of the local node for a topic.
     #[cfg(feature = "topic-discovery")]
     TopicRegistered { topic: TopicId, registrar: NodeId },
-    /// A topic search found advertisers that it had not returned before.
-    #[cfg(feature = "topic-discovery")]
-    TopicNodesFound { topic: TopicId, nodes: Vec<Enr> },
 }
 
 /// The main Discv5 Service struct. This provides the user-level API for performing queries and
@@ -110,6 +107,9 @@ pub struct Discv5 {
     /// The ad cache of the topic discovery registrar.
     #[cfg(feature = "topic-discovery")]
     topic_table: Arc<RwLock<TopicTable>>,
+    /// Notifies the service when a topic search stream is read or dropped.
+    #[cfg(feature = "topic-discovery")]
+    topic_reads: Arc<tokio::sync::Notify>,
 }
 
 impl Discv5 {
@@ -158,13 +158,17 @@ impl Discv5 {
 
         let local_enr = Arc::new(RwLock::new(local_enr));
         let enr_key = Arc::new(RwLock::new(enr_key));
-        let kbuckets = Arc::new(RwLock::new(KBucketsTable::new(
+        #[allow(unused_mut)]
+        let mut kbuckets = KBucketsTable::new(
             local_enr.read().node_id().into(),
             Duration::from_secs(60),
             config.incoming_bucket_limit,
             table_filter,
             bucket_filter,
-        )));
+        );
+        #[cfg(feature = "topic-discovery")]
+        kbuckets.track_changes(true);
+        let kbuckets = Arc::new(RwLock::new(kbuckets));
 
         // Update the PermitBan list based on initial configuration
         *PERMIT_BAN_LIST.write() = config.permit_ban_list.clone();
@@ -174,6 +178,8 @@ impl Discv5 {
         Ok(Discv5 {
             #[cfg(feature = "topic-discovery")]
             topic_table: Arc::new(RwLock::new(TopicTable::new(config.topic.clone()))),
+            #[cfg(feature = "topic-discovery")]
+            topic_reads: Default::default(),
             config,
             service_channel: None,
             service_exit: None,
@@ -198,7 +204,9 @@ impl Discv5 {
             self.kbuckets.clone(),
             self.config.clone(),
             #[cfg(feature = "topic-discovery")]
-            self.topic_table.clone(),
+            Some(self.topic_table.clone()),
+            #[cfg(feature = "topic-discovery")]
+            self.topic_reads.clone(),
         )
         .await?;
         self.service_exit = Some(service_exit);
@@ -736,7 +744,7 @@ impl Discv5 {
 
     /// Keeps an advertisement of the local node for `topic` alive: runs the registration
     /// walk against the registrars around the topic hash until it is stopped. The
-    /// registrars are the nodes whose record carries the `ng` entry.
+    /// registrars are the nodes whose record carries the `td` entry.
     #[cfg(feature = "topic-discovery")]
     pub fn register_topic(&self, topic: TopicId) -> Result<(), Error> {
         self.send_topic_command(ServiceRequest::RegisterTopic(topic))
@@ -749,6 +757,19 @@ impl Discv5 {
         self.send_topic_command(ServiceRequest::StopTopic(topic))
     }
 
+    /// Looks up advertisers of `topic`, pass after pass, until the stream is dropped.
+    /// An advertiser is delivered once per ad lifetime, and once more with a newer
+    /// record. While `SEARCH_UNREAD_LIMIT` results wait unread, the lookup sends no
+    /// query, and a pass ends only once its results are read. Fails with
+    /// `Error::Custom("Service channel full")` when the service has a backlog of
+    /// requests; `topic_search` waits for room instead.
+    #[cfg(feature = "topic-discovery")]
+    pub fn topic_search_stream(&self, topic: TopicId) -> Result<TopicSearchStream, Error> {
+        let (results, stream) = self.new_topic_search();
+        self.send_topic_command(ServiceRequest::TopicSearch(topic, results))?;
+        Ok(stream)
+    }
+
     /// Looks up advertisers of `topic`. Resolves with `count` distinct records, or with
     /// the records found when the query timeout of the configuration has passed.
     #[cfg(feature = "topic-discovery")]
@@ -757,22 +778,44 @@ impl Discv5 {
         topic: TopicId,
         count: usize,
     ) -> impl Future<Output = Result<Vec<Enr>, QueryError>> + 'static + use<> {
+        use futures::StreamExt;
         let channel = self.clone_channel();
+        let (results, mut stream) = self.new_topic_search();
+        let timeout = self.config.query_timeout;
 
         async move {
-            let channel = channel.map_err(|_| QueryError::ServiceNotStarted)?;
-            let (callback_send, callback_recv) = oneshot::channel();
-
-            let event = ServiceRequest::TopicSearch(topic, count, callback_send);
+            let channel = channel.map_err(|e| match e {
+                Error::Custom(e) => QueryError::ChannelFailed(e.into()),
+                _ => QueryError::ServiceNotStarted,
+            })?;
             channel
-                .send(event)
+                .send(ServiceRequest::TopicSearch(topic, results))
                 .await
                 .map_err(|_| QueryError::ChannelFailed("Service channel closed".into()))?;
-
-            callback_recv
-                .await
-                .map_err(|e| QueryError::ChannelFailed(e.to_string()))
+            let mut found: Vec<Enr> = Vec::new();
+            let read = async {
+                while found.len() < count {
+                    let Some(enr) = stream.next().await else {
+                        break;
+                    };
+                    match found.iter_mut().find(|n| n.node_id() == enr.node_id()) {
+                        Some(known) => *known = enr,
+                        None => found.push(enr),
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(timeout, read).await;
+            Ok(found)
         }
+    }
+
+    #[cfg(feature = "topic-discovery")]
+    fn new_topic_search(&self) -> (mpsc::Sender<Enr>, TopicSearchStream) {
+        let (results_send, results) = mpsc::channel(crate::topic::params::SEARCH_UNREAD_LIMIT);
+        (
+            results_send,
+            TopicSearchStream::new(results, self.topic_reads.clone()),
+        )
     }
 
     /// Sends a REGTOPIC request for `topic` to the designated peer. `ticket` is the
@@ -785,12 +828,12 @@ impl Discv5 {
         topic: TopicId,
         ticket: Vec<u8>,
         distances: Vec<u64>,
-    ) -> impl Future<Output = Result<RegConfirmation, RequestError>> + 'static + use<> {
+    ) -> impl Future<Output = Result<RegTopicResult, RequestError>> + 'static + use<> {
         let (callback_send, callback_recv) = oneshot::channel();
         let channel = self.clone_channel();
 
         async move {
-            let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
+            let channel = channel.map_err(topic_request_error)?;
 
             let event = ServiceRequest::RegTopic(contact, topic, ticket, distances, callback_send);
             channel
@@ -816,7 +859,7 @@ impl Discv5 {
         let channel = self.clone_channel();
 
         async move {
-            let channel = channel.map_err(|_| RequestError::ServiceNotStarted)?;
+            let channel = channel.map_err(topic_request_error)?;
 
             let event = ServiceRequest::TopicQuery(contact, topic, distances, callback_send);
             channel
@@ -876,8 +919,103 @@ impl Discv5 {
     }
 }
 
+#[cfg(feature = "topic-discovery")]
+fn topic_request_error(error: Error) -> RequestError {
+    match error {
+        Error::Custom(e) => RequestError::ChannelFailed(e.into()),
+        _ => RequestError::ServiceNotStarted,
+    }
+}
+
+/// The results of a topic lookup, from [`Discv5::topic_search_stream`]. Dropping it
+/// closes the lookup.
+#[cfg(feature = "topic-discovery")]
+pub struct TopicSearchStream {
+    results: mpsc::Receiver<Enr>,
+    reads: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "topic-discovery")]
+impl TopicSearchStream {
+    pub(crate) fn new(results: mpsc::Receiver<Enr>, reads: Arc<tokio::sync::Notify>) -> Self {
+        TopicSearchStream { results, reads }
+    }
+}
+
+#[cfg(feature = "topic-discovery")]
+impl futures::Stream for TopicSearchStream {
+    type Item = Enr;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Enr>> {
+        let poll = self.results.poll_recv(cx);
+        if let std::task::Poll::Ready(Some(_)) = poll {
+            self.reads.notify_one();
+        }
+        poll
+    }
+}
+
+#[cfg(feature = "topic-discovery")]
+impl Drop for TopicSearchStream {
+    fn drop(&mut self) {
+        self.results.close();
+        self.reads.notify_one();
+    }
+}
+
 impl Drop for Discv5 {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(all(test, feature = "topic-discovery"))]
+mod stream_tests {
+    use super::*;
+    use futures::{FutureExt, StreamExt};
+
+    fn stream() -> (
+        mpsc::Sender<Enr>,
+        TopicSearchStream,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let (tx, rx) = mpsc::channel(crate::topic::params::SEARCH_UNREAD_LIMIT);
+        let reads = Arc::new(tokio::sync::Notify::new());
+        (tx, TopicSearchStream::new(rx, reads.clone()), reads)
+    }
+
+    // Every read notifies the service, so that a paused lookup resumes.
+    #[test]
+    fn read_notifies() {
+        let (tx, mut stream, reads) = stream();
+        let key = CombinedKey::generate_secp256k1();
+        let enr = Enr::builder().build(&key).unwrap();
+        assert!(stream.next().now_or_never().is_none());
+        assert!(
+            reads.notified().now_or_never().is_none(),
+            "notified without a read"
+        );
+        tx.try_send(enr.clone()).unwrap();
+        assert_eq!(stream.next().now_or_never(), Some(Some(enr)));
+        assert!(
+            reads.notified().now_or_never().is_some(),
+            "read not notified"
+        );
+    }
+
+    // Dropping the stream closes the channel and notifies the service, which then ends
+    // the lookup.
+    #[test]
+    fn drop_closes_and_notifies() {
+        let (tx, stream, reads) = stream();
+        drop(stream);
+        assert!(tx.is_closed());
+        assert!(
+            reads.notified().now_or_never().is_some(),
+            "drop not notified"
+        );
     }
 }

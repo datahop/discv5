@@ -12,10 +12,13 @@ use crate::Enr;
 use enr::NodeId;
 use std::{net::IpAddr, time::Duration};
 
+mod admittedset;
+mod askedset;
 mod bound;
 mod config;
 mod iptree;
 pub(crate) mod netutil;
+pub mod params;
 mod registration;
 mod search;
 mod searchfilter;
@@ -24,24 +27,47 @@ mod ticket;
 
 pub use config::TopicConfig;
 pub use registration::{RegAttempt, RegAttemptState, Registration};
-pub use search::Search;
+pub use search::{Search, SearchSets};
 pub use searchfilter::SearchFilter;
-pub use table::{TOPIC_TABLE_WAIT_TIME_FLOOR, TopicTable};
-pub use ticket::{TICKET_SIZE, Ticket, TicketError, TicketSealer};
+pub use table::TopicTable;
+pub use ticket::{TICKET_SIZE, Ticket, TicketError, TicketSealer, TicketTiming, UsedTickets};
 
 /// A topic (service) identifier: a 32-byte hash.
 pub type TopicId = [u8; 32];
 
+/// The service identifier of a service name: SHA-256 of its UTF-8 bytes.
+pub fn topic_id(service: &str) -> TopicId {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(service.as_bytes()).into()
+}
+
+/// The outcome of one REGTOPIC, from its REGCONFIRMATION.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegConfirmation {
+    /// The registrar stores the advertisement for `lifetime`, as announced.
+    Admitted { lifetime: Duration },
+    /// Not admitted yet: retry with `ticket` after `wait`.
+    Ticket { ticket: Vec<u8>, wait: Duration },
+    /// The registrar rejected the request.
+    Rejected,
+}
+
+impl RegConfirmation {
+    /// Reads the `ticket` and `wait-time` of a REGCONFIRMATION.
+    pub fn from_wire(ticket: Vec<u8>, wait_time_ms: u64) -> Self {
+        let wait = Duration::from_millis(wait_time_ms);
+        match (ticket.is_empty(), wait_time_ms) {
+            (false, _) => RegConfirmation::Ticket { ticket, wait },
+            (true, 0) => RegConfirmation::Rejected,
+            (true, _) => RegConfirmation::Admitted { lifetime: wait },
+        }
+    }
+}
+
 /// The answer of a registrar to one REGTOPIC request.
 #[derive(Debug, Clone)]
-pub struct RegConfirmation {
-    /// The registrar stores the advertisement.
-    pub admitted: bool,
-    /// The ticket to send with the next attempt. Empty when admitted.
-    pub ticket: Vec<u8>,
-    /// How long to wait before the next attempt, or the advertisement lifetime when
-    /// admitted.
-    pub wait_time: Duration,
+pub struct RegTopicResult {
+    pub confirmation: RegConfirmation,
     /// Registrars near the topic that the registrar knows.
     pub aux: Vec<Enr>,
 }
@@ -53,6 +79,11 @@ pub struct TopicQueryResult {
     pub advertisers: Vec<Enr>,
     /// Registrars near the topic that the registrar knows.
     pub aux: Vec<Enr>,
+    /// All announced packets arrived; a `total` above `QUERY_RESP_LIMIT` never does, as
+    /// the requester stops at the cap. A partial response ended early, at the packet
+    /// cap, by a timeout or an error, after a valid record; one that ended early without
+    /// a valid record is an error.
+    pub complete: bool,
 }
 
 /// What the registration and search tables need to know about a node.
@@ -96,9 +127,9 @@ pub(crate) fn bucket_index(topic: &TopicId, id: &NodeId, depth: usize) -> usize 
 }
 
 /// ENR key signalling the topic discovery capability.
-pub const TOPIC_DISCOVERY_ENR_KEY: &str = "ng";
+pub const TOPIC_DISCOVERY_ENR_KEY: &str = "td";
 
-/// Protocol version advertised in the `ng` entry and required from peers.
+/// Protocol version advertised in the `td` entry and required from peers.
 pub const TOPIC_DISCOVERY_VERSION: u64 = 1;
 
 /// Reports whether the record advertises a supported version of the topic discovery
@@ -187,16 +218,10 @@ pub(crate) mod test_util {
         nodes_at_distance_from(base, dist, n, 1)
     }
 
-    /// The table sizes the Go tests were written for.
+    /// The defaults with a small ad cache, as the Go tests use.
     pub(crate) fn test_config() -> TopicConfig {
         TopicConfig {
             ad_cache_size: 20,
-            reg_table_depth: 18,
-            search_table_depth: 18,
-            reg_bucket_size: 10,
-            reg_bucket_standby_limit: 20,
-            search_bucket_size: 8,
-            search_yield_floor: 0,
             ..Default::default()
         }
     }
@@ -233,5 +258,13 @@ mod tests {
 
         enr.insert(TOPIC_DISCOVERY_ENR_KEY, &2u64, &key).unwrap();
         assert!(!supports_topic_discovery(&enr));
+    }
+
+    #[test]
+    fn topic_id_sha256() {
+        assert_eq!(
+            hex::encode(topic_id("example-service")),
+            "acac0a3cfc659b9392c42a643065965e71cae5229afeade460788cca53315f89"
+        );
     }
 }

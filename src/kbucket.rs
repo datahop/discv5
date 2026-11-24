@@ -468,6 +468,15 @@ where
         }
     }
 
+    /// Turns the recording of the nodes that enter or leave the table on or off. Off by
+    /// default.
+    #[cfg(feature = "topic-discovery")]
+    pub fn track_changes(&mut self, on: bool) {
+        for bucket in self.buckets.iter_mut() {
+            bucket.track_changes(on);
+        }
+    }
+
     /// Returns the nodes that entered or left the table since the last call, in order
     /// per bucket.
     #[cfg(feature = "topic-discovery")]
@@ -1093,6 +1102,7 @@ mod tests {
             None,
             None,
         );
+        table.track_changes(true);
         assert!(table.take_changes().is_empty());
 
         let key = Key::from(NodeId::random());
@@ -1166,6 +1176,7 @@ mod tests {
             None,
             None,
         );
+        table.track_changes(true);
         let key = Key::from(NodeId::random());
         for _ in 0..100 {
             let _ = table.insert_or_update(&key, 1, connected_state());

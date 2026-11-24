@@ -119,6 +119,8 @@ extern crate lazy_static;
 
 pub type Enr = enr::Enr<enr::CombinedKey>;
 
+#[cfg(feature = "topic-discovery")]
+pub use crate::discv5::TopicSearchStream;
 pub use crate::discv5::{Discv5, Event};
 pub use config::{Config, ConfigBuilder};
 pub use error::{Error, QueryError, RequestError, ResponseError};

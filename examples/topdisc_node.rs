@@ -2,18 +2,25 @@
 //! ENRs, keeps an advertisement for one topic alive and/or searches it, and serves its
 //! state as JSON on a status port.
 //!
-//! Every `TopicRegistered` and `TopicNodesFound` event, and the end of every search, is
-//! one JSON line on stdout. Logs go to stderr (`RUST_LOG`).
+//! Every `TopicRegistered` event, every search result, and every `--search` results
+//! read, is one JSON line on stdout. Logs go to stderr (`RUST_LOG`).
 //!
 //! ```sh
 //! cargo run --features topic-discovery --example topdisc_node -- \
-//!     --port 9300 --status-port 19300 --topic <64 hex chars> \
+//!     --port 9300 --status-port 19300 --service my-service \
 //!     --bootnode enr:... --register --search 100
 //! ```
+//!
+//! With `--probe-regtopic <enr>` the node sends one REGTOPIC to that node, prints the
+//! outcome (`admitted`, `ticket` or `rejected`) and exits.
 
 use clap::Parser;
-use discv5::{ConfigBuilder, Discv5, Enr, Event, ListenConfig, topic::TopicConfig};
+use discv5::{
+    ConfigBuilder, Discv5, Enr, Event, IpMode, ListenConfig, NodeContact,
+    topic::{RegConfirmation, TopicConfig, topic_id},
+};
 use enr::{CombinedKey, NodeId, k256};
+use futures::StreamExt;
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -47,8 +54,11 @@ struct Args {
     #[clap(long, default_value_t = 30)]
     lookup_interval: u64,
     /// Topic id, 32 bytes in hex.
+    #[clap(long, required_unless_present = "service", conflicts_with = "service")]
+    topic: Option<String>,
+    /// Service name; the topic id is its SHA-256.
     #[clap(long)]
-    topic: String,
+    service: Option<String>,
     /// Other topic ids whose ads the status reports. Repeatable.
     #[clap(long)]
     report_topic: Vec<String>,
@@ -58,27 +68,25 @@ struct Args {
     /// Seconds to wait after start before registering.
     #[clap(long, default_value_t = 0)]
     register_after: u64,
-    /// Search the topic for this many advertisers, again and again.
+    /// Search the topic with one lookup that runs until shutdown. Every this many
+    /// results read count as one search done.
     #[clap(long)]
     search: Option<usize>,
-    /// Adaptive search: ads per reply below which the search moves closer. 0 turns it off.
-    #[clap(long, default_value_t = 8)]
-    yield_floor: usize,
-    /// Adaptive search: buckets around the active one to refill. -1 asks for every bucket.
-    #[clap(long, default_value_t = 1)]
-    aux_radius: i64,
-    /// Cap on the gap between search passes, in seconds. -1 keeps 2 s.
-    #[clap(long, default_value_t = 60)]
-    pass_backoff: i64,
     /// Ad lifetime in seconds.
     #[clap(long, default_value_t = 900)]
     ad_lifetime: u64,
-    /// How long one search runs at most, in seconds.
+    /// Capacity of the ad cache.
+    #[clap(long, default_value_t = discv5::topic::params::C)]
+    ad_cache_size: usize,
+    /// Send one REGTOPIC for the topic to this node, print the outcome and exit.
+    #[clap(long)]
+    probe_regtopic: Option<String>,
+    /// Query timeout in seconds.
     #[clap(long, default_value_t = 60)]
     search_timeout: u64,
-    /// TCP port of the status server.
+    /// TCP port of the status server. No server when absent.
     #[clap(long)]
-    status_port: u16,
+    status_port: Option<u16>,
     /// Private key in hex. A random one when absent.
     #[clap(long)]
     key: Option<String>,
@@ -132,7 +140,11 @@ async fn main() {
             .and_then(|b| b.try_into().ok())
             .expect("a topic must be 32 bytes in hex")
     };
-    let topic = parse_topic(&args.topic);
+    let topic = match (&args.topic, &args.service) {
+        (Some(t), _) => parse_topic(t),
+        (None, Some(service)) => topic_id(service),
+        (None, None) => unreachable!("clap requires --topic or --service"),
+    };
     let mut report_topics = vec![topic];
     for t in &args.report_topic {
         let t = parse_topic(t);
@@ -153,16 +165,11 @@ async fn main() {
         .build(&key)
         .unwrap();
 
-    let mut topic_config = TopicConfig {
+    let topic_config = TopicConfig {
         ad_lifetime: Duration::from_secs(args.ad_lifetime),
-        search_yield_floor: args.yield_floor,
-        search_aux_radius: usize::try_from(args.aux_radius).ok(),
-        search_pass_backoff: u64::try_from(args.pass_backoff)
-            .ok()
-            .map(Duration::from_secs),
+        ad_cache_size: args.ad_cache_size,
         ..Default::default()
     };
-    topic_config.reg_attempt_timeout = topic_config.ad_lifetime + topic_config.ad_lifetime / 2;
     let listen = ListenConfig::from_ip(IpAddr::V4(args.listen_ip), args.port);
     let config = ConfigBuilder::new(listen)
         .query_timeout(Duration::from_secs(args.search_timeout))
@@ -189,6 +196,10 @@ async fn main() {
         }
     }
     discv5.start().await.expect("discv5 start");
+    if let Some(target) = &args.probe_regtopic {
+        probe_regtopic(&discv5, target, topic).await;
+        return;
+    }
     let discv5 = Arc::new(discv5);
     let state = Arc::new(Mutex::new(State::default()));
     let started = Instant::now();
@@ -236,11 +247,11 @@ async fn main() {
     }
 
     // Status server.
-    {
+    if let Some(status_port) = args.status_port {
         let discv5 = discv5.clone();
         let state = state.clone();
         let report_topics = report_topics.clone();
-        let addr = SocketAddr::new(IpAddr::V4(args.listen_ip), args.status_port);
+        let addr = SocketAddr::new(IpAddr::V4(args.listen_ip), status_port);
         let listener = TcpListener::bind(addr).await.expect("status port");
         tokio::spawn(async move {
             loop {
@@ -267,34 +278,14 @@ async fn main() {
         let state = state.clone();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                match event {
-                    Event::TopicRegistered { topic, registrar } => {
-                        let t = unix_ms();
-                        state.lock().unwrap().registrars.insert(registrar.raw(), t);
-                        println!(
-                            "{{\"t\":{t},\"event\":\"registered\",\"topic\":\"{}\",\"registrar\":\"{}\"}}",
-                            hex::encode(topic),
-                            hex_id(&registrar)
-                        );
-                    }
-                    Event::TopicNodesFound { topic, nodes } => {
-                        let t = unix_ms();
-                        let mut st = state.lock().unwrap();
-                        let ids: Vec<[u8; 32]> = nodes.iter().map(|n| n.node_id().raw()).collect();
-                        let mut new = Vec::new();
-                        for id in &ids {
-                            if st.advertisers.insert(*id, t).is_none() {
-                                new.push(*id);
-                            }
-                        }
-                        println!(
-                            "{{\"t\":{t},\"event\":\"found\",\"topic\":\"{}\",\"nodes\":{},\"new\":{}}}",
-                            hex::encode(topic),
-                            json_ids(ids.iter()),
-                            json_ids(new.iter())
-                        );
-                    }
-                    _ => {}
+                if let Event::TopicRegistered { topic, registrar } = event {
+                    let t = unix_ms();
+                    state.lock().unwrap().registrars.insert(registrar.raw(), t);
+                    println!(
+                        "{{\"t\":{t},\"event\":\"registered\",\"topic\":\"{}\",\"registrar\":\"{}\"}}",
+                        hex::encode(topic),
+                        hex_id(&registrar)
+                    );
                 }
             }
         });
@@ -317,31 +308,82 @@ async fn main() {
     if let Some(count) = args.search {
         let discv5 = discv5.clone();
         let state = state.clone();
+        let count = count.max(1);
         tokio::spawn(async move {
             loop {
-                let t0 = Instant::now();
-                let result = discv5.topic_search(topic, count).await;
-                let t = unix_ms();
-                let n = result.as_ref().map(Vec::len).unwrap_or(0);
-                let mut st = state.lock().unwrap();
-                st.searches_done += 1;
-                let total = st.advertisers.len();
-                drop(st);
-                println!(
-                    "{{\"t\":{t},\"event\":\"search_end\",\"topic\":\"{}\",\"results\":{n},\"ms\":{},\"distinct_total\":{total},\"err\":{}}}",
-                    hex::encode(topic),
-                    t0.elapsed().as_millis(),
-                    match &result {
-                        Ok(_) => "null".to_string(),
-                        Err(e) => format!("\"{e:?}\""),
+                let mut stream = match discv5.topic_search_stream(topic) {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!(error = ?e, "Topic search not started");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
-                );
+                };
+                let mut t0 = Instant::now();
+                let mut n = 0;
+                while let Some(enr) = stream.next().await {
+                    let t = unix_ms();
+                    let id = enr.node_id().raw();
+                    let mut st = state.lock().unwrap();
+                    let new = st.advertisers.insert(id, t).is_none();
+                    n += 1;
+                    let done = n % count == 0;
+                    if done {
+                        st.searches_done += 1;
+                    }
+                    let total = st.advertisers.len();
+                    drop(st);
+                    let new_ids = if new { vec![id] } else { vec![] };
+                    println!(
+                        "{{\"t\":{t},\"event\":\"found\",\"topic\":\"{}\",\"nodes\":{},\"new\":{}}}",
+                        hex::encode(topic),
+                        json_ids([id].iter()),
+                        json_ids(new_ids.iter())
+                    );
+                    if done {
+                        println!(
+                            "{{\"t\":{t},\"event\":\"search_end\",\"topic\":\"{}\",\"results\":{count},\"ms\":{},\"distinct_total\":{total},\"err\":null}}",
+                            hex::encode(topic),
+                            t0.elapsed().as_millis(),
+                        );
+                        t0 = Instant::now();
+                    }
+                }
+                warn!("Topic search stream ended");
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
 
     tokio::signal::ctrl_c().await.ok();
     info!("Shutting down");
+}
+
+async fn probe_regtopic(discv5: &Discv5, target: &str, topic: [u8; 32]) {
+    let enr = parse_enr(target).expect("--probe-regtopic needs an ENR");
+    let id = hex_id(&enr.node_id());
+    let contact = NodeContact::try_from_enr(enr, IpMode::Ip4).expect("contactable ENR");
+    let (result, detail) = match discv5
+        .send_regtopic(contact, topic, Vec::new(), Vec::new())
+        .await
+    {
+        Ok(reply) => match reply.confirmation {
+            RegConfirmation::Admitted { lifetime } => (
+                "admitted",
+                format!("\"lifetime_ms\":{}", lifetime.as_millis()),
+            ),
+            RegConfirmation::Ticket { wait, .. } => {
+                ("ticket", format!("\"wait_ms\":{}", wait.as_millis()))
+            }
+            RegConfirmation::Rejected => ("rejected", "\"err\":null".to_string()),
+        },
+        Err(e) => ("error", format!("\"err\":\"{e:?}\"")),
+    };
+    println!(
+        "{{\"t\":{},\"event\":\"probe\",\"topic\":\"{}\",\"target\":\"{id}\",\"result\":\"{result}\",{detail}}}",
+        unix_ms(),
+        hex::encode(topic),
+    );
 }
 
 fn status_json(
@@ -373,7 +415,9 @@ fn status_json(
             "\"ads_held\":{{{}}},\"ads_held_ids\":{{{}}},",
             "\"advertisers_found\":{},\"advertiser_ids\":{},\"searches_done\":{},",
             "\"regtopic_sent\":{},\"regtopic_recv\":{},\"topicquery_sent\":{},\"topicquery_recv\":{},",
-            "\"regconfirmation_recv\":{},\"topicnodes_recv\":{},\"sessions\":{}}}"
+            "\"regconfirmation_recv\":{},\"topicnodes_recv\":{},",
+            "\"tickets_issued\":{},\"tickets_recv\":{},\"rejections_sent\":{},\"rejections_recv\":{},",
+            "\"sessions\":{}}}"
         ),
         hex_id(&local.node_id()),
         local.to_base64(),
@@ -394,6 +438,10 @@ fn status_json(
         metrics.topic.topicquery_recv,
         metrics.topic.regconfirmation_recv,
         metrics.topic.topicnodes_recv,
+        metrics.topic.ticket_issued,
+        metrics.topic.ticket_recv,
+        metrics.topic.regtopic_rejected,
+        metrics.topic.rejection_recv,
         metrics.active_sessions,
     )
 }

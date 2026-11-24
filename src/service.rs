@@ -56,7 +56,7 @@ use tracing::{debug, error, info, trace, warn};
 #[cfg(feature = "topic-discovery")]
 use crate::{
     metrics::METRICS,
-    topic::{RegConfirmation, TopicId, TopicQueryResult, TopicTable},
+    topic::{RegTopicResult, TopicId, TopicQueryResult, TopicTable},
 };
 #[cfg(feature = "topic-discovery")]
 use std::sync::atomic::Ordering;
@@ -185,7 +185,7 @@ pub(crate) enum ServiceRequest {
         TopicId,
         Vec<u8>,
         Vec<u64>,
-        oneshot::Sender<Result<RegConfirmation, RequestError>>,
+        oneshot::Sender<Result<RegTopicResult, RequestError>>,
     ),
     /// Send a TOPICQUERY request to the designated peer and wait for the response.
     #[cfg(feature = "topic-discovery")]
@@ -201,9 +201,9 @@ pub(crate) enum ServiceRequest {
     /// Stop to advertise the local node for a topic.
     #[cfg(feature = "topic-discovery")]
     StopTopic(TopicId),
-    /// Search for the given number of advertisers of a topic.
+    /// Search for advertisers of a topic, delivered to the sender until it is closed.
     #[cfg(feature = "topic-discovery")]
-    TopicSearch(TopicId, usize, oneshot::Sender<Vec<Enr>>),
+    TopicSearch(TopicId, mpsc::Sender<Enr>),
 }
 
 use crate::discv5::PERMIT_BAN_LIST;
@@ -246,12 +246,16 @@ pub(crate) struct Service {
     /// contactable or not. This decides if we should update our ENR or set it to None, if we are
     /// not contactable.
     connectivity_state: ConnectivityState,
-    /// The ad cache of the topic discovery registrar.
+    /// The ad cache of the topic discovery registrar. `Discv5` always passes one; tests
+    /// may build a service without.
     #[cfg(feature = "topic-discovery")]
-    topic_table: Arc<RwLock<TopicTable>>,
-    /// Seals the tickets handed out by the registrar.
+    topic_table: Option<Arc<RwLock<TopicTable>>>,
+    /// Seals the tickets handed out by the registrar, with the ad cache.
     #[cfg(feature = "topic-discovery")]
-    ticket_sealer: crate::topic::TicketSealer,
+    ticket_sealer: Option<crate::topic::TicketSealer>,
+    /// The tickets the registrar credited recently.
+    #[cfg(feature = "topic-discovery")]
+    used_tickets: crate::topic::UsedTickets,
     /// The topic registrations and searches of the local node.
     #[cfg(feature = "topic-discovery")]
     topics: topic::TopicSystem,
@@ -289,7 +293,7 @@ pub(crate) enum CallbackResponse {
     Pong(oneshot::Sender<Result<Pong, RequestError>>),
     /// A response to a REGTOPIC request of the user.
     #[cfg(feature = "topic-discovery")]
-    RegConfirmation(oneshot::Sender<Result<RegConfirmation, RequestError>>),
+    RegConfirmation(oneshot::Sender<Result<RegTopicResult, RequestError>>),
     /// A response to a TOPICQUERY request of the user.
     #[cfg(feature = "topic-discovery")]
     TopicNodes(oneshot::Sender<Result<TopicQueryResult, RequestError>>),
@@ -330,7 +334,8 @@ impl Service {
         enr_key: Arc<RwLock<CombinedKey>>,
         kbuckets: Arc<RwLock<KBucketsTable<NodeId, Enr>>>,
         config: Config,
-        #[cfg(feature = "topic-discovery")] topic_table: Arc<RwLock<TopicTable>>,
+        #[cfg(feature = "topic-discovery")] topic_table: Option<Arc<RwLock<TopicTable>>>,
+        #[cfg(feature = "topic-discovery")] topic_reads: Arc<tokio::sync::Notify>,
     ) -> Result<(oneshot::Sender<()>, mpsc::Sender<ServiceRequest>), std::io::Error> {
         // process behaviour-level configuration parameters
         let ip_votes = if config.enr_update {
@@ -375,11 +380,15 @@ impl Service {
                     event_stream: None,
                     exit,
                     #[cfg(feature = "topic-discovery")]
+                    ticket_sealer: topic_table
+                        .as_ref()
+                        .map(|_| crate::topic::TicketSealer::new(Instant::now())),
+                    #[cfg(feature = "topic-discovery")]
+                    used_tickets: Default::default(),
+                    #[cfg(feature = "topic-discovery")]
                     topic_table,
                     #[cfg(feature = "topic-discovery")]
-                    ticket_sealer: crate::topic::TicketSealer::new(Instant::now()),
-                    #[cfg(feature = "topic-discovery")]
-                    topics: Default::default(),
+                    topics: topic::TopicSystem::new(topic_reads),
                     config: config.clone(),
                     ip_mode,
                     connectivity_state,
@@ -398,6 +407,7 @@ impl Service {
             #[cfg(feature = "topic-discovery")]
             self.topic_table_changes();
             let topic_wakeup = self.topic_wakeup();
+            let topic_reads = self.topic_reads();
             tokio::select! {
                 _ = &mut self.exit => {
                     if let Some(exit) = self.handler_exit.take() {
@@ -450,8 +460,8 @@ impl Service {
                         #[cfg(feature = "topic-discovery")]
                         ServiceRequest::StopTopic(topic) => self.stop_topic_registration(topic),
                         #[cfg(feature = "topic-discovery")]
-                        ServiceRequest::TopicSearch(topic, count, callback) => {
-                            self.start_topic_search(topic, count, callback);
+                        ServiceRequest::TopicSearch(topic, results) => {
+                            self.start_topic_search(topic, results);
                         }
                     }
                 }
@@ -467,6 +477,10 @@ impl Service {
                         HandlerOut::Response(node_address, response) => {
                                 self.handle_rpc_response(node_address, *response);
                             }
+                        #[cfg(feature = "topic-discovery")]
+                        HandlerOut::TopicResponse(node_address, response, last) => {
+                            self.handle_topic_response(node_address, *response, last);
+                        }
                         HandlerOut::WhoAreYou(whoareyou_ref) => {
                             // check what our latest known ENR is for this node.
                             if let Some(known_enr) = self.find_enr(&whoareyou_ref.0.node_id) {
@@ -511,9 +525,15 @@ impl Service {
                 event = Service::bucket_maintenance_poll(&self.kbuckets) => {
                     self.send_event(event);
                 }
-                _ = Service::topic_wakeup_poll(topic_wakeup) => {
+                read = Service::topic_wakeup_poll(topic_wakeup, topic_reads) => {
                     #[cfg(feature = "topic-discovery")]
-                    self.topic_tick();
+                    if read {
+                        self.topic_searches_read();
+                    } else {
+                        self.topic_tick();
+                    }
+                    #[cfg(not(feature = "topic-discovery"))]
+                    let _ = read;
                 }
                 query_event = Service::query_event_poll(&mut self.queries) => {
                     match query_event {
@@ -774,7 +794,15 @@ impl Service {
                 buckets,
             } => {
                 METRICS.topic.regtopic_recv.fetch_add(1, Ordering::Relaxed);
-                self.handle_regtopic(node_address, id, topic, ticket, enr, buckets);
+                self.handle_regtopic(
+                    node_address,
+                    id,
+                    topic,
+                    ticket,
+                    enr,
+                    buckets,
+                    Instant::now(),
+                );
             }
             #[cfg(feature = "topic-discovery")]
             RequestBody::TopicQuery { topic, buckets } => {
@@ -782,7 +810,7 @@ impl Service {
                     .topic
                     .topicquery_recv
                     .fetch_add(1, Ordering::Relaxed);
-                self.handle_topic_query(node_address, id, topic, buckets);
+                self.handle_topic_query(node_address, id, topic, buckets, Instant::now());
             }
         }
     }
@@ -791,6 +819,16 @@ impl Service {
     fn handle_rpc_response(&mut self, node_address: NodeAddress, response: Response) {
         // verify we know of the rpc_id
         let id = response.id.clone();
+
+        // The handler reports topic responses separately, with their end.
+        #[cfg(feature = "topic-discovery")]
+        if self
+            .active_requests
+            .get(&id)
+            .is_some_and(|request| request.request_body.is_topic_request())
+        {
+            return self.handle_topic_response(node_address, response, true);
+        }
 
         let Some(mut active_request) = self.active_requests.remove(&id) else {
             warn!(%id, "Received an RPC response which doesn't match a request");
@@ -821,20 +859,10 @@ impl Service {
                 %node_address,
                 "Node gave an incorrect response type. Ignoring response"
             );
-            // The handler has dropped the request, so no timeout follows.
-            #[cfg(feature = "topic-discovery")]
-            if active_request.request_body.is_topic_request() {
-                self.topic_request_failed(id, active_request, RequestError::InvalidRemotePacket);
-            }
             return;
         }
 
         let node_id = node_address.node_id;
-
-        #[cfg(feature = "topic-discovery")]
-        if active_request.request_body.is_topic_request() {
-            return self.handle_topic_response(node_address, id, active_request, response.body);
-        }
 
         match response.body {
             ResponseBody::Nodes { total, mut nodes } => {
@@ -1796,13 +1824,41 @@ impl Service {
         }
     }
 
-    /// A future that resolves at the given time, or never without one. It is rebuilt on
-    /// every iteration of the main loop, so a new earlier time is picked up.
-    async fn topic_wakeup_poll(wakeup: Option<Instant>) {
-        match wakeup {
-            #[cfg(feature = "topic-discovery")]
-            Some(at) => tokio::time::sleep_until(at.into()).await,
-            _ => future::pending().await,
+    /// What wakes the topic system up when a search caller reads.
+    fn topic_reads(&self) -> Option<Arc<tokio::sync::Notify>> {
+        #[cfg(feature = "topic-discovery")]
+        {
+            Some(self.topics.reads.clone())
+        }
+        #[cfg(not(feature = "topic-discovery"))]
+        {
+            None
+        }
+    }
+
+    /// A future that resolves at the given time, or never without one, or with `true`
+    /// once a search caller read results. It is rebuilt on every iteration of the main
+    /// loop, so a new earlier time is picked up.
+    async fn topic_wakeup_poll(
+        wakeup: Option<Instant>,
+        reads: Option<Arc<tokio::sync::Notify>>,
+    ) -> bool {
+        let timer = async {
+            match wakeup {
+                #[cfg(feature = "topic-discovery")]
+                Some(at) => tokio::time::sleep_until(at.into()).await,
+                _ => future::pending().await,
+            }
+        };
+        let read = async {
+            match &reads {
+                Some(reads) => reads.notified().await,
+                None => future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = timer => false,
+            _ = read => true,
         }
     }
 

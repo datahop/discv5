@@ -93,7 +93,7 @@ pub enum RequestBody {
         /// The ticket issued by the recipient on the previous attempt; empty on the first.
         ticket: Vec<u8>,
         /// The sender's current record.
-        enr: Enr<CombinedKey>,
+        enr: RegTopicEnr,
         /// Log2 distances from the topic where the sender's service table has space.
         buckets: Vec<u64>,
     },
@@ -151,11 +151,8 @@ pub enum ResponseBody {
     },
 }
 
-/// Decode-time bounds on the variable-length fields of the topic discovery messages.
 #[cfg(feature = "topic-discovery")]
-const MAX_TOPIC_DISTANCES: usize = 256;
-#[cfg(feature = "topic-discovery")]
-const MAX_TOPIC_NODES: usize = 16;
+use crate::topic::params::{MAX_TOPIC_DISTANCES, MAX_TOPIC_NODES};
 
 #[cfg(feature = "topic-discovery")]
 impl RequestBody {
@@ -237,7 +234,7 @@ impl Request {
                 id.as_bytes().encode(&mut list);
                 topic.encode(&mut list);
                 ticket.as_slice().encode(&mut list);
-                enr.encode(&mut list);
+                list.extend_from_slice(&enr.rlp);
                 buckets.encode(&mut list);
                 wrap_list(buf, &list)
             }
@@ -416,8 +413,95 @@ fn decode_enr(payload: &mut &[u8]) -> Result<Enr<CombinedKey>, DecoderError> {
     Ok(enr)
 }
 
-/// Decodes an RLP list of records.
-fn decode_enr_list(payload: &mut &[u8]) -> Result<Vec<Enr<CombinedKey>>, DecoderError> {
+/// The record of a REGTOPIC: its RLP, and the record itself when it is valid. A
+/// well-formed record that does not verify is kept so the registrar can reject it.
+#[cfg(feature = "topic-discovery")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegTopicEnr {
+    pub rlp: Vec<u8>,
+    pub enr: Option<Box<Enr<CombinedKey>>>,
+}
+
+#[cfg(feature = "topic-discovery")]
+impl From<Enr<CombinedKey>> for RegTopicEnr {
+    fn from(enr: Enr<CombinedKey>) -> Self {
+        let mut rlp = Vec::new();
+        enr.encode(&mut rlp);
+        RegTopicEnr {
+            rlp,
+            enr: Some(Box::new(enr)),
+        }
+    }
+}
+
+#[cfg(feature = "topic-discovery")]
+impl RegTopicEnr {
+    /// Decodes a record that is well-formed as in go-ethereum's `enr.Record`: at most
+    /// 300 bytes, a list of signature, sequence number and strictly sorted key/value
+    /// pairs. Anything else is a decoding error.
+    pub(crate) fn decode(payload: &mut &[u8]) -> Result<Self, DecoderError> {
+        const MAX_ENR_SIZE: usize = 300;
+        let mut rest = *payload;
+        let header = Header::decode(&mut rest)?;
+        if !header.list {
+            return Err(DecoderError::UnexpectedString);
+        }
+        if header.payload_length > rest.len() {
+            return Err(DecoderError::InputTooShort);
+        }
+        let len = payload.len() - rest.len() + header.payload_length;
+        let rlp = payload[..len].to_vec();
+        if len > MAX_ENR_SIZE {
+            return Err(DecoderError::Custom("enr exceeds max size"));
+        }
+
+        let mut items = &rest[..header.payload_length];
+        Header::decode_bytes(&mut items, false)?;
+        u64::decode(&mut items)?;
+        let mut prev: Option<&[u8]> = None;
+        while !items.is_empty() {
+            let key = Header::decode_bytes(&mut items, false)?;
+            if prev.is_some_and(|prev| prev >= key) {
+                return Err(DecoderError::Custom("Unsorted or duplicate keys"));
+            }
+            prev = Some(key);
+            if items.is_empty() {
+                return Err(DecoderError::Custom("Incomplete key/value pair"));
+            }
+            let value = Header::decode(&mut items)?;
+            if value.payload_length > items.len() {
+                return Err(DecoderError::InputTooShort);
+            }
+            items.advance(value.payload_length);
+        }
+
+        let enr = Enr::<CombinedKey>::decode(&mut &rlp[..]).ok().map(Box::new);
+        payload.advance(len);
+        Ok(RegTopicEnr { rlp, enr })
+    }
+}
+
+/// Decodes the REGCONFIRMATION wait time. Values wider than 64 bits saturate.
+#[cfg(feature = "topic-discovery")]
+fn decode_wait_time(payload: &mut &[u8]) -> Result<u64, DecoderError> {
+    let mut rest = *payload;
+    let bytes = Header::decode_bytes(&mut rest, false)?;
+    if bytes.len() <= 8 {
+        return u64::decode(payload);
+    }
+    if bytes[0] == 0 {
+        return Err(DecoderError::LeadingZero);
+    }
+    *payload = rest;
+    Ok(u64::MAX)
+}
+
+/// Decodes an RLP list of records. With `skipped`, a well-formed record that fails
+/// verification is dropped and counted instead of failing the list.
+fn decode_enr_list(
+    payload: &mut &[u8],
+    skipped: Option<&mut usize>,
+) -> Result<Vec<Enr<CombinedKey>>, DecoderError> {
     let header = Header::decode(payload)?;
     if !header.list {
         return Err(DecoderError::Custom("Invalid format of header"));
@@ -429,8 +513,23 @@ fn decode_enr_list(payload: &mut &[u8]) -> Result<Vec<Enr<CombinedKey>>, Decoder
     }
     let (mut items, rest) = payload.split_at(header.payload_length);
     let mut nodes = Vec::new();
-    while !items.is_empty() {
-        nodes.push(decode_enr(&mut items)?);
+    match skipped {
+        None => {
+            while !items.is_empty() {
+                nodes.push(decode_enr(&mut items)?);
+            }
+        }
+        #[cfg(feature = "topic-discovery")]
+        Some(skipped) => {
+            while !items.is_empty() {
+                match RegTopicEnr::decode(&mut items)?.enr {
+                    Some(enr) => nodes.push(*enr),
+                    None => *skipped += 1,
+                }
+            }
+        }
+        #[cfg(not(feature = "topic-discovery"))]
+        Some(_) => unreachable!("records are only skipped with topic discovery"),
     }
     *payload = rest;
     Ok(nodes)
@@ -555,6 +654,19 @@ impl Message {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, DecoderError> {
+        Self::decode_counting(data, None)
+    }
+
+    /// Decodes like `decode`, but drops the records of NODES and TOPICNODES that fail
+    /// verification instead of the whole message, and returns their number.
+    #[cfg(feature = "topic-discovery")]
+    pub fn decode_lenient(data: &[u8]) -> Result<(Self, usize), DecoderError> {
+        let mut skipped = 0;
+        let message = Self::decode_counting(data, Some(&mut skipped))?;
+        Ok((message, skipped))
+    }
+
+    fn decode_counting(data: &[u8], skipped: Option<&mut usize>) -> Result<Self, DecoderError> {
         if data.len() < 3 {
             return Err(DecoderError::InputTooShort);
         }
@@ -656,7 +768,7 @@ impl Message {
             4 => {
                 // NodesResponse
                 let total = u64::decode(payload)?;
-                let nodes = decode_enr_list(payload)?;
+                let nodes = decode_enr_list(payload, skipped)?;
                 if !payload.is_empty() {
                     return Err(DecoderError::Custom("Payload should be empty"));
                 }
@@ -695,7 +807,7 @@ impl Message {
                 // REGTOPIC: [request-id, topic, ticket, ENR, [distance, ...]]
                 let topic = <[u8; 32]>::decode(payload)?;
                 let ticket = Bytes::decode(payload)?.to_vec();
-                let enr = decode_enr(payload)?;
+                let enr = RegTopicEnr::decode(payload)?;
                 let buckets = Vec::<u64>::decode(payload)?;
                 if buckets.len() > MAX_TOPIC_DISTANCES {
                     return Err(DecoderError::Custom("Too many distances in REGTOPIC"));
@@ -718,7 +830,7 @@ impl Message {
                 // REGCONFIRMATION: [request-id, total, ticket, wait-time]
                 let total = u64::from(u8::decode(payload)?);
                 let ticket = Bytes::decode(payload)?.to_vec();
-                let wait_time = u64::decode(payload)?;
+                let wait_time = decode_wait_time(payload)?;
                 if !payload.is_empty() {
                     return Err(DecoderError::Custom("Payload should be empty"));
                 }
@@ -751,9 +863,13 @@ impl Message {
             10 => {
                 // TOPICNODES: [request-id, total, [ENR, ...]]
                 let total = u64::from(u8::decode(payload)?);
-                let nodes = decode_enr_list(payload)?;
-                if nodes.len() > MAX_TOPIC_NODES {
+                let mut dropped = 0;
+                let nodes = decode_enr_list(payload, skipped.is_some().then_some(&mut dropped))?;
+                if nodes.len() + dropped > MAX_TOPIC_NODES {
                     return Err(DecoderError::Custom("Too many nodes in TOPICNODES"));
+                }
+                if let Some(skipped) = skipped {
+                    *skipped += dropped;
                 }
                 if !payload.is_empty() {
                     return Err(DecoderError::Custom("Payload should be empty"));
@@ -1157,154 +1273,232 @@ mod tests {
 
 #[cfg(all(test, feature = "topic-discovery"))]
 mod topic_tests {
-    //! Byte vectors produced by the Go implementation: each message below was built with
-    //! the same field values in `v5wire`, encoded with `rlp.EncodeToBytes` and prefixed
-    //! with its message type byte. The record is signed with the secp256k1 key
-    //! eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f (ip 127.0.0.1,
-    //! udp 30303, seq 1); the signature is deterministic (RFC 6979), so the bytes are
-    //! reproducible from the Go code.
+    //! The spec's "TopDisc Message Encodings" test vectors, kept verbatim in
+    //! `topic/testdata`.
     use super::*;
+    use crate::topic::{supports_topic_discovery, topic_id};
+    use enr::{EnrKey, NodeId};
+    use std::collections::HashMap;
 
-    const ENR: &str = "f884b8404ee3d46c3bfc895484b582e2a5892c2eccfd61c6259bcb57e12bcfbd3544b46b6922188402582c89eae528dd0ea691ebfb2c13cc974b357ba721ea9b84a285a080826964827634826970847f00000189736563703235366b31a10313d14211e0287b2361a1615890a9b5212080546d0a257ae4cff96cf534992cb98375647082765f";
+    const VECTORS: &str = include_str!("topic/testdata/topdisc-message-encodings.txt");
 
+    /// The indented blocks of the vector file, in order, without the indent.
+    fn blocks() -> Vec<Vec<&'static str>> {
+        let mut blocks = Vec::new();
+        let mut block = Vec::new();
+        for line in VECTORS.lines() {
+            match line.strip_prefix("    ") {
+                Some(line) => block.push(line.trim()),
+                None if !block.is_empty() => blocks.push(std::mem::take(&mut block)),
+                None => {}
+            }
+        }
+        if !block.is_empty() {
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    fn hex_block(block: &[&str]) -> Vec<u8> {
+        hex::decode(block.concat()).unwrap()
+    }
+
+    /// The ENR of the vectors.
     fn record() -> Enr<CombinedKey> {
-        Enr::decode(&mut &hex::decode(ENR).unwrap()[..]).unwrap()
+        Enr::decode(&mut &hex_block(&blocks()[0])[..]).unwrap()
     }
 
     fn topic() -> [u8; 32] {
-        let mut topic = [0u8; 32];
-        topic[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
-        topic
+        topic_id("example-service")
     }
 
-    const TOPIC_HEX: &str = "a00102030405000000000000000000000000000000000000000000000000000000";
-
-    fn check(message: Message, expected_hex: &str) {
-        let expected = hex::decode(expected_hex).unwrap();
-        assert_eq!(hex::encode(message.clone().encode()), expected_hex);
-        assert_eq!(Message::decode(&expected).unwrap(), message);
+    /// The bytes of the first vector whose comment starts with `first_field`.
+    fn vector(first_field: &str) -> Vec<u8> {
+        let blocks = blocks();
+        let i = blocks
+            .iter()
+            .position(|b| b[0] == first_field)
+            .expect("no such vector");
+        hex_block(&blocks[i + 1])
     }
 
-    #[test]
-    fn regtopic_vector() {
-        check(
-            Message::Request(Request {
-                id: RequestId(vec![1, 2, 3]),
+    /// Builds the message the `# kind.field = value` comment lines describe.
+    fn message_from_fields(fields: &[&str]) -> Message {
+        let mut kind = None;
+        let mut values = HashMap::new();
+        for line in fields {
+            let (name, value) = line
+                .strip_prefix("# ")
+                .and_then(|l| l.split_once(" = "))
+                .unwrap_or_else(|| panic!("bad field line {line}"));
+            let (k, field) = name.split_once('.').unwrap();
+            assert!(
+                kind.is_none_or(|kind| kind == k),
+                "mixed kinds in {fields:?}"
+            );
+            kind = Some(k);
+            values.insert(field, value);
+        }
+        let mut take = |field: &str| {
+            values
+                .remove(field)
+                .unwrap_or_else(|| panic!("missing field {field}"))
+        };
+        let bytes = |v: &str| match v {
+            "(empty)" => Vec::new(),
+            v => hex::decode(v.strip_prefix("0x").unwrap()).unwrap(),
+        };
+        let int = |v: &str| v.parse::<u64>().unwrap();
+        let topic = |v: &str| {
+            let service = v
+                .strip_prefix("SHA-256(\"")
+                .and_then(|v| v.strip_suffix("\")"))
+                .unwrap();
+            topic_id(service)
+        };
+        let enr = |v: &str| {
+            assert_eq!(v, "the ENR above");
+            record()
+        };
+        let list = |v: &str| -> Vec<String> {
+            let v = v
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .unwrap();
+            v.split(", ")
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        };
+        let distances = |v: &str| list(v).iter().map(|d| int(d)).collect::<Vec<_>>();
+
+        let id = RequestId(bytes(take("req-id")));
+        let message = match kind.unwrap() {
+            "regtopic" => Message::Request(Request {
+                id,
                 body: RequestBody::RegTopic {
-                    topic: topic(),
-                    ticket: vec![9, 9],
-                    enr: record(),
-                    buckets: vec![250, 251],
+                    topic: topic(take("topic")),
+                    ticket: bytes(take("ticket")),
+                    enr: enr(take("ENR")).into(),
+                    buckets: distances(take("topic-distances")),
                 },
             }),
-            &format!("07f8b383010203{TOPIC_HEX}820909{ENR}c481fa81fb"),
-        );
-    }
-
-    #[test]
-    fn regtopic_vector_no_ticket() {
-        check(
-            Message::Request(Request {
-                id: RequestId(vec![1]),
-                body: RequestBody::RegTopic {
-                    topic: topic(),
-                    ticket: vec![],
-                    enr: record(),
-                    buckets: vec![],
-                },
-            }),
-            &format!("07f8aa01{TOPIC_HEX}80{ENR}c0"),
-        );
-    }
-
-    #[test]
-    fn regconfirmation_vectors() {
-        check(
-            Message::Response(Response {
-                id: RequestId(vec![4]),
+            "regconfirmation" => Message::Response(Response {
+                id,
                 body: ResponseBody::RegConfirmation {
-                    total: 2,
-                    ticket: vec![7, 7],
-                    wait_time: 1500,
+                    total: int(take("total")),
+                    ticket: bytes(take("ticket")),
+                    wait_time: int(take("wait-time")),
                 },
             }),
-            "08c804028207078205dc",
-        );
-        // Admitted: empty ticket, wait time carries the ad lifetime (15 min).
-        check(
-            Message::Response(Response {
-                id: RequestId(vec![4]),
-                body: ResponseBody::RegConfirmation {
-                    total: 1,
-                    ticket: vec![],
-                    wait_time: 900_000,
+            "topicquery" => Message::Request(Request {
+                id,
+                body: RequestBody::TopicQuery {
+                    topic: topic(take("topic")),
+                    buckets: distances(take("topic-distances")),
                 },
             }),
-            "08c7040180830dbba0",
-        );
+            "topicnodes" => Message::Response(Response {
+                id,
+                body: ResponseBody::TopicNodes {
+                    total: int(take("total")),
+                    nodes: list(take("ENRs")).iter().map(|v| enr(v)).collect(),
+                },
+            }),
+            kind => panic!("unknown message kind {kind}"),
+        };
+        assert!(values.is_empty(), "unchecked fields {values:?}");
+        message
     }
 
+    // Every spec vector decodes to the fields in its comment and encodes back to the
+    // same bytes.
     #[test]
-    fn topicquery_vectors() {
-        check(
-            Message::Request(Request {
-                id: RequestId(vec![5]),
-                body: RequestBody::TopicQuery {
-                    topic: topic(),
-                    buckets: vec![248],
-                },
-            }),
-            &format!("09e505{TOPIC_HEX}c281f8"),
+    fn spec_vectors_decode_encode() {
+        let blocks = blocks();
+
+        let enr = record();
+        // node-a-key of the spec's test vectors.
+        let mut node_a_key =
+            hex::decode("eef77acb6c6a6eebc5b363a475ac583ec7eccdb42b6481424c60f59aa326547f")
+                .unwrap();
+        let node_a_key = CombinedKey::secp256k1_from_bytes(&mut node_a_key).unwrap();
+        assert_eq!(enr.public_key(), node_a_key.public());
+        assert_eq!(enr.node_id(), NodeId::from(node_a_key.public()));
+        assert_eq!(enr.seq(), 1);
+        assert_eq!(enr.ip4(), Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(enr.udp4(), Some(30303));
+        assert!(supports_topic_discovery(&enr));
+        let mut encoded = Vec::new();
+        enr.encode(&mut encoded);
+        assert_eq!(encoded, hex_block(&blocks[0]));
+
+        assert_eq!(blocks[1][0], "topic = SHA-256(\"example-service\")");
+        assert_eq!(
+            blocks[1][1],
+            format!("= 0x{}", hex::encode(topic_id("example-service")))
         );
-        check(
-            Message::Request(Request {
-                id: RequestId(vec![5]),
-                body: RequestBody::TopicQuery {
-                    topic: topic(),
-                    buckets: vec![],
-                },
-            }),
-            &format!("09e305{TOPIC_HEX}c0"),
-        );
+
+        let mut checked = 0;
+        for pair in blocks[2..].chunks(2) {
+            let [fields, data] = pair else {
+                panic!("vector without bytes: {pair:?}");
+            };
+            let expected = message_from_fields(fields);
+            let data = hex_block(data);
+            assert_eq!(
+                Message::decode(&data).unwrap(),
+                expected,
+                "decode {fields:?}"
+            );
+            assert_eq!(
+                hex::encode(expected.encode()),
+                hex::encode(&data),
+                "encode {fields:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 8);
     }
 
+    // A wait time wider than 64 bits decodes as the largest one.
     #[test]
-    fn topicnodes_vectors() {
-        check(
-            Message::Response(Response {
-                id: RequestId(vec![6]),
-                body: ResponseBody::TopicNodes {
-                    total: 3,
-                    nodes: vec![record()],
-                },
-            }),
-            &format!("0af88a0603f886{ENR}"),
-        );
-        check(
-            Message::Response(Response {
-                id: RequestId(vec![6]),
-                body: ResponseBody::TopicNodes {
-                    total: 1,
-                    nodes: vec![],
-                },
-            }),
-            "0ac30601c0",
-        );
+    fn wait_time_saturates() {
+        let wait_time = |hex_msg: &str| match Message::decode(&hex::decode(hex_msg).unwrap()) {
+            Ok(Message::Response(Response {
+                body: ResponseBody::RegConfirmation { wait_time, .. },
+                ..
+            })) => Ok(wait_time),
+            Ok(other) => panic!("not a REGCONFIRMATION: {other:?}"),
+            Err(e) => Err(e),
+        };
+        let max = "08d08400000001018088ffffffffffffffff";
+        assert_eq!(wait_time(max), Ok(u64::MAX));
+        let wide = "08d184000000010180890100000000000000ff";
+        assert_eq!(wait_time(wide), Ok(u64::MAX));
+        let huge = format!("08e884000000010180a0{}", "ff".repeat(32));
+        assert_eq!(wait_time(&huge), Ok(u64::MAX));
+        // Leading zeros stay invalid.
+        assert!(wait_time("08d1840000000101808900ffffffffffffffff").is_err());
+
+        let saturated = Message::decode(&hex::decode(wide).unwrap()).unwrap();
+        assert_eq!(hex::encode(saturated.encode()), max);
     }
 
     #[test]
     fn nodes_vector_unchanged() {
-        // The shared record-list codec still produces the plain NODES encoding.
-        check(
-            Message::Response(Response {
-                id: RequestId(vec![6]),
-                body: ResponseBody::Nodes {
-                    total: 3,
-                    nodes: vec![record()],
-                },
-            }),
-            &format!("04f88a0603f886{ENR}"),
-        );
+        // NODES shares the record-list codec of TOPICNODES.
+        let mut data = vector("# topicnodes.req-id = 0x00000003");
+        data[0] = 4;
+        let message = Message::Response(Response {
+            id: RequestId(vec![0, 0, 0, 3]),
+            body: ResponseBody::Nodes {
+                total: 1,
+                nodes: vec![record()],
+            },
+        });
+        assert_eq!(message.clone().encode(), data);
+        assert_eq!(Message::decode(&data).unwrap(), message);
     }
 
     #[test]
@@ -1323,7 +1517,7 @@ mod topic_tests {
             .match_request(&RequestBody::RegTopic {
                 topic: topic(),
                 ticket: vec![],
-                enr: record(),
+                enr: record().into(),
                 buckets: vec![]
             })
         );
@@ -1362,7 +1556,7 @@ mod topic_tests {
             body: RequestBody::RegTopic {
                 topic: topic(),
                 ticket: vec![],
-                enr: record(),
+                enr: record().into(),
                 buckets: vec![1; MAX_TOPIC_DISTANCES],
             },
         })
@@ -1384,7 +1578,7 @@ mod topic_tests {
         assert!(Message::decode(&hex::decode("08c904820100820707820101").unwrap()).is_err());
 
         // Trailing and truncated bodies.
-        let good = hex::decode(format!("09e505{TOPIC_HEX}c281f8")).unwrap();
+        let good = vector("# topicquery.req-id = 0x00000003");
         let mut trailing = good.clone();
         trailing.push(0);
         assert!(Message::decode(&trailing).is_err());
@@ -1393,10 +1587,191 @@ mod topic_tests {
         // The topic must be exactly 32 bytes.
         assert!(Message::decode(&hex::decode("09c5059f0102c0").unwrap()).is_err());
 
-        // A record where the ticket is expected (the field order of the spec draft)
-        // does not decode.
-        let spec_order =
-            hex::decode(format!("07f8b083010203{TOPIC_HEX}{ENR}820909c481fa81fb")).unwrap();
-        assert!(Message::decode(&spec_order).is_err());
+        // The record and the ticket swapped.
+        let mut list = Vec::new();
+        RequestId(vec![1]).as_bytes().encode(&mut list);
+        topic().encode(&mut list);
+        record().encode(&mut list);
+        [9u8, 9].as_slice().encode(&mut list);
+        vec![250u64, 251].encode(&mut list);
+        assert!(Message::decode(&wrap_list(vec![7], &list)).is_err());
+    }
+
+    fn regtopic(id: Vec<u8>, ticket: Vec<u8>, buckets: Vec<u64>) -> Vec<u8> {
+        Message::Request(Request {
+            id: RequestId(id),
+            body: RequestBody::RegTopic {
+                topic: topic(),
+                ticket,
+                enr: record().into(),
+                buckets,
+            },
+        })
+        .encode()
+    }
+
+    fn regconfirmation(id: Vec<u8>, ticket: Vec<u8>) -> Vec<u8> {
+        Message::Response(Response {
+            id: RequestId(id),
+            body: ResponseBody::RegConfirmation {
+                total: 1,
+                ticket,
+                wait_time: 0,
+            },
+        })
+        .encode()
+    }
+
+    fn topicquery(id: Vec<u8>, buckets: Vec<u64>) -> Vec<u8> {
+        Message::Request(Request {
+            id: RequestId(id),
+            body: RequestBody::TopicQuery {
+                topic: topic(),
+                buckets,
+            },
+        })
+        .encode()
+    }
+
+    fn topicnodes(id: Vec<u8>, nodes: usize) -> Vec<u8> {
+        Message::Response(Response {
+            id: RequestId(id),
+            body: ResponseBody::TopicNodes {
+                total: 1,
+                nodes: vec![record(); nodes],
+            },
+        })
+        .encode()
+    }
+
+    /// A message of `kind` whose list holds the given encoded items.
+    fn raw(kind: u8, items: &[&[u8]]) -> Vec<u8> {
+        wrap_list(vec![kind], &items.concat())
+    }
+
+    fn rlp<T: Encodable + ?Sized>(v: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        v.encode(&mut out);
+        out
+    }
+
+    // The malformed topic messages of geth's decode tests do not decode.
+    #[test]
+    fn rejects_malformed_topic_kinds() {
+        let trailing = |mut b: Vec<u8>| {
+            b.push(0);
+            b
+        };
+        let truncated = |mut b: Vec<u8>| {
+            b.pop();
+            b
+        };
+        let id = rlp([1u8].as_slice());
+        let no_buckets = rlp(&Vec::<u64>::new());
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("unknown type", raw(0xee, &[&[1]])),
+            ("regtopic empty", vec![7]),
+            ("regtopic not a list", vec![7, 1]),
+            ("topicquery not a list", vec![9, 1]),
+            ("regtopic too few", raw(7, &[&[1]])),
+            ("regconfirmation too few", raw(8, &[&[1]])),
+            ("topicquery too few", raw(9, &[&[1]])),
+            ("topicnodes too few", raw(10, &[&[1]])),
+            ("topicquery trailing", trailing(topicquery(vec![1], vec![]))),
+            ("topicnodes trailing", trailing(topicnodes(vec![1], 1))),
+            (
+                "regtopic truncated",
+                truncated(regtopic(vec![1], vec![2], vec![])),
+            ),
+            (
+                "topicquery truncated",
+                truncated(topicquery(vec![1], vec![])),
+            ),
+            ("topicnodes truncated", truncated(topicnodes(vec![1], 1))),
+            ("regtopic big req-id", regtopic(vec![0; 9], vec![], vec![])),
+            (
+                "regconfirmation big req-id",
+                regconfirmation(vec![0; 9], vec![]),
+            ),
+            ("topicquery big req-id", topicquery(vec![0; 9], vec![])),
+            ("topicnodes big req-id", topicnodes(vec![0; 9], 0)),
+            (
+                "topicquery too many fields",
+                raw(
+                    9,
+                    &[&id, &rlp(&topic()), &no_buckets, &rlp([2u8].as_slice())],
+                ),
+            ),
+            (
+                "topicquery topic short",
+                raw(9, &[&id, &rlp([0u8; 31].as_slice()), &no_buckets]),
+            ),
+            (
+                "topicquery topic long",
+                raw(9, &[&id, &rlp([0u8; 33].as_slice()), &no_buckets]),
+            ),
+            (
+                "regconfirmation total overflow",
+                raw(8, &[&id, &rlp(&256u64), &rlp([].as_slice()), &rlp(&0u64)]),
+            ),
+            (
+                "topicnodes total overflow",
+                raw(10, &[&id, &rlp(&256u64), &no_buckets]),
+            ),
+            (
+                "regtopic bad enr",
+                raw(
+                    7,
+                    &[&id, &rlp(&topic()), &rlp([].as_slice()), &[1], &no_buckets],
+                ),
+            ),
+            (
+                "topicnodes bad enr",
+                raw(10, &[&id, &rlp(&1u64), &wrap_list(vec![], &[1])]),
+            ),
+            (
+                "regtopic distances above the cap",
+                regtopic(vec![1], vec![1], vec![1; MAX_TOPIC_DISTANCES + 1]),
+            ),
+        ];
+        for (name, data) in cases {
+            assert!(Message::decode(&data).is_err(), "{name} decoded");
+        }
+    }
+
+    // Fields at their caps, large opaque tickets and request ids of 0 to 8 bytes
+    // decode.
+    #[test]
+    fn decodes_topic_fields_at_bounds() {
+        let ticket = vec![0xab; 1 << 16];
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "regtopic distances at the cap",
+                regtopic(vec![1], vec![1], vec![1; MAX_TOPIC_DISTANCES]),
+            ),
+            (
+                "topicquery distances at the cap",
+                topicquery(vec![1], vec![1; MAX_TOPIC_DISTANCES]),
+            ),
+            (
+                "topicnodes records at the cap",
+                topicnodes(vec![1], MAX_TOPIC_NODES),
+            ),
+            (
+                "regtopic large ticket",
+                regtopic(vec![1], ticket.clone(), vec![]),
+            ),
+            (
+                "regconfirmation large ticket",
+                regconfirmation(vec![1], ticket),
+            ),
+            ("topicquery empty req-id", topicquery(vec![], vec![])),
+            ("topicquery 1-byte req-id", topicquery(vec![0], vec![])),
+            ("topicquery 8-byte req-id", topicquery(vec![0; 8], vec![])),
+        ];
+        for (name, data) in cases {
+            let message = Message::decode(&data).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(message.encode(), data, "{name}");
+        }
     }
 }

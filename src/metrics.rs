@@ -35,6 +35,17 @@ pub(crate) struct TopicCounters {
     pub topicquery_recv: AtomicUsize,
     pub regconfirmation_recv: AtomicUsize,
     pub topicnodes_recv: AtomicUsize,
+    pub regtopic_rejected: AtomicUsize,
+    pub ticket_issued: AtomicUsize,
+    pub ticket_recv: AtomicUsize,
+    pub rejection_recv: AtomicUsize,
+    pub ticket_early: AtomicUsize,
+    pub ticket_late: AtomicUsize,
+    pub ticket_expired: AtomicUsize,
+    pub ticket_replayed: AtomicUsize,
+    pub ticket_invalid: AtomicUsize,
+    pub ticket_foreign: AtomicUsize,
+    pub invalid_records: AtomicUsize,
 }
 
 #[cfg(feature = "topic-discovery")]
@@ -47,6 +58,17 @@ impl TopicCounters {
             topicquery_recv: self.topicquery_recv.load(Ordering::Relaxed),
             regconfirmation_recv: self.regconfirmation_recv.load(Ordering::Relaxed),
             topicnodes_recv: self.topicnodes_recv.load(Ordering::Relaxed),
+            regtopic_rejected: self.regtopic_rejected.load(Ordering::Relaxed),
+            ticket_issued: self.ticket_issued.load(Ordering::Relaxed),
+            ticket_recv: self.ticket_recv.load(Ordering::Relaxed),
+            rejection_recv: self.rejection_recv.load(Ordering::Relaxed),
+            ticket_early: self.ticket_early.load(Ordering::Relaxed),
+            ticket_late: self.ticket_late.load(Ordering::Relaxed),
+            ticket_expired: self.ticket_expired.load(Ordering::Relaxed),
+            ticket_replayed: self.ticket_replayed.load(Ordering::Relaxed),
+            ticket_invalid: self.ticket_invalid.load(Ordering::Relaxed),
+            ticket_foreign: self.ticket_foreign.load(Ordering::Relaxed),
+            invalid_records: self.invalid_records.load(Ordering::Relaxed),
         }
     }
 }
@@ -61,6 +83,28 @@ pub struct TopicMetrics {
     pub topicquery_recv: usize,
     pub regconfirmation_recv: usize,
     pub topicnodes_recv: usize,
+    /// REGTOPIC requests rejected for their record.
+    pub regtopic_rejected: usize,
+    /// Tickets issued in REGCONFIRMATION.
+    pub ticket_issued: usize,
+    /// REGCONFIRMATIONs received with a ticket.
+    pub ticket_recv: usize,
+    /// REGCONFIRMATIONs received with a rejection.
+    pub rejection_recv: usize,
+    /// Tickets presented before their window and echoed.
+    pub ticket_early: usize,
+    /// Tickets credited late, within the grace.
+    pub ticket_late: usize,
+    /// Tickets presented past the grace.
+    pub ticket_expired: usize,
+    /// Tickets presented again after being credited.
+    pub ticket_replayed: usize,
+    /// Tickets that failed authentication or were for another topic.
+    pub ticket_invalid: usize,
+    /// Tickets presented by a node they were not issued to.
+    pub ticket_foreign: usize,
+    /// Records dropped from topic responses for failing verification.
+    pub invalid_records: usize,
 }
 
 impl Default for InternalMetrics {
