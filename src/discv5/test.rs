@@ -732,9 +732,9 @@ async fn test_predicate_search() {
     assert_eq!(found_nodes.len(), num_nodes);
 }
 
-// The kbuckets table can have maximum 10 nodes in the same /24 subnet across all buckets
-#[tokio::test]
-async fn test_table_limits() {
+// Adds `table_limit + 1` nodes in `subnet`/24 to a table with `ip_limit` on and returns the
+// table size.
+fn table_limit_count(subnet: [u8; 3]) -> usize {
     // this seed generates 12 node id's that are distributed across buckets such that no more than
     // 2 exist in a single bucket.
     let mut keypairs = generate_deterministic_keypair(12, 9487);
@@ -753,7 +753,7 @@ async fn test_table_limits() {
     // Generate `table_limit + 2` nodes in the same subnet.
     let enrs: Vec<Enr<CombinedKey>> = (1..=table_limit + 1)
         .map(|i| {
-            let ip: Ipv4Addr = Ipv4Addr::new(192, 168, 1, i as u8);
+            let ip: Ipv4Addr = Ipv4Addr::new(subnet[0], subnet[1], subnet[2], i as u8);
             let enr_key: CombinedKey = keypairs.remove(0);
             Enr::builder()
                 .ip4(ip)
@@ -765,13 +765,25 @@ async fn test_table_limits() {
     for enr in enrs {
         let _ = discv5.add_enr(enr.clone()); // we expect some of these to fail the filter.
     }
-    // Number of entries should be `table_limit`, i.e one node got restricted
-    assert_eq!(discv5.kbuckets.read().iter_ref().count(), table_limit);
+    discv5.kbuckets.read().iter_ref().count()
 }
 
-// Each bucket can have maximum 2 nodes in the same /24 subnet
+// The kbuckets table can have maximum 10 nodes in the same /24 subnet across all buckets
 #[tokio::test]
-async fn test_bucket_limits() {
+async fn test_table_limits() {
+    // Number of entries should be `table_limit`, i.e one node got restricted
+    assert_eq!(table_limit_count([203, 0, 113]), 10);
+}
+
+// LAN nodes are exempt from the table limit.
+#[tokio::test]
+async fn test_table_limits_lan_exempt() {
+    assert_eq!(table_limit_count([192, 168, 1]), 11);
+}
+
+// Adds `bucket_limit + 1` nodes in `subnet`/24 to one bucket with `ip_limit` on and returns
+// the table size.
+fn bucket_limit_count(subnet: [u8; 3]) -> usize {
     let enr_key = CombinedKey::generate_secp256k1();
     let ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
     let enr = Enr::builder().ip4(ip).udp4(9500).build(&enr_key).unwrap();
@@ -797,7 +809,7 @@ async fn test_bucket_limits() {
     let enrs: Vec<Enr<CombinedKey>> = (1..=bucket_limit + 1)
         .map(|i| {
             let kp = &keys[i - 1];
-            let ip: Ipv4Addr = Ipv4Addr::new(192, 168, 1, i as u8);
+            let ip: Ipv4Addr = Ipv4Addr::new(subnet[0], subnet[1], subnet[2], i as u8);
             Enr::builder()
                 .ip4(ip)
                 .udp4(9500 + i as u16)
@@ -816,9 +828,20 @@ async fn test_bucket_limits() {
     for enr in enrs {
         let _ = discv5.add_enr(enr.clone()); // we expect some of these to fail based on the filter.
     }
+    discv5.kbuckets.read().iter_ref().count()
+}
 
+// Each bucket can have maximum 2 nodes in the same /24 subnet
+#[tokio::test]
+async fn test_bucket_limits() {
     // Number of entries should be equal to `bucket_limit`.
-    assert_eq!(discv5.kbuckets.read().iter_ref().count(), bucket_limit);
+    assert_eq!(bucket_limit_count([203, 0, 113]), 2);
+}
+
+// LAN nodes are exempt from the bucket limit.
+#[tokio::test]
+async fn test_bucket_limits_lan_exempt() {
+    assert_eq!(bucket_limit_count([192, 168, 1]), 3);
 }
 
 /// Topic discovery between nodes of this crate, over UDP sockets on the loopback

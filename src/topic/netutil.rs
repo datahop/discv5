@@ -3,6 +3,8 @@
 //! is consistent with the packet source, and by the registration and search tables to
 //! limit the nodes per subnet.
 
+pub(crate) use crate::netutil::{is_lan, unmap};
+
 use crate::Enr;
 use std::{
     collections::HashMap,
@@ -41,28 +43,12 @@ const SPECIAL_V6: &[(Ipv6Addr, u8)] = &[
     (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
 ];
 
-/// Converts an IPv4-mapped IPv6 address to IPv4, as Go's `netip.Addr.Unmap` does.
-pub(crate) fn unmap(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    }
-}
-
 fn in_v4(ip: Ipv4Addr, net: Ipv4Addr, bits: u8) -> bool {
     (u32::from(ip) ^ u32::from(net)) >> (32 - bits) == 0
 }
 
 fn in_v6(ip: Ipv6Addr, net: Ipv6Addr, bits: u8) -> bool {
     (u128::from(ip) ^ u128::from(net)) >> (128 - bits) == 0
-}
-
-/// Loopback, private or link-local unicast.
-pub(crate) fn is_lan(ip: IpAddr) -> bool {
-    match unmap(ip) {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
-    }
 }
 
 /// Multicast, broadcast, documentation and other special-use ranges.
