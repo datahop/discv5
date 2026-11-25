@@ -104,6 +104,7 @@ mod ipmode;
 pub mod kbucket;
 mod lru_time_cache;
 pub mod metrics;
+mod netutil;
 mod node_info;
 pub mod packet;
 pub mod permit_ban;
