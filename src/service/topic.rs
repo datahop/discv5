@@ -38,6 +38,10 @@ use tracing::{debug, trace, warn};
 /// routing table, so the loops do not run hot on an empty table.
 const LOOP_MIN_TIME: Duration = Duration::from_secs(2);
 
+/// How often a running registration offers the routing table to its table again, so
+/// registrars dropped from it are asked again without a routing table change.
+const REG_REFILL_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The REGTOPIC requests one registration keeps in flight.
 const REG_SENDERS: usize = 4;
 
@@ -86,6 +90,8 @@ struct TopicReg {
     table: Registration,
     /// When the table was last seeded from the routing table.
     seeded_at: Option<Instant>,
+    /// When the running table was last offered the routing table.
+    refilled_at: Option<Instant>,
     /// The table is seeded and holds nodes.
     running: bool,
     /// The registrars with a REGTOPIC in flight, at most `REG_SENDERS`.
@@ -97,10 +103,14 @@ impl TopicReg {
         if !self.running || self.table.node_count() == 0 {
             return self.seeded_at.map(|t| t + LOOP_MIN_TIME);
         }
+        let refill = self.refilled_at.map(|t| t + REG_REFILL_INTERVAL);
         if self.in_flight.len() >= REG_SENDERS {
-            return None;
+            return refill;
         }
-        self.table.next_update_time()
+        [self.table.next_update_time(), refill]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 
@@ -799,6 +809,7 @@ impl Service {
                 id,
                 table: Registration::new(topic, local_id, self.config.topic.clone()),
                 seeded_at: None,
+                refilled_at: None,
                 running: false,
                 in_flight: HashSet::new(),
             },
@@ -829,10 +840,20 @@ impl Service {
                 }
                 reg.table.add_nodes(None, nodes, now);
                 reg.running = true;
+                reg.refilled_at = Some(now);
             }
             if reg.table.node_count() == 0 {
                 reg.running = false;
                 continue;
+            }
+            if reg
+                .refilled_at
+                .is_some_and(|t| now >= t + REG_REFILL_INTERVAL)
+            {
+                reg.refilled_at = Some(now);
+                if !reg.table.buckets_with_free_space().is_empty() {
+                    reg.table.add_nodes(None, self.topic_capable_nodes(), now);
+                }
             }
 
             if reg.in_flight.len() >= REG_SENDERS
@@ -1976,9 +1997,12 @@ mod tests {
         assert_eq!(enr.enr.as_deref(), Some(&*service.local_enr.read()));
         // The labels of the registration buckets, as the Go table lists them.
         assert_eq!(buckets, (239..=256).rev().collect::<Vec<u64>>());
-        // The only registrar is in flight: nothing else is due.
+        // The only registrar is in flight: nothing else is due before the refill.
         assert!(next_request(&mut handler).is_none());
-        assert!(service.topic_next_wakeup().is_none());
+        let refill = service.topics.registrations[&TOPIC]
+            .refilled_at
+            .map(|t| t + REG_REFILL_INTERVAL);
+        assert_eq!(service.topic_next_wakeup(), refill);
 
         let aux = registrar(12102);
         let not_capable = record(Ipv4Addr::LOCALHOST, 12103, false);
@@ -2210,6 +2234,64 @@ mod tests {
         assert_eq!(asked, nodes.iter().map(Enr::node_id).collect());
     }
 
+    // A registrar dropped when its ad expires is offered again from the unchanged
+    // routing table at the next refill, not before, while another ad keeps the table
+    // running.
+    #[tokio::test]
+    async fn expired_registrar_refilled() {
+        let nodes: Vec<Enr> = (0..2).map(|i| registrar(12101 + i)).collect();
+        let (mut service, mut handler) = service(TopicConfig::default(), &nodes);
+        service.topic_table_changes();
+        service.register_topic(TOPIC);
+        let sent = all_requests(&mut handler);
+        assert_eq!(sent.len(), 2);
+        let (short, long) = (&sent[0], &sent[1]);
+        respond(
+            &mut service,
+            &short.0,
+            &short.1.id,
+            confirmation(1, vec![], 1_000),
+        );
+        respond(
+            &mut service,
+            &long.0,
+            &long.1.id,
+            confirmation(1, vec![], 600_000),
+        );
+        let short_id = short.0.node_id();
+        let expiry = service.topics.registrations[&TOPIC]
+            .table
+            .attempt(&short_id)
+            .unwrap()
+            .next_time;
+
+        service.registration_step(TOPIC, expiry);
+        let reg = &service.topics.registrations[&TOPIC];
+        assert!(reg.table.attempt(&short_id).is_none());
+        assert_eq!(reg.table.node_count(), 1);
+        assert!(next_request(&mut handler).is_none());
+        let refill = reg.refilled_at.unwrap() + REG_REFILL_INTERVAL;
+        assert_eq!(service.topic_next_wakeup(), Some(refill));
+
+        service.registration_step(TOPIC, refill - Duration::from_millis(1));
+        assert!(
+            service.topics.registrations[&TOPIC]
+                .table
+                .attempt(&short_id)
+                .is_none()
+        );
+        assert!(next_request(&mut handler).is_none());
+
+        assert!(service.kbuckets.write().take_changes().is_empty());
+        service.registration_step(TOPIC, refill);
+        let (contact, _) = next_request(&mut handler).unwrap();
+        assert_eq!(contact.node_id(), short_id);
+        assert!(next_request(&mut handler).is_none());
+        let reg = &service.topics.registrations[&TOPIC];
+        assert_eq!(reg.table.node_count(), 2);
+        assert_eq!(reg.refilled_at, Some(refill));
+    }
+
     /// All topic requests the service handed to the handler.
     fn all_requests(handler: &mut UnboundedReceiver<HandlerIn>) -> Vec<(NodeContact, Request)> {
         std::iter::from_fn(|| next_request(handler)).collect()
@@ -2231,7 +2313,8 @@ mod tests {
                 .next_update_time()
                 .is_some_and(|t| t <= Instant::now())
         );
-        assert!(service.topic_next_wakeup().is_none());
+        let refill = reg.refilled_at.map(|t| t + REG_REFILL_INTERVAL);
+        assert_eq!(service.topic_next_wakeup(), refill);
         service.topic_tick();
         assert!(next_request(&mut handler).is_none());
 
